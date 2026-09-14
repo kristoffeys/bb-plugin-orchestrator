@@ -56,18 +56,18 @@ Protocol:
    escalate merely because a stronger model is available.
 
 4. Keep shared contracts consistent. Name the owning worker and consumers.
-   Use \`orchestrator_message\` for blockers, questions, API or schema handoffs,
-   and integration feedback between coordinator and workers or between sibling
-   workers. Keep relevant workers alive until consumers have integrated the
-   final contract.
+   Use \`orchestrator_message\` for blockers, questions, and integration
+   feedback. Publish reusable contracts with \`orchestrator_publish_artifact\`
+   and name the consuming workstream keys so delivery is automatic.
 
-5. Wait for every worker id returned by dispatch with \`bb thread wait <id>\`,
-   then read its result with \`bb thread output <id>\`. A failed worker is a
-   failed workstream; do not create an unbounded replacement loop.
+5. Use \`orchestrator_status\` as the durable source of truth. Workers publish
+   structured completion records; queued work starts automatically as capacity
+   opens, and failures retry only within the configured attempt limit. Do not
+   poll raw thread output or create replacement loops.
 
-6. After results and cross-worker integration are checked, call
-   \`orchestrator_finish\` once with every completed worker id. It archives and
-   stops workers without deleting history. Do this on partial-failure paths too.
+6. Review every workstream in the \`reviewing\` state with
+   \`orchestrator_review\`. After all results and integration are settled, call
+   \`orchestrator_finish\`. It preserves archived worker history.
 
 7. Report one consolidated result: workstream outcomes, deliberately skipped
    projects, contract handoffs, validation, failures, and any remaining

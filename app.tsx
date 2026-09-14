@@ -6,6 +6,7 @@ import {
   useRealtime,
   useRpc,
   useComposerView,
+  type PluginPendingInteractionProps,
   type PluginThreadHeaderActionProps,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server.ts";
@@ -13,6 +14,19 @@ import type { rpcContract } from "./server.ts";
 const PROFILES = ["quick", "standard", "complex", "critical"] as const;
 type Profile = (typeof PROFILES)[number];
 type Routes = Record<Profile, string>;
+type RouteTarget = { providerId: string; modelId: string } | null;
+type RoutingPolicy = { strategy: "coordinator" | "profile"; profileRoutes: Record<Profile, RouteTarget> };
+type OrchestrationPolicy = {
+  maxParallelWorkers: number;
+  maxWorkersPerRun: number;
+  maxAttemptsPerWorkstream: number;
+  workerTimeoutMinutes: number;
+  runTimeoutMinutes: number;
+  inactiveCleanupMinutes: number;
+  tokenBudget: number;
+  approval: "never" | "first-dispatch" | "critical" | "every-dispatch";
+  evaluator: "never" | "critical" | "always";
+};
 type Catalog = Awaited<
   ReturnType<ReturnType<typeof useRpc<typeof rpcContract>>["call"]>
 >;
@@ -32,6 +46,39 @@ type ThreadOrchestrationState = {
   projects: Array<{ id: string; name: string; current: boolean }>;
 };
 const OPEN_ORCHESTRATION_EVENT = "bb-orchestrator:open";
+
+function DispatchApproval({ interaction, submit, cancel }: PluginPendingInteractionProps) {
+  const payload = typeof interaction.payload === "object" && interaction.payload !== null ? interaction.payload as Record<string, unknown> : {};
+  const assignments = Array.isArray(payload.assignments) ? payload.assignments.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null) : [];
+  const [busy, setBusy] = useState(false);
+  const decide = async (approved: boolean) => {
+    setBusy(true);
+    try { if (approved) await submit({ approved: true }); else await cancel(); } finally { setBusy(false); }
+  };
+  return (
+    <div className="space-y-4 p-4">
+      <div>
+        <p className="text-sm font-semibold text-foreground">Approve this worker plan?</p>
+        <p className="mt-1 text-xs text-muted-foreground">The coordinator is paused until you decide.</p>
+      </div>
+      <div className="divide-y divide-border overflow-hidden rounded-md border border-border">
+        {assignments.map((assignment) => (
+          <div key={`${String(assignment.projectId ?? "project")}:${String(assignment.key ?? assignment.title ?? "workstream")}`} className="flex items-center gap-3 px-3 py-2.5">
+            <Icon name="Workflow" className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm text-foreground">{String(assignment.title ?? assignment.key ?? "Workstream")}</p>
+              <p className="text-xs text-muted-foreground">{String(assignment.projectId ?? "Project")} · {String(assignment.profile ?? "quick")}</p>
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="flex justify-end gap-2">
+        <button type="button" disabled={busy} onClick={() => void decide(false)} className="rounded-md px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-accent disabled:opacity-50">Reject</button>
+        <button type="button" disabled={busy} onClick={() => void decide(true)} className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-50">Approve workers</button>
+      </div>
+    </div>
+  );
+}
 
 function ProjectPicker({
   projects,
@@ -310,6 +357,59 @@ function ComposerOrchestrationAction() {
   );
 }
 
+const NUMBER_POLICY_FIELDS: Array<{ key: keyof Pick<OrchestrationPolicy, "maxParallelWorkers" | "maxWorkersPerRun" | "maxAttemptsPerWorkstream" | "workerTimeoutMinutes" | "runTimeoutMinutes" | "inactiveCleanupMinutes" | "tokenBudget">; label: string; description: string; min: number; max: number }> = [
+  { key: "maxParallelWorkers", label: "Parallel workers", description: "Extra workstreams wait in a durable queue.", min: 1, max: 20 },
+  { key: "maxWorkersPerRun", label: "Workstreams per run", description: "Reject plans larger than this limit.", min: 1, max: 50 },
+  { key: "maxAttemptsPerWorkstream", label: "Attempts per workstream", description: "Includes the first attempt and automatic retries.", min: 1, max: 5 },
+  { key: "workerTimeoutMinutes", label: "Worker timeout", description: "Minutes before a running worker is considered stale.", min: 5, max: 1440 },
+  { key: "runTimeoutMinutes", label: "Run timeout", description: "Maximum wall-clock lifetime in minutes.", min: 10, max: 10080 },
+  { key: "inactiveCleanupMinutes", label: "Inactive cleanup", description: "Minutes without run activity before cleanup.", min: 10, max: 43200 },
+  { key: "tokenBudget", label: "Token budget", description: "Stop the run when observed usage exceeds this; 0 disables it.", min: 0, max: 100000000 },
+];
+
+function PolicySettings() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [draft, setDraft] = useState<OrchestrationPolicy | null>(null);
+  const [saved, setSaved] = useState<OrchestrationPolicy | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(async () => {
+    const value = await rpc.call("policy_get", null);
+    setDraft(value); setSaved(value);
+  }, [rpc]);
+  useEffect(() => { void load().catch((cause: unknown) => setError(cause instanceof Error ? cause.message : "Could not load policy.")); }, [load]);
+  useRealtime("policy-changed", load);
+  if (draft === null) return <p className="text-sm text-muted-foreground">Loading orchestration policy…</p>;
+  const dirty = JSON.stringify(draft) !== JSON.stringify(saved);
+  const save = async () => {
+    setBusy(true); setError(null);
+    try { const value = await rpc.call("policy_set", draft); setDraft(value); setSaved(value); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "Could not save policy."); }
+    finally { setBusy(false); }
+  };
+  return (
+    <div className="max-w-3xl space-y-5">
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border bg-muted/30 px-4 py-3">
+        <p className="text-sm font-medium text-foreground">{draft.maxParallelWorkers} parallel · {draft.maxAttemptsPerWorkstream} attempts · {draft.approval.replace("-", " ")} approval</p>
+        <button type="button" disabled={busy || !dirty} onClick={() => void save()} className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-45">{busy ? "Saving…" : "Save policy"}</button>
+      </div>
+      {error === null ? null : <p role="alert" className="text-sm text-destructive">{error}</p>}
+      <div className="grid gap-x-6 gap-y-4 sm:grid-cols-2">
+        {NUMBER_POLICY_FIELDS.map((field) => (
+          <label key={field.key} className="grid grid-cols-[minmax(0,1fr)_6rem] items-center gap-3">
+            <span><span className="block text-sm font-medium text-foreground">{field.label}</span><span className="block text-xs leading-relaxed text-muted-foreground">{field.description}</span></span>
+            <input type="number" min={field.min} max={field.max} value={draft[field.key]} onChange={(event) => { const parsed = event.target.valueAsNumber; if (Number.isFinite(parsed)) setDraft({ ...draft, [field.key]: Math.min(field.max, Math.max(field.min, parsed)) }); }} className="h-9 rounded-md border border-input bg-background px-3 text-sm" />
+          </label>
+        ))}
+      </div>
+      <div className="grid gap-4 border-t border-border pt-4 sm:grid-cols-2">
+        <label><span className="block text-sm font-medium text-foreground">Dispatch approval</span><span className="mb-1.5 block text-xs text-muted-foreground">Pause before workers are created.</span><select value={draft.approval} onChange={(event) => setDraft({ ...draft, approval: event.target.value as OrchestrationPolicy["approval"] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option value="never">Never</option><option value="first-dispatch">First dispatch</option><option value="critical">Critical work only</option><option value="every-dispatch">Every dispatch</option></select></label>
+        <label><span className="block text-sm font-medium text-foreground">Evaluator gate</span><span className="mb-1.5 block text-xs text-muted-foreground">Require coordinator review before completion.</span><select value={draft.evaluator} onChange={(event) => setDraft({ ...draft, evaluator: event.target.value as OrchestrationPolicy["evaluator"] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option value="never">Never</option><option value="critical">Critical work only</option><option value="always">Every successful result</option></select></label>
+      </div>
+    </div>
+  );
+}
+
 function RoutingSettings() {
   const rpc = useRpc<typeof rpcContract>();
   const [providers, setProviders] = useState<
@@ -317,6 +417,10 @@ function RoutingSettings() {
   >([] as never);
   const [storedRoutes, setStoredRoutes] = useState<Record<string, Routes>>({});
   const [drafts, setDrafts] = useState<Record<string, Routes>>({});
+  const [routePolicy, setRoutePolicy] = useState<RoutingPolicy>({ strategy: "coordinator", profileRoutes: { quick: null, standard: null, complex: null, critical: null } });
+  const [savedRoutePolicy, setSavedRoutePolicy] = useState<RoutingPolicy>({ strategy: "coordinator", profileRoutes: { quick: null, standard: null, complex: null, critical: null } });
+  const [metrics, setMetrics] = useState<Array<{ providerId: string; model: string; profile: Profile; samples: number; successes: number; failures: number; averageDurationMs: number; averageTokens: number }>>([]);
+  const [recommendations, setRecommendations] = useState<Array<{ profile: Profile; providerId: string; model: string; samples: number; successRate: number; reason: string }>>([]);
   const [saving, setSaving] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -331,6 +435,10 @@ function RoutingSettings() {
       ]);
       setProviders(catalog.providers as never);
       setStoredRoutes(routing.routes);
+      setRoutePolicy(routing.policy);
+      setSavedRoutePolicy(routing.policy);
+      setMetrics(routing.metrics);
+      setRecommendations(routing.recommendations);
       setDrafts((current) => {
         const next = { ...current };
         for (const provider of catalog.providers) {
@@ -378,6 +486,13 @@ function RoutingSettings() {
     }
   };
 
+  const saveRoutePolicy = async () => {
+    setSaving("cross-provider"); setSaved(null); setError(null);
+    try { const result = await rpc.call("routing_policy_set", routePolicy); setRoutePolicy(result); setSavedRoutePolicy(result); setSaved("cross-provider"); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "Could not save cross-provider routing."); }
+    finally { setSaving(null); }
+  };
+
   if (loading) {
     return <p className="text-sm text-muted-foreground">Loading provider models…</p>;
   }
@@ -397,6 +512,54 @@ function RoutingSettings() {
       {error === null ? null : (
         <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           {error}
+        </div>
+      )}
+
+      <section className="rounded-lg border border-border bg-card px-4 py-4 sm:px-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold text-foreground">Provider strategy</h3>
+            <p className="mt-0.5 text-xs text-muted-foreground">Use the coordinator’s provider, or route each workload profile across any active provider.</p>
+          </div>
+          <button type="button" disabled={saving === "cross-provider" || JSON.stringify(routePolicy) === JSON.stringify(savedRoutePolicy)} onClick={() => void saveRoutePolicy()} className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-45">{saving === "cross-provider" ? "Saving…" : saved === "cross-provider" ? "Saved" : "Save strategy"}</button>
+        </div>
+        <select aria-label="Worker provider strategy" value={routePolicy.strategy} onChange={(event) => {
+          const strategy = event.target.value as RoutingPolicy["strategy"];
+          const fallback = providers[0];
+          setRoutePolicy({
+            strategy,
+            profileRoutes: strategy === "profile" && fallback !== undefined
+              ? Object.fromEntries(PROFILES.map((profile) => [profile, routePolicy.profileRoutes[profile] ?? { providerId: fallback.id, modelId: fallback.recommendedRoutes?.[profile] ?? fallback.models[0]?.id ?? "" }])) as Record<Profile, RouteTarget>
+              : routePolicy.profileRoutes,
+          });
+        }} className="mt-3 h-9 w-full rounded-md border border-input bg-background px-3 text-sm sm:w-64"><option value="coordinator">Stay with coordinator provider</option><option value="profile">Route by workload profile</option></select>
+        {routePolicy.strategy === "profile" ? (
+          <div className="mt-4 grid gap-3 border-t border-border pt-4 sm:grid-cols-2">
+            {PROFILES.map((profile) => {
+              const target = routePolicy.profileRoutes[profile];
+              const provider = providers.find((item) => item.id === target?.providerId) ?? providers[0];
+              return (
+                <div key={profile} className="grid gap-1.5">
+                  <span className="text-sm font-medium text-foreground">{PROFILE_COPY[profile].label}</span>
+                  <div className="grid grid-cols-2 gap-2">
+                    <select aria-label={`${PROFILE_COPY[profile].label} provider`} value={provider?.id ?? ""} onChange={(event) => { const nextProvider = providers.find((item) => item.id === event.target.value); const nextModel = nextProvider?.recommendedRoutes?.[profile] ?? nextProvider?.models[0]?.id ?? ""; setRoutePolicy({ ...routePolicy, profileRoutes: { ...routePolicy.profileRoutes, [profile]: nextProvider === undefined ? null : { providerId: nextProvider.id, modelId: nextModel } } }); }} className="h-9 rounded-md border border-input bg-background px-2 text-sm">{providers.map((item) => <option key={item.id} value={item.id}>{item.displayName}</option>)}</select>
+                    <select aria-label={`${PROFILE_COPY[profile].label} model`} value={target?.modelId ?? provider?.recommendedRoutes?.[profile] ?? provider?.models[0]?.id ?? ""} onChange={(event) => { if (provider !== undefined) setRoutePolicy({ ...routePolicy, profileRoutes: { ...routePolicy.profileRoutes, [profile]: { providerId: provider.id, modelId: event.target.value } } }); }} className="h-9 min-w-0 rounded-md border border-input bg-background px-2 text-sm">{provider?.models.map((item) => <option key={item.id} value={item.id}>{item.displayName}</option>)}</select>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+      </section>
+
+      {recommendations.length === 0 ? (
+        <p className="text-xs text-muted-foreground">Measured recommendations appear after three completed samples for a profile and model. Routes never change automatically.</p>
+      ) : (
+        <div className="rounded-md border border-border bg-muted/25 px-4 py-3">
+          <p className="text-sm font-medium text-foreground">Measured recommendations</p>
+          <div className="mt-2 space-y-1.5">
+            {recommendations.map((item) => <p key={item.profile} className="text-xs text-muted-foreground"><span className="font-medium text-foreground">{PROFILE_COPY[item.profile].label}:</span> {item.providerId} / {item.model} — {item.reason}</p>)}
+          </div>
         </div>
       )}
 
@@ -461,6 +624,7 @@ function RoutingSettings() {
                             {selected === undefined ? null : (
                               <p className="mt-1 text-xs text-muted-foreground">
                                 Default reasoning: {selected.defaultReasoningLevel}
+                                {(() => { const evidence = metrics.find((item) => item.providerId === provider.id && item.model === selected.model && item.profile === profile); return evidence === undefined ? " · no measured runs yet" : ` · ${evidence.successes}/${evidence.samples} successful · ${Math.round(evidence.averageDurationMs / 1000)}s avg · ${evidence.averageTokens.toLocaleString()} tokens avg`; })()}
                               </p>
                             )}
                           </div>
@@ -479,6 +643,7 @@ function RoutingSettings() {
 }
 
 export default definePluginApp((app) => {
+  app.slots.pendingInteraction({ id: "dispatch-approval", component: DispatchApproval });
   app.slots.experimental_appOverlay({
     id: "orchestration-dialog",
     component: OrchestrationOverlay,
@@ -492,6 +657,12 @@ export default definePluginApp((app) => {
     id: "thread-orchestration",
     title: "Thread orchestration",
     component: ThreadOrchestrationLauncher,
+  });
+  app.slots.settingsSection({
+    id: "orchestration-policy",
+    title: "Orchestration policy",
+    description: "Set lifecycle limits, budgets, approvals, and evaluator gates.",
+    component: PolicySettings,
   });
   app.slots.settingsSection({
     id: "model-routing",
