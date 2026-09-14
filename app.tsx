@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import * as Dialog from "@radix-ui/react-dialog";
 import {
   definePluginApp,
   experimental_Icon as Icon,
-  useBbNavigate,
   useRealtime,
   useRpc,
   useComposerView,
   type PluginThreadHeaderActionProps,
-  type PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server.ts";
 
@@ -32,6 +31,7 @@ type ThreadOrchestrationState = {
   allowedProjectIds: string[];
   projects: Array<{ id: string; name: string; current: boolean }>;
 };
+const OPEN_ORCHESTRATION_EVENT = "bb-orchestrator:open";
 
 function ProjectPicker({
   projects,
@@ -81,7 +81,6 @@ function ProjectPicker({
 
 function ThreadOrchestrationLauncher({ threadId }: PluginThreadHeaderActionProps) {
   const rpc = useRpc<typeof rpcContract>();
-  const navigate = useBbNavigate();
   const [state, setState] = useState<ThreadOrchestrationState | null>(null);
 
   const load = useCallback(async () => {
@@ -103,7 +102,9 @@ function ThreadOrchestrationLauncher({ threadId }: PluginThreadHeaderActionProps
       type="button"
       aria-label={state.enabled ? "Configure orchestration" : "Enable orchestration"}
       title={state.enabled ? "Orchestration enabled" : "Enable orchestration"}
-      onClick={() => navigate.openThreadPanel({ actionId: "orchestration", title: "Orchestration" })}
+      onClick={() => window.dispatchEvent(new CustomEvent(OPEN_ORCHESTRATION_EVENT, {
+        detail: { threadId },
+      }))}
       className={`relative grid size-7 place-items-center rounded-md outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring ${
         state.enabled
           ? "bg-primary/12 text-primary hover:bg-primary/20"
@@ -118,7 +119,7 @@ function ThreadOrchestrationLauncher({ threadId }: PluginThreadHeaderActionProps
   );
 }
 
-function OrchestrationPanel({ threadId }: PluginThreadPanelProps) {
+function OrchestrationForm({ threadId }: { threadId: string }) {
   const rpc = useRpc<typeof rpcContract>();
   const [state, setState] = useState<ThreadOrchestrationState | null>(null);
   const [label, setLabel] = useState("");
@@ -242,6 +243,58 @@ function OrchestrationPanel({ threadId }: PluginThreadPanelProps) {
         </button>
       </div>
     </div>
+  );
+}
+
+function OrchestrationOverlay() {
+  const [threadId, setThreadId] = useState<string | null>(null);
+
+  useEffect(() => {
+    const open = (event: Event) => {
+      const detail = (event as CustomEvent<unknown>).detail;
+      if (
+        typeof detail === "object" && detail !== null &&
+        "threadId" in detail && typeof detail.threadId === "string"
+      ) {
+        setThreadId(detail.threadId);
+      }
+    };
+    window.addEventListener(OPEN_ORCHESTRATION_EVENT, open);
+    return () => window.removeEventListener(OPEN_ORCHESTRATION_EVENT, open);
+  }, []);
+
+  return (
+    <Dialog.Root open={threadId !== null} onOpenChange={(open) => {
+      if (!open) setThreadId(null);
+    }}>
+      {threadId === null ? null : (
+        <>
+          <Dialog.Overlay className="fixed inset-0 z-[2147483646] bg-background/70 backdrop-blur-[1px]" />
+          <Dialog.Content className="fixed left-1/2 top-1/2 z-[2147483647] max-h-[min(42rem,calc(100dvh-2rem))] w-[min(30rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-lg border border-border bg-popover p-5 text-popover-foreground shadow-xl outline-none">
+            <div className="mb-5 flex items-start justify-between gap-4">
+              <div>
+                <Dialog.Title className="text-base font-semibold text-foreground">
+                  Orchestrate this thread
+                </Dialog.Title>
+                <Dialog.Description className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                  Choose where this thread may create managed workers.
+                </Dialog.Description>
+              </div>
+              <Dialog.Close asChild>
+                <button
+                  type="button"
+                  aria-label="Close orchestration settings"
+                  className="grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <Icon name="X" className="size-4" aria-hidden="true" />
+                </button>
+              </Dialog.Close>
+            </div>
+            <OrchestrationForm threadId={threadId} />
+          </Dialog.Content>
+        </>
+      )}
+    </Dialog.Root>
   );
 }
 
@@ -426,6 +479,10 @@ function RoutingSettings() {
 }
 
 export default definePluginApp((app) => {
+  app.slots.experimental_appOverlay({
+    id: "orchestration-dialog",
+    component: OrchestrationOverlay,
+  });
   app.composer.customize({
     id: "thread-orchestration",
     scopes: ["thread"],
@@ -435,13 +492,6 @@ export default definePluginApp((app) => {
     id: "thread-orchestration",
     title: "Thread orchestration",
     component: ThreadOrchestrationLauncher,
-  });
-  app.slots.threadPanelAction({
-    id: "orchestration",
-    title: "Orchestration",
-    icon: "Workflow",
-    component: OrchestrationPanel,
-    layout: "padded",
   });
   app.slots.settingsSection({
     id: "model-routing",
