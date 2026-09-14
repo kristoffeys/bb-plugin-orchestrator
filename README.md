@@ -13,11 +13,13 @@ and cost-aware model routing. Callers such as the Sidebar plugin provide a label
 task, and allowed project ids through the `start` RPC; they do not manage worker
 threads themselves.
 
-Ordinary root project threads can orchestrate too. When the user asks for it,
-the plugin exposes `orchestrator_enable`; it records the allowed projects on
-that thread, and the dispatch/message/finish tools attach on the following
-turn. This is opt-in so every routine thread does not acquire worker-management
-tools by default.
+Ordinary root project threads can orchestrate too. Click the workflow icon in
+the thread header, choose the projects workers may use, and enable it. The very
+next ordinary prompt can dispatch workers: no separate enable message is
+needed. The same control can update the project scope or disable orchestration.
+As an alternative, asking the agent to enable orchestration exposes the
+`orchestrator_enable` tool. Opt-in keeps routine threads from acquiring
+worker-management tools by default.
 
 Assignments default to the `quick` profile. Higher profiles require a concrete
 complexity reason. The default routing is:

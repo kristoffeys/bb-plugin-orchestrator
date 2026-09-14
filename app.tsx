@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { definePluginApp, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
+import * as Popover from "@radix-ui/react-popover";
+import {
+  definePluginApp,
+  experimental_Icon as Icon,
+  useRealtime,
+  useRpc,
+  type PluginThreadHeaderActionProps,
+} from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server.ts";
 
 const PROFILES = ["quick", "standard", "complex", "critical"] as const;
@@ -15,6 +22,179 @@ const PROFILE_COPY: Record<Profile, { label: string; description: string }> = {
   complex: { label: "Complex", description: "Architecture and difficult debugging" },
   critical: { label: "Critical", description: "Highest-risk decisions" },
 };
+
+type ThreadOrchestrationState = {
+  eligible: boolean;
+  enabled: boolean;
+  label: string;
+  allowedProjectIds: string[];
+  projects: Array<{ id: string; name: string; current: boolean }>;
+};
+
+function ThreadOrchestrationAction({ threadId }: PluginThreadHeaderActionProps) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [state, setState] = useState<ThreadOrchestrationState | null>(null);
+  const [label, setLabel] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [confirmation, setConfirmation] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const result = await rpc.call("thread_orchestration_get", { threadId });
+      setState(result);
+      setLabel(result.label);
+      setSelected(result.allowedProjectIds);
+    } catch {
+      setState(null);
+    }
+  }, [rpc, threadId]);
+
+  useEffect(() => void load(), [load]);
+  useRealtime("thread-orchestration-changed", load);
+  const selectedProjects = useMemo(() => new Set(selected), [selected]);
+
+  if (state === null || !state.eligible) return null;
+
+  const toggleProject = (projectId: string) => {
+    setSelected((current) => current.includes(projectId)
+      ? current.filter((id) => id !== projectId)
+      : [...current, projectId]);
+    setConfirmation(null);
+  };
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    setConfirmation(null);
+    try {
+      await rpc.call("enable", { threadId, label: label.trim(), projectIds: selected });
+      setConfirmation("Ready — your next prompt can dispatch workers.");
+      await load();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not enable orchestration.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disable = async () => {
+    setBusy(true);
+    setError(null);
+    setConfirmation(null);
+    try {
+      await rpc.call("thread_orchestration_disable", { threadId });
+      setConfirmation("Orchestration is off for this thread.");
+      await load();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not disable orchestration.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Popover.Root open={open} onOpenChange={(next) => {
+      setOpen(next);
+      if (next) {
+        setError(null);
+        setConfirmation(null);
+        void load();
+      }
+    }}>
+      <Popover.Trigger asChild>
+        <button
+          type="button"
+          aria-label={state.enabled ? "Configure orchestration" : "Enable orchestration"}
+          title={state.enabled ? "Orchestration enabled" : "Enable orchestration"}
+          className={`relative grid size-7 place-items-center rounded-md outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring ${
+            state.enabled
+              ? "bg-primary/12 text-primary hover:bg-primary/20"
+              : "text-muted-foreground hover:bg-accent hover:text-foreground"
+          }`}
+        >
+          <Icon name="Workflow" className="size-4" aria-hidden="true" />
+          {state.enabled ? (
+            <span className="absolute right-0.5 top-0.5 size-1.5 rounded-full bg-primary ring-1 ring-background" />
+          ) : null}
+        </button>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content
+          sideOffset={8}
+          align="end"
+          className="z-[1000] w-[min(22rem,calc(100vw-1rem))] rounded-lg border border-border bg-popover p-4 text-popover-foreground shadow-lg outline-none"
+        >
+          <div className="mb-4">
+            <div className="flex items-center gap-2">
+              <span className={`size-2 rounded-full ${state.enabled ? "bg-primary" : "bg-muted-foreground/35"}`} />
+              <h2 className="text-sm font-semibold">Orchestrate this thread</h2>
+            </div>
+            <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
+              Let this thread create visible, managed workers in the selected projects.
+            </p>
+          </div>
+
+          <label className="block text-xs font-medium text-foreground" htmlFor={`orchestrator-label-${threadId}`}>
+            Worker group label
+          </label>
+          <input
+            id={`orchestrator-label-${threadId}`}
+            value={label}
+            maxLength={200}
+            onChange={(event) => { setLabel(event.target.value); setConfirmation(null); }}
+            className="mt-1.5 h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          />
+
+          <fieldset className="mt-4">
+            <legend className="text-xs font-medium text-foreground">Worker projects</legend>
+            <div className="mt-1.5 max-h-48 space-y-1 overflow-y-auto rounded-md border border-border p-1">
+              {state.projects.map((project) => (
+                <label key={project.id} className="flex cursor-pointer items-center gap-2.5 rounded px-2 py-2 text-sm hover:bg-accent">
+                  <input
+                    type="checkbox"
+                    checked={selectedProjects.has(project.id)}
+                    onChange={() => toggleProject(project.id)}
+                    className="size-4 rounded border-input accent-primary"
+                  />
+                  <span className="min-w-0 flex-1 truncate">{project.name}</span>
+                  {project.current ? <span className="text-[11px] text-muted-foreground">Current</span> : null}
+                </label>
+              ))}
+            </div>
+          </fieldset>
+
+          {error === null ? null : <p role="alert" className="mt-3 text-xs text-destructive">{error}</p>}
+          {confirmation === null ? null : <p role="status" className="mt-3 text-xs text-primary">{confirmation}</p>}
+
+          <div className="mt-4 flex items-center justify-between gap-3">
+            {state.enabled ? (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void disable()}
+                className="rounded-md px-2 py-1.5 text-xs font-medium text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+              >
+                Disable
+              </button>
+            ) : <span />}
+            <button
+              type="button"
+              disabled={busy || label.trim().length === 0 || selected.length === 0}
+              onClick={() => void save()}
+              className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              {busy ? "Saving…" : state.enabled ? "Save projects" : "Enable orchestration"}
+            </button>
+          </div>
+          <Popover.Arrow className="fill-border" />
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
+  );
+}
 
 function RoutingSettings() {
   const rpc = useRpc<typeof rpcContract>();
@@ -185,6 +365,11 @@ function RoutingSettings() {
 }
 
 export default definePluginApp((app) => {
+  app.slots.experimental_threadHeaderAction({
+    id: "thread-orchestration",
+    title: "Thread orchestration",
+    component: ThreadOrchestrationAction,
+  });
   app.slots.settingsSection({
     id: "model-routing",
     title: "Worker model routing",

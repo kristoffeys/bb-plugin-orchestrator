@@ -38,6 +38,18 @@ const enableInput = z.object({
   label: z.string().trim().min(1).max(200),
   projectIds,
 });
+const threadOrchestrationProject = z.object({
+  id: z.string(),
+  name: z.string(),
+  current: z.boolean(),
+});
+const threadOrchestrationState = z.object({
+  eligible: z.boolean(),
+  enabled: z.boolean(),
+  label: z.string(),
+  allowedProjectIds: z.array(z.string()),
+  projects: z.array(threadOrchestrationProject),
+});
 const profile = z.enum(["quick", "standard", "complex", "critical"]);
 const providerRoutes = z.object({
   quick: z.string().min(1),
@@ -81,6 +93,14 @@ const catalogProvider = z.object({
 export const rpcContract = defineRpcContract({
   start: { input: startInput, output: z.object({ threadId: z.string() }) },
   enable: { input: enableInput, output: z.object({ threadId: z.string() }) },
+  thread_orchestration_get: {
+    input: z.object({ threadId: z.string().min(1) }),
+    output: threadOrchestrationState,
+  },
+  thread_orchestration_disable: {
+    input: z.object({ threadId: z.string().min(1) }),
+    output: z.null(),
+  },
   routing_catalog: {
     input: z.null(),
     output: z.object({ providers: z.array(catalogProvider) }),
@@ -225,7 +245,36 @@ export default async function plugin(bb: BbPluginApi) {
       threadId: input.threadId,
       set: { role: "coordinator", label: input.label, allowedProjectIds: input.projectIds },
     });
+    bb.realtime.publish("thread-orchestration-changed", { threadId: input.threadId });
     return { threadId: input.threadId };
+  };
+
+  const threadOrchestrationStateFor = async (threadId: string) => {
+    const [thread, allProjects, value] = await Promise.all([
+      bb.sdk.threads.get({ threadId }),
+      bb.sdk.projects.list({ includePersonal: true }),
+      metadata(threadId),
+    ]);
+    const projects = allProjects
+      .filter((project) => project.kind !== "personal")
+      .map((project) => ({
+        id: project.id,
+        name: project.name,
+        current: project.id === thread.projectId,
+      }));
+    const currentProject = projects.find((project) => project.current);
+    const enabled = value?.role === "coordinator";
+    return {
+      eligible: thread.parentThreadId === null && value?.role !== "worker",
+      enabled,
+      label: enabled
+        ? value.label
+        : thread.title ?? thread.titleFallback ?? currentProject?.name ?? "Orchestrated work",
+      allowedProjectIds: enabled
+        ? value.allowedProjectIds
+        : currentProject === undefined ? [] : [currentProject.id],
+      projects,
+    };
   };
 
   bb.rpc.register(rpcContract, {
@@ -247,6 +296,17 @@ export default async function plugin(bb: BbPluginApi) {
       return { threadId: thread.id };
     },
     enable,
+    thread_orchestration_get: async ({ threadId }) => threadOrchestrationStateFor(threadId),
+    thread_orchestration_disable: async ({ threadId }) => {
+      const state = await threadOrchestrationStateFor(threadId);
+      if (!state.eligible) throw new Error("Only an eligible root thread can change orchestration.");
+      await bb.sdk.threads.updatePluginMetadata({
+        threadId,
+        remove: ["role", "label", "allowedProjectIds"],
+      });
+      bb.realtime.publish("thread-orchestration-changed", { threadId });
+      return null;
+    },
     routing_catalog: async () => ({ providers: await providerCatalog() }),
     routing_get: async () => ({ routes: await readRoutes() }),
     routing_set_provider: async ({ providerId, routes }) => {

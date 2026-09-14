@@ -59,8 +59,10 @@ async function load(providerId = "codex") {
           return thread;
         },
         getPluginMetadata: async ({ threadId }: { threadId: string }) => (metadata.get(threadId) ?? {}) as never,
-        updatePluginMetadata: async ({ threadId, set }: { threadId: string; set?: Record<string, unknown> }) => {
-          metadata.set(threadId, { ...(metadata.get(threadId) ?? {}), ...set });
+        updatePluginMetadata: async ({ threadId, set, remove }: { threadId: string; set?: Record<string, unknown>; remove?: string[] }) => {
+          const next = { ...(metadata.get(threadId) ?? {}), ...set };
+          for (const key of remove ?? []) delete next[key];
+          metadata.set(threadId, next);
           return metadata.get(threadId) as never;
         },
         list: async ({ parentThreadId }: { parentThreadId?: string }) => [...threads.values()].filter(
@@ -192,6 +194,32 @@ test("an ordinary root thread can opt into orchestration", async () => {
     label: "Local refactor",
     allowedProjectIds: ["api"],
   });
+});
+
+test("thread header RPC enables, describes, and disables orchestration", async () => {
+  const state = await load();
+  state.metadata.set("coord", {});
+  const initial = await state.harness.behavior.callRpc("thread_orchestration_get", {
+    threadId: "coord",
+  }) as { enabled: boolean; allowedProjectIds: string[]; projects: Array<{ id: string; current: boolean }> };
+  assert.equal(initial.enabled, false);
+  assert.deepEqual(initial.allowedProjectIds, []);
+  assert.deepEqual(initial.projects.map(({ id, current }) => ({ id, current })), [
+    { id: "api", current: false },
+    { id: "web", current: false },
+  ]);
+
+  await state.harness.behavior.callRpc("enable", {
+    threadId: "coord",
+    label: "Interface run",
+    projectIds: ["api", "web"],
+  });
+  assert.equal((await state.harness.behavior.callRpc("thread_orchestration_get", {
+    threadId: "coord",
+  }) as { enabled: boolean }).enabled, true);
+
+  await state.harness.behavior.callRpc("thread_orchestration_disable", { threadId: "coord" });
+  assert.deepEqual(state.metadata.get("coord"), {});
 });
 
 test("a newly activated provider is configurable without an Orchestrator code change", async () => {
