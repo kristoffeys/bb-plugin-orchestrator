@@ -32,7 +32,56 @@ type ThreadOrchestrationState = {
   projects: Array<{ id: string; name: string; current: boolean }>;
 };
 
-function ThreadOrchestrationAction({ threadId }: PluginThreadHeaderActionProps) {
+function ProjectPicker({
+  projects,
+  selectedProjects,
+  expanded,
+  onExpandedChange,
+  onToggle,
+}: {
+  projects: ThreadOrchestrationState["projects"];
+  selectedProjects: ReadonlySet<string>;
+  expanded: boolean;
+  onExpandedChange: (expanded: boolean) => void;
+  onToggle: (projectId: string) => void;
+}) {
+  const visibleProjects = expanded
+    ? projects
+    : projects.filter((project) => selectedProjects.has(project.id));
+  return (
+    <fieldset className="mt-4">
+      <legend className="text-xs font-medium text-foreground">Worker projects</legend>
+      <div className="mt-1.5 max-h-48 space-y-1 overflow-y-auto rounded-md border border-border p-1">
+        {visibleProjects.map((project) => (
+          <label key={project.id} className="flex cursor-pointer items-center gap-2.5 rounded px-2 py-2 text-sm hover:bg-accent">
+            <input
+              type="checkbox"
+              checked={selectedProjects.has(project.id)}
+              onChange={() => onToggle(project.id)}
+              className="size-4 rounded border-input accent-primary"
+            />
+            <span className="min-w-0 flex-1 truncate">{project.name}</span>
+            {project.current ? <span className="text-[11px] text-muted-foreground">Current</span> : null}
+          </label>
+        ))}
+      </div>
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => onExpandedChange(!expanded)}
+        className="mt-1.5 flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <span>{expanded ? "Show selected projects only" : "Add or remove projects"}</span>
+        <Icon name={expanded ? "ChevronUp" : "ChevronDown"} className="size-3.5" aria-hidden="true" />
+      </button>
+    </fieldset>
+  );
+}
+
+function ThreadOrchestrationAction({
+  threadId,
+  popoverSide = "bottom",
+}: PluginThreadHeaderActionProps & { popoverSide?: "top" | "bottom" }) {
   const rpc = useRpc<typeof rpcContract>();
   const [state, setState] = useState<ThreadOrchestrationState | null>(null);
   const [label, setLabel] = useState("");
@@ -41,6 +90,7 @@ function ThreadOrchestrationAction({ threadId }: PluginThreadHeaderActionProps) 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmation, setConfirmation] = useState<string | null>(null);
+  const [showAllProjects, setShowAllProjects] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -102,6 +152,7 @@ function ThreadOrchestrationAction({ threadId }: PluginThreadHeaderActionProps) 
       if (next) {
         setError(null);
         setConfirmation(null);
+        setShowAllProjects(false);
         void load();
       }
     }}>
@@ -124,9 +175,11 @@ function ThreadOrchestrationAction({ threadId }: PluginThreadHeaderActionProps) 
       </Popover.Trigger>
       <Popover.Portal>
         <Popover.Content
+          side={popoverSide}
           sideOffset={8}
           align="end"
-          className="z-[1000] w-[min(22rem,calc(100vw-1rem))] rounded-lg border border-border bg-popover p-4 text-popover-foreground shadow-lg outline-none"
+          collisionPadding={12}
+          className="z-[2147483647] max-h-[calc(var(--radix-popover-content-available-height)-0.5rem)] w-[min(22rem,calc(100vw-1rem))] overflow-y-auto rounded-lg border border-border bg-popover p-4 text-popover-foreground shadow-lg outline-none"
         >
           <div className="mb-4">
             <div className="flex items-center gap-2">
@@ -149,23 +202,13 @@ function ThreadOrchestrationAction({ threadId }: PluginThreadHeaderActionProps) 
             className="mt-1.5 h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
           />
 
-          <fieldset className="mt-4">
-            <legend className="text-xs font-medium text-foreground">Worker projects</legend>
-            <div className="mt-1.5 max-h-48 space-y-1 overflow-y-auto rounded-md border border-border p-1">
-              {state.projects.map((project) => (
-                <label key={project.id} className="flex cursor-pointer items-center gap-2.5 rounded px-2 py-2 text-sm hover:bg-accent">
-                  <input
-                    type="checkbox"
-                    checked={selectedProjects.has(project.id)}
-                    onChange={() => toggleProject(project.id)}
-                    className="size-4 rounded border-input accent-primary"
-                  />
-                  <span className="min-w-0 flex-1 truncate">{project.name}</span>
-                  {project.current ? <span className="text-[11px] text-muted-foreground">Current</span> : null}
-                </label>
-              ))}
-            </div>
-          </fieldset>
+          <ProjectPicker
+            projects={state.projects}
+            selectedProjects={selectedProjects}
+            expanded={showAllProjects}
+            onExpandedChange={setShowAllProjects}
+            onToggle={toggleProject}
+          />
 
           {error === null ? null : <p role="alert" className="mt-3 text-xs text-destructive">{error}</p>}
           {confirmation === null ? null : <p role="status" className="mt-3 text-xs text-primary">{confirmation}</p>}
@@ -205,6 +248,7 @@ function ComposerOrchestrationAction() {
       threadId={view.scope.threadId}
       projectId=""
       isCompactViewport={view.layout === "compact"}
+      popoverSide="top"
     />
   );
 }
