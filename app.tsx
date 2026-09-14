@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import * as Popover from "@radix-ui/react-popover";
 import {
   definePluginApp,
   experimental_Icon as Icon,
+  useBbNavigate,
   useRealtime,
   useRpc,
   useComposerView,
   type PluginThreadHeaderActionProps,
+  type PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server.ts";
 
@@ -78,26 +79,15 @@ function ProjectPicker({
   );
 }
 
-function ThreadOrchestrationAction({
-  threadId,
-  popoverSide = "bottom",
-}: PluginThreadHeaderActionProps & { popoverSide?: "top" | "bottom" }) {
+function ThreadOrchestrationLauncher({ threadId }: PluginThreadHeaderActionProps) {
   const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
   const [state, setState] = useState<ThreadOrchestrationState | null>(null);
-  const [label, setLabel] = useState("");
-  const [selected, setSelected] = useState<string[]>([]);
-  const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [confirmation, setConfirmation] = useState<string | null>(null);
-  const [showAllProjects, setShowAllProjects] = useState(false);
 
   const load = useCallback(async () => {
     try {
       const result = await rpc.call("thread_orchestration_get", { threadId });
       setState(result);
-      setLabel(result.label);
-      setSelected(result.allowedProjectIds);
     } catch {
       setState(null);
     }
@@ -105,9 +95,58 @@ function ThreadOrchestrationAction({
 
   useEffect(() => void load(), [load]);
   useRealtime("thread-orchestration-changed", load);
-  const selectedProjects = useMemo(() => new Set(selected), [selected]);
 
   if (state === null || !state.eligible) return null;
+
+  return (
+    <button
+      type="button"
+      aria-label={state.enabled ? "Configure orchestration" : "Enable orchestration"}
+      title={state.enabled ? "Orchestration enabled" : "Enable orchestration"}
+      onClick={() => navigate.openThreadPanel({ actionId: "orchestration", title: "Orchestration" })}
+      className={`relative grid size-7 place-items-center rounded-md outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring ${
+        state.enabled
+          ? "bg-primary/12 text-primary hover:bg-primary/20"
+          : "text-muted-foreground hover:bg-accent hover:text-foreground"
+      }`}
+    >
+      <Icon name="Workflow" className="size-4" aria-hidden="true" />
+      {state.enabled ? (
+        <span className="absolute right-0.5 top-0.5 size-1.5 rounded-full bg-primary ring-1 ring-background" />
+      ) : null}
+    </button>
+  );
+}
+
+function OrchestrationPanel({ threadId }: PluginThreadPanelProps) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [state, setState] = useState<ThreadOrchestrationState | null>(null);
+  const [label, setLabel] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [confirmation, setConfirmation] = useState<string | null>(null);
+  const [showAllProjects, setShowAllProjects] = useState(false);
+
+  const load = useCallback(async () => {
+    const result = await rpc.call("thread_orchestration_get", { threadId });
+    setState(result);
+    setLabel(result.label);
+    setSelected(result.allowedProjectIds);
+  }, [rpc, threadId]);
+
+  useEffect(() => { void load().catch((cause: unknown) => {
+    setError(cause instanceof Error ? cause.message : "Could not load orchestration.");
+  }); }, [load]);
+  useRealtime("thread-orchestration-changed", load);
+  const selectedProjects = useMemo(() => new Set(selected), [selected]);
+
+  if (state === null) {
+    return <p className="text-sm text-muted-foreground">Loading orchestration…</p>;
+  }
+  if (!state.eligible) {
+    return <p className="text-sm text-muted-foreground">This thread cannot manage workers.</p>;
+  }
 
   const toggleProject = (projectId: string) => {
     setSelected((current) => current.includes(projectId)
@@ -147,96 +186,62 @@ function ThreadOrchestrationAction({
   };
 
   return (
-    <Popover.Root open={open} onOpenChange={(next) => {
-      setOpen(next);
-      if (next) {
-        setError(null);
-        setConfirmation(null);
-        setShowAllProjects(false);
-        void load();
-      }
-    }}>
-      <Popover.Trigger asChild>
+    <div className="mx-auto w-full max-w-lg">
+      <div className="mb-5 flex items-start gap-3">
+        <span className={`mt-1 size-2 rounded-full ${state.enabled ? "bg-primary" : "bg-muted-foreground/35"}`} />
+        <div>
+          <p className="text-sm font-medium text-foreground">
+            {state.enabled ? "Orchestration is enabled" : "Orchestrate this thread"}
+          </p>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            Create visible, managed workers in the selected projects.
+          </p>
+        </div>
+      </div>
+
+      <label className="block text-xs font-medium text-foreground" htmlFor={`orchestrator-label-${threadId}`}>
+        Worker group label
+      </label>
+      <input
+        id={`orchestrator-label-${threadId}`}
+        value={label}
+        maxLength={200}
+        onChange={(event) => { setLabel(event.target.value); setConfirmation(null); }}
+        className="mt-1.5 h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      />
+
+      <ProjectPicker
+        projects={state.projects}
+        selectedProjects={selectedProjects}
+        expanded={showAllProjects}
+        onExpandedChange={setShowAllProjects}
+        onToggle={toggleProject}
+      />
+
+      {error === null ? null : <p role="alert" className="mt-3 text-xs text-destructive">{error}</p>}
+      {confirmation === null ? null : <p role="status" className="mt-3 text-xs text-primary">{confirmation}</p>}
+
+      <div className="mt-5 flex items-center justify-between gap-3 border-t border-border pt-4">
+        {state.enabled ? (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void disable()}
+            className="rounded-md px-2 py-1.5 text-xs font-medium text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+          >
+            Disable
+          </button>
+        ) : <span />}
         <button
           type="button"
-          aria-label={state.enabled ? "Configure orchestration" : "Enable orchestration"}
-          title={state.enabled ? "Orchestration enabled" : "Enable orchestration"}
-          className={`relative grid size-7 place-items-center rounded-md outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring ${
-            state.enabled
-              ? "bg-primary/12 text-primary hover:bg-primary/20"
-              : "text-muted-foreground hover:bg-accent hover:text-foreground"
-          }`}
+          disabled={busy || label.trim().length === 0 || selected.length === 0}
+          onClick={() => void save()}
+          className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-45"
         >
-          <Icon name="Workflow" className="size-4" aria-hidden="true" />
-          {state.enabled ? (
-            <span className="absolute right-0.5 top-0.5 size-1.5 rounded-full bg-primary ring-1 ring-background" />
-          ) : null}
+          {busy ? "Saving…" : state.enabled ? "Save projects" : "Enable orchestration"}
         </button>
-      </Popover.Trigger>
-      <Popover.Portal>
-        <Popover.Content
-          side={popoverSide}
-          sideOffset={8}
-          align="end"
-          collisionPadding={12}
-          className="z-[2147483647] max-h-[calc(var(--radix-popover-content-available-height)-0.5rem)] w-[min(22rem,calc(100vw-1rem))] overflow-y-auto rounded-lg border border-border bg-popover p-4 text-popover-foreground shadow-lg outline-none"
-        >
-          <div className="mb-4">
-            <div className="flex items-center gap-2">
-              <span className={`size-2 rounded-full ${state.enabled ? "bg-primary" : "bg-muted-foreground/35"}`} />
-              <h2 className="text-sm font-semibold">Orchestrate this thread</h2>
-            </div>
-            <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
-              Let this thread create visible, managed workers in the selected projects.
-            </p>
-          </div>
-
-          <label className="block text-xs font-medium text-foreground" htmlFor={`orchestrator-label-${threadId}`}>
-            Worker group label
-          </label>
-          <input
-            id={`orchestrator-label-${threadId}`}
-            value={label}
-            maxLength={200}
-            onChange={(event) => { setLabel(event.target.value); setConfirmation(null); }}
-            className="mt-1.5 h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          />
-
-          <ProjectPicker
-            projects={state.projects}
-            selectedProjects={selectedProjects}
-            expanded={showAllProjects}
-            onExpandedChange={setShowAllProjects}
-            onToggle={toggleProject}
-          />
-
-          {error === null ? null : <p role="alert" className="mt-3 text-xs text-destructive">{error}</p>}
-          {confirmation === null ? null : <p role="status" className="mt-3 text-xs text-primary">{confirmation}</p>}
-
-          <div className="mt-4 flex items-center justify-between gap-3">
-            {state.enabled ? (
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() => void disable()}
-                className="rounded-md px-2 py-1.5 text-xs font-medium text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-              >
-                Disable
-              </button>
-            ) : <span />}
-            <button
-              type="button"
-              disabled={busy || label.trim().length === 0 || selected.length === 0}
-              onClick={() => void save()}
-              className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-45"
-            >
-              {busy ? "Saving…" : state.enabled ? "Save projects" : "Enable orchestration"}
-            </button>
-          </div>
-          <Popover.Arrow className="fill-border" />
-        </Popover.Content>
-      </Popover.Portal>
-    </Popover.Root>
+      </div>
+    </div>
   );
 }
 
@@ -244,11 +249,10 @@ function ComposerOrchestrationAction() {
   const view = useComposerView();
   if (view.scope.kind !== "thread") return null;
   return (
-    <ThreadOrchestrationAction
+    <ThreadOrchestrationLauncher
       threadId={view.scope.threadId}
       projectId=""
       isCompactViewport={view.layout === "compact"}
-      popoverSide="top"
     />
   );
 }
@@ -430,7 +434,14 @@ export default definePluginApp((app) => {
   app.slots.experimental_threadHeaderAction({
     id: "thread-orchestration",
     title: "Thread orchestration",
-    component: ThreadOrchestrationAction,
+    component: ThreadOrchestrationLauncher,
+  });
+  app.slots.threadPanelAction({
+    id: "orchestration",
+    title: "Orchestration",
+    icon: "Workflow",
+    component: OrchestrationPanel,
+    layout: "padded",
   });
   app.slots.settingsSection({
     id: "model-routing",

@@ -14,9 +14,9 @@ task, and allowed project ids through the `start` RPC; they do not manage worker
 threads themselves.
 
 Ordinary root project threads can orchestrate too. Click the workflow icon in
-the chat composer or thread header, choose the projects workers may use, and
-enable it. The very next ordinary prompt can dispatch workers: no separate
-enable message is needed. The compact view shows selected projects only;
+the chat composer or thread header to open BB's Orchestration side panel,
+choose the projects workers may use, and enable it. The very next ordinary
+prompt can dispatch workers: no separate enable message is needed. The compact view shows selected projects only;
 expand **Add or remove projects** for the uncommon cross-project case. The
 same control can update the project scope or disable orchestration.
 As an alternative, asking the agent to enable orchestration exposes the
