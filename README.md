@@ -14,9 +14,9 @@ task, and allowed project ids through the `start` RPC; they do not manage worker
 threads themselves.
 
 Ordinary root project threads can orchestrate too. Click the workflow icon in
-the thread header, choose the projects workers may use, and enable it. The very
-next ordinary prompt can dispatch workers: no separate enable message is
-needed. The same control can update the project scope or disable orchestration.
+the chat composer or thread header, choose the projects workers may use, and
+enable it. The very next ordinary prompt can dispatch workers: no separate
+enable message is needed. The same control can update the project scope or disable orchestration.
 As an alternative, asking the agent to enable orchestration exposes the
 `orchestrator_enable` tool. Opt-in keeps routine threads from acquiring
 worker-management tools by default.

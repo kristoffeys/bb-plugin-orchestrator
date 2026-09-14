@@ -5,6 +5,7 @@ import {
   experimental_Icon as Icon,
   useRealtime,
   useRpc,
+  useComposerView,
   type PluginThreadHeaderActionProps,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server.ts";
@@ -196,6 +197,18 @@ function ThreadOrchestrationAction({ threadId }: PluginThreadHeaderActionProps) 
   );
 }
 
+function ComposerOrchestrationAction() {
+  const view = useComposerView();
+  if (view.scope.kind !== "thread") return null;
+  return (
+    <ThreadOrchestrationAction
+      threadId={view.scope.threadId}
+      projectId=""
+      isCompactViewport={view.layout === "compact"}
+    />
+  );
+}
+
 function RoutingSettings() {
   const rpc = useRpc<typeof rpcContract>();
   const [providers, setProviders] = useState<
@@ -365,6 +378,11 @@ function RoutingSettings() {
 }
 
 export default definePluginApp((app) => {
+  app.composer.customize({
+    id: "thread-orchestration",
+    scopes: ["thread"],
+    actions: [{ id: "configure", component: ComposerOrchestrationAction }],
+  });
   app.slots.experimental_threadHeaderAction({
     id: "thread-orchestration",
     title: "Thread orchestration",
