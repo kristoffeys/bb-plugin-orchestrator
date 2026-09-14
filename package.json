@@ -1,0 +1,38 @@
+{
+  "name": "bb-plugin-orchestrator",
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kristoffeys/bb-plugin-orchestrator.git"
+  },
+  "type": "module",
+  "engines": {
+    "bb": ">=0.43",
+    "bbPluginSdk": ">=0.4.87"
+  },
+  "bb": {
+    "name": "Orchestrator",
+    "description": "Managed BB workers with lifecycle, communication, and cost-aware model routing.",
+    "branding": {
+      "icon": "Workflow"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.4.87",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  },
+  "scripts": {
+    "build": "bb plugin build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  }
+}
