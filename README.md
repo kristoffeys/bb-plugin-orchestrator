@@ -5,7 +5,7 @@ Managed, visible BB worker threads for multi-project and multi-workstream jobs.
 ## Install
 
 ```sh
-bb plugin install git:https://github.com/kristoffeys/bb-plugin-orchestrator.git@main
+bb plugin install git:https://github.com/kristoffeys/bb-plugin-orchestrator.git@semver:^0.1.0
 ```
 
 The plugin owns worker reconciliation, parent/worker messaging, runtime cleanup,
