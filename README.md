@@ -107,14 +107,25 @@ providers. Completed work records success, duration, and observed tokens;
 measured recommendations appear after three samples and never change routing
 without an explicit save.
 
-Reasoning is configured per profile as an exact level or `model-default`.
-Exact levels must appear in the selected model's
+Reasoning is configured beside every exact provider/model route, both in the
+provider-local table and cross-provider profile strategy. This means two
+models from the same provider can use different reasoning values. Exact levels must appear in the selected model's
 `supportedReasoningEfforts`; invalid combinations are rejected and never
 silently downgraded. `model-default` resolves to the model's declared default.
 Each spawn sends the resolved SDK `reasoningLevel` as an explicit execution
 input, while metadata and status keep both the requested choice and effective
 level. A worker assignment may override its profile's reasoning; nested
-assignments otherwise inherit profile routing.
+assignments otherwise inherit their parent's resolved provider/model route.
+
+### Routing policy compatibility
+
+Existing saved `profileReasoning` policies are upgraded on their first load.
+For cross-provider routes, the old profile choice is attached to that profile's
+selected provider/model target. For provider-local routes, it is attached to
+the corresponding selected model. The upgraded records are persisted, while
+the old `profileReasoning` field is removed. If the selected model no longer
+supports that old exact choice, saving or dispatching reports a clear validation
+error; selecting `model-default` explicitly uses the model's current default.
 
 Workers publish structured completion records and versioned API/schema/
 interface artifacts. Named consumer workstreams receive artifact handoffs

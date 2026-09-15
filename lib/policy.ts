@@ -57,6 +57,7 @@ export function effectiveProtectedBranches(policy: Pick<OrchestrationPolicy, "pr
 export const routeTarget = z.object({
   providerId: z.string().min(1),
   modelId: z.string().min(1),
+  reasoningLevel: reasoningChoice.default("model-default"),
 });
 export const profileRouteTargets = z.object({
   quick: routeTarget.nullable(),
@@ -76,17 +77,22 @@ export const EMPTY_PROFILE_ROUTES: ProfileRouteTargets = {
 export const routingPolicy = z.object({
   strategy: providerStrategy,
   profileRoutes: profileRouteTargets,
-  profileReasoning: z.object({
-    quick: reasoningChoice,
-    standard: reasoningChoice,
-    complex: reasoningChoice,
-    critical: reasoningChoice,
-  }).default({ quick: "low", standard: "medium", complex: "high", critical: "xhigh" }),
 });
 export type RoutingPolicy = z.infer<typeof routingPolicy>;
+
+/** The pre-0.3 policy is accepted only while loading persisted settings. */
+export const legacyRoutingPolicy = z.object({
+  strategy: providerStrategy,
+  profileRoutes: z.object({ quick: z.object({ providerId: z.string().min(1), modelId: z.string().min(1) }).nullable(), standard: z.object({ providerId: z.string().min(1), modelId: z.string().min(1) }).nullable(), complex: z.object({ providerId: z.string().min(1), modelId: z.string().min(1) }).nullable(), critical: z.object({ providerId: z.string().min(1), modelId: z.string().min(1) }).nullable() }),
+  profileReasoning: z.object({ quick: reasoningChoice, standard: reasoningChoice, complex: reasoningChoice, critical: reasoningChoice }),
+});
+
+export const providerRouteTarget = z.object({ modelId: z.string().min(1), reasoningLevel: reasoningChoice.default("model-default") });
+export const providerProfileRoutes = z.object({ quick: providerRouteTarget, standard: providerRouteTarget, complex: providerRouteTarget, critical: providerRouteTarget });
+export type ProviderProfileRoutes = z.infer<typeof providerProfileRoutes>;
+export const legacyProviderProfileRoutes = z.object({ quick: z.string().min(1), standard: z.string().min(1), complex: z.string().min(1), critical: z.string().min(1) });
 
 export const DEFAULT_ROUTING_POLICY: RoutingPolicy = {
   strategy: "coordinator",
   profileRoutes: EMPTY_PROFILE_ROUTES,
-  profileReasoning: { quick: "low", standard: "medium", complex: "high", critical: "xhigh" },
 };

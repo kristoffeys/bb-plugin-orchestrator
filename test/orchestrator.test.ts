@@ -141,7 +141,7 @@ async function load(providerId = "codex", options: { delayedAttachmentGets?: num
     },
   });
   await plugin(bb);
-  return { harness, metadata, threads, spawned, sent, archived, stopped, retries, eventRows };
+  return { bb, harness, metadata, threads, spawned, sent, archived, stopped, retries, eventRows };
 }
 
 test("start creates a personal coordinator with generic Orchestrator identity", async () => {
@@ -361,10 +361,10 @@ test("a newly activated provider is configurable without an Orchestrator code ch
   await state.harness.behavior.callRpc("routing_set_provider", {
     providerId: "opencode",
     routes: {
-      quick: "budget-code",
-      standard: "balanced-code",
-      complex: "deep-code",
-      critical: "deep-code",
+      quick: { modelId: "budget-code", reasoningLevel: "model-default" },
+      standard: { modelId: "balanced-code", reasoningLevel: "model-default" },
+      complex: { modelId: "deep-code", reasoningLevel: "model-default" },
+      critical: { modelId: "deep-code", reasoningLevel: "model-default" },
     },
   });
   const dispatched = JSON.parse(await state.harness.behavior.callAgentTool(
@@ -834,13 +834,12 @@ test("protected branches and push approval are enforced independently", async ()
   await pushAllowed.state.harness.behavior.callAgentTool("orchestrator_worker_done", { ...pushed, pushApproval: { approvedByUser: true, evidence: "User explicitly approved this push." } }, { threadId: pushAllowed.worker.threadId, projectId: "api" });
 });
 
-test("configured reasoning is passed explicitly to spawned threads for every supported level", async () => {
+test("exact provider/model routes retain distinct reasoning and pass explicit spawn inputs", async () => {
   for (const level of ["low", "medium", "high", "xhigh"] as const) {
     const state = await load();
     await state.harness.behavior.callRpc("routing_policy_set", {
-      strategy: "coordinator",
-      profileRoutes: { quick: null, standard: null, complex: null, critical: null },
-      profileReasoning: { quick: level, standard: "medium", complex: "high", critical: "xhigh" },
+      strategy: "profile",
+      profileRoutes: { quick: { providerId: "codex", modelId: "gpt-5.6-luna", reasoningLevel: level }, standard: { providerId: "codex", modelId: "gpt-5.6-terra", reasoningLevel: "medium" }, complex: null, critical: null },
     });
     const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
       assignments: [{ key: `reason-${level}`, projectId: "api", prompt: "Use configured reasoning." }],
@@ -853,27 +852,49 @@ test("configured reasoning is passed explicitly to spawned threads for every sup
   }
 });
 
+test("provider-local routes keep reasoning with each exact model", async () => {
+  const state = await load();
+  await state.harness.behavior.callRpc("routing_set_provider", { providerId: "codex", routes: {
+    quick: { modelId: "gpt-5.6-luna", reasoningLevel: "low" },
+    standard: { modelId: "gpt-5.6-terra", reasoningLevel: "xhigh" },
+    complex: { modelId: "gpt-5.6-sol", reasoningLevel: "high" },
+    critical: { modelId: "gpt-6-astra", reasoningLevel: "xhigh" },
+  } });
+  const workers = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [
+    { key: "quick", projectId: "api", prompt: "Quick." },
+    { key: "standard", projectId: "web", prompt: "Standard.", profile: "standard", complexityReason: "Needs ordinary implementation judgment." },
+  ] }, { threadId: "coord", projectId: "personal" }) as string).workers;
+  assert.deepEqual(workers.map((worker: { model: string; configuredReasoningLevel: string; reasoningLevel: string }) => [worker.model, worker.configuredReasoningLevel, worker.reasoningLevel]), [
+    ["gpt-5.6-luna", "low", "low"], ["gpt-5.6-terra", "xhigh", "xhigh"],
+  ]);
+});
+
+test("legacy profile reasoning migrates onto persisted exact routes", async () => {
+  const state = await load();
+  await state.bb.storage.kv.set("routing-policy", {
+    strategy: "profile",
+    profileRoutes: { quick: { providerId: "codex", modelId: "gpt-5.6-luna" }, standard: null, complex: null, critical: null },
+    profileReasoning: { quick: "high", standard: "medium", complex: "high", critical: "xhigh" },
+  });
+  await state.bb.storage.kv.set("provider-routes", { codex: {
+    quick: "gpt-5.6-luna", standard: "gpt-5.6-terra", complex: "gpt-5.6-sol", critical: "gpt-6-astra",
+  } });
+  const routing = await state.harness.behavior.callRpc("routing_get", null) as { policy: { profileRoutes: { quick: { reasoningLevel: string } | null } }; routes: { codex: { quick: { reasoningLevel: string } } } };
+  assert.equal(routing.policy.profileRoutes.quick?.reasoningLevel, "high");
+  assert.equal(routing.routes.codex.quick.reasoningLevel, "high");
+  assert.deepEqual(await state.bb.storage.kv.get("routing-policy"), routing.policy);
+});
+
 test("reasoning rejects unsupported levels and model-default uses the declared default", async () => {
   const invalid = await load();
   await assert.rejects(invalid.harness.behavior.callRpc("routing_policy_set", {
     strategy: "profile",
-    profileRoutes: { quick: { providerId: "codex", modelId: "gpt-5.6-luna" }, standard: null, complex: null, critical: null },
-    profileReasoning: { quick: "max", standard: "medium", complex: "high", critical: "xhigh" },
+    profileRoutes: { quick: { providerId: "codex", modelId: "gpt-5.6-luna", reasoningLevel: "max" }, standard: null, complex: null, critical: null },
   }), /not supported/);
-  await invalid.harness.behavior.callRpc("routing_policy_set", {
-    strategy: "coordinator",
-    profileRoutes: { quick: null, standard: null, complex: null, critical: null },
-    profileReasoning: { quick: "max", standard: "medium", complex: "high", critical: "xhigh" },
-  });
-  await assert.rejects(invalid.harness.behavior.callAgentTool("orchestrator_dispatch", {
-    assignments: [{ key: "invalid", projectId: "api", prompt: "Invalid reasoning." }],
-  }, { threadId: "coord", projectId: "personal" }), /Supported levels/);
-
   const defaults = await load();
   await defaults.harness.behavior.callRpc("routing_policy_set", {
-    strategy: "coordinator",
-    profileRoutes: { quick: null, standard: null, complex: null, critical: null },
-    profileReasoning: { quick: "model-default", standard: "medium", complex: "high", critical: "xhigh" },
+    strategy: "profile",
+    profileRoutes: { quick: { providerId: "codex", modelId: "gpt-5.6-luna", reasoningLevel: "model-default" }, standard: null, complex: null, critical: null },
   });
   const worker = JSON.parse(await defaults.harness.behavior.callAgentTool("orchestrator_dispatch", {
     assignments: [{ key: "default", projectId: "api", prompt: "Use model default." }],
@@ -887,8 +908,7 @@ test("reasoning policy survives reload and descendants inherit or override their
   const state = await load();
   await state.harness.behavior.callRpc("routing_policy_set", {
     strategy: "profile",
-    profileRoutes: { quick: { providerId: "opencode", modelId: "budget-code" }, standard: null, complex: null, critical: null },
-    profileReasoning: { quick: "high", standard: "medium", complex: "high", critical: "xhigh" },
+    profileRoutes: { quick: { providerId: "opencode", modelId: "budget-code", reasoningLevel: "high" }, standard: null, complex: null, critical: null },
   });
   const root = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
     assignments: [{ key: "root", projectId: "api", prompt: "Root.", reasoningLevel: "low" }],
@@ -903,9 +923,9 @@ test("reasoning policy survives reload and descendants inherit or override their
   assert.deepEqual(delegated.workers.map((item: { providerId: string; model: string }) => [item.providerId, item.model]), [["opencode", "budget-code"], ["opencode", "budget-code"]]);
   const reloaded = await state.harness.lifecycle.reload(plugin);
   const status = JSON.parse(await reloaded.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
-  assert.equal(status.routing.policy.profileReasoning.quick, "high");
-  assert.deepEqual(status.workstreams.map((item: { requestedReasoningLevel: string; reasoningLevel: string }) => [item.requestedReasoningLevel, item.reasoningLevel]), [
-    ["low", "low"], ["high", "high"], ["medium", "medium"],
+  assert.equal(status.routing.policy.profileRoutes.quick.reasoningLevel, "high");
+  assert.deepEqual(status.workstreams.map((item: { configuredReasoningLevel: string; requestedReasoningLevel: string; effectiveReasoningLevel: string }) => [item.configuredReasoningLevel, item.requestedReasoningLevel, item.effectiveReasoningLevel]), [
+    ["high", "low", "low"], ["high", "high", "high"], ["high", "medium", "medium"],
   ]);
 });
 

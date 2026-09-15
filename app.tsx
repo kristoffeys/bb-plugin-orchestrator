@@ -12,12 +12,11 @@ import {
 import type { rpcContract } from "./server.ts";
 
 const PROFILES = ["quick", "standard", "complex", "critical"] as const;
-const REASONING_CHOICES: ReasoningChoice[] = ["model-default", "none", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"];
 type Profile = (typeof PROFILES)[number];
-type Routes = Record<Profile, string>;
-type RouteTarget = { providerId: string; modelId: string } | null;
+type Routes = Record<Profile, { modelId: string; reasoningLevel: ReasoningChoice }>;
+type RouteTarget = { providerId: string; modelId: string; reasoningLevel: ReasoningChoice } | null;
 type ReasoningChoice = "model-default" | "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "ultracode";
-type RoutingPolicy = { strategy: "coordinator" | "profile"; profileRoutes: Record<Profile, RouteTarget>; profileReasoning: Record<Profile, ReasoningChoice> };
+type RoutingPolicy = { strategy: "coordinator" | "profile"; profileRoutes: Record<Profile, RouteTarget> };
 type OrchestrationPolicy = {
   maxParallelWorkers: number;
   maxWorkersPerRun: number;
@@ -429,7 +428,7 @@ function RoutingSettings() {
   >([] as never);
   const [storedRoutes, setStoredRoutes] = useState<Record<string, Routes>>({});
   const [drafts, setDrafts] = useState<Record<string, Routes>>({});
-  const initialRoutingPolicy: RoutingPolicy = { strategy: "coordinator", profileRoutes: { quick: null, standard: null, complex: null, critical: null }, profileReasoning: { quick: "low", standard: "medium", complex: "high", critical: "xhigh" } };
+  const initialRoutingPolicy: RoutingPolicy = { strategy: "coordinator", profileRoutes: { quick: null, standard: null, complex: null, critical: null } };
   const [routePolicy, setRoutePolicy] = useState<RoutingPolicy>(initialRoutingPolicy);
   const [savedRoutePolicy, setSavedRoutePolicy] = useState<RoutingPolicy>(initialRoutingPolicy);
   const [metrics, setMetrics] = useState<Array<{ providerId: string; model: string; profile: Profile; samples: number; successes: number; failures: number; averageDurationMs: number; averageTokens: number }>>([]);
@@ -455,9 +454,11 @@ function RoutingSettings() {
       setDrafts((current) => {
         const next = { ...current };
         for (const provider of catalog.providers) {
-          const initial = routing.routes[provider.id] ?? provider.recommendedRoutes;
-          if (next[provider.id] === undefined && initial !== null) {
-            next[provider.id] = initial;
+          const savedRoutes = routing.routes[provider.id];
+          if (next[provider.id] === undefined && savedRoutes !== undefined) {
+            next[provider.id] = savedRoutes;
+          } else if (next[provider.id] === undefined && provider.recommendedRoutes !== null) {
+            next[provider.id] = Object.fromEntries(PROFILES.map((profile) => [profile, { modelId: provider.recommendedRoutes![profile], reasoningLevel: "model-default" }])) as Routes;
           }
         }
         return next;
@@ -541,9 +542,8 @@ function RoutingSettings() {
           const fallback = providers[0];
           setRoutePolicy({
             strategy,
-            profileReasoning: routePolicy.profileReasoning,
             profileRoutes: strategy === "profile" && fallback !== undefined
-              ? Object.fromEntries(PROFILES.map((profile) => [profile, routePolicy.profileRoutes[profile] ?? { providerId: fallback.id, modelId: fallback.recommendedRoutes?.[profile] ?? fallback.models[0]?.id ?? "" }])) as Record<Profile, RouteTarget>
+              ? Object.fromEntries(PROFILES.map((profile) => [profile, routePolicy.profileRoutes[profile] ?? { providerId: fallback.id, modelId: fallback.recommendedRoutes?.[profile] ?? fallback.models[0]?.id ?? "", reasoningLevel: "model-default" }])) as Record<Profile, RouteTarget>
               : routePolicy.profileRoutes,
           });
         }} className="mt-3 h-9 w-full rounded-md border border-input bg-background px-3 text-sm sm:w-64"><option value="coordinator">Stay with coordinator provider</option><option value="profile">Route by workload profile</option></select>
@@ -556,9 +556,9 @@ function RoutingSettings() {
                 <div key={profile} className="grid gap-1.5">
                   <span className="text-sm font-medium text-foreground">{PROFILE_COPY[profile].label}</span>
                   <div className="grid grid-cols-3 gap-2">
-                    <select aria-label={`${PROFILE_COPY[profile].label} provider`} value={provider?.id ?? ""} onChange={(event) => { const nextProvider = providers.find((item) => item.id === event.target.value); const nextModel = nextProvider?.recommendedRoutes?.[profile] ?? nextProvider?.models[0]?.id ?? ""; setRoutePolicy({ ...routePolicy, profileRoutes: { ...routePolicy.profileRoutes, [profile]: nextProvider === undefined ? null : { providerId: nextProvider.id, modelId: nextModel } } }); }} className="h-9 rounded-md border border-input bg-background px-2 text-sm">{providers.map((item) => <option key={item.id} value={item.id}>{item.displayName}</option>)}</select>
-                    <select aria-label={`${PROFILE_COPY[profile].label} model`} value={target?.modelId ?? provider?.recommendedRoutes?.[profile] ?? provider?.models[0]?.id ?? ""} onChange={(event) => { if (provider !== undefined) setRoutePolicy({ ...routePolicy, profileRoutes: { ...routePolicy.profileRoutes, [profile]: { providerId: provider.id, modelId: event.target.value } } }); }} className="h-9 min-w-0 rounded-md border border-input bg-background px-2 text-sm">{provider?.models.map((item) => <option key={item.id} value={item.id}>{item.displayName}</option>)}</select>
-                    <select aria-label={`${PROFILE_COPY[profile].label} reasoning`} value={routePolicy.profileReasoning[profile]} onChange={(event) => setRoutePolicy({ ...routePolicy, profileReasoning: { ...routePolicy.profileReasoning, [profile]: event.target.value as ReasoningChoice } })} className="h-9 min-w-0 rounded-md border border-input bg-background px-2 text-sm">{REASONING_CHOICES.map((choice) => <option key={choice} value={choice}>{choice}</option>)}</select>
+                    <select aria-label={`${PROFILE_COPY[profile].label} provider`} value={provider?.id ?? ""} onChange={(event) => { const nextProvider = providers.find((item) => item.id === event.target.value); const nextModel = nextProvider?.recommendedRoutes?.[profile] ?? nextProvider?.models[0]?.id ?? ""; setRoutePolicy({ ...routePolicy, profileRoutes: { ...routePolicy.profileRoutes, [profile]: nextProvider === undefined ? null : { providerId: nextProvider.id, modelId: nextModel, reasoningLevel: "model-default" } } }); }} className="h-9 rounded-md border border-input bg-background px-2 text-sm">{providers.map((item) => <option key={item.id} value={item.id}>{item.displayName}</option>)}</select>
+                    <select aria-label={`${PROFILE_COPY[profile].label} model`} value={target?.modelId ?? provider?.recommendedRoutes?.[profile] ?? provider?.models[0]?.id ?? ""} onChange={(event) => { if (provider !== undefined) setRoutePolicy({ ...routePolicy, profileRoutes: { ...routePolicy.profileRoutes, [profile]: { providerId: provider.id, modelId: event.target.value, reasoningLevel: "model-default" } } }); }} className="h-9 min-w-0 rounded-md border border-input bg-background px-2 text-sm">{provider?.models.map((item) => <option key={item.id} value={item.id}>{item.displayName}</option>)}</select>
+                    <select aria-label={`${PROFILE_COPY[profile].label} reasoning`} value={target?.reasoningLevel ?? "model-default"} onChange={(event) => setRoutePolicy({ ...routePolicy, profileRoutes: { ...routePolicy.profileRoutes, [profile]: target === null ? null : { ...target, reasoningLevel: event.target.value as ReasoningChoice } } })} className="h-9 min-w-0 rounded-md border border-input bg-background px-2 text-sm"><option value="model-default">model-default</option>{provider?.models.find((model) => model.id === target?.modelId)?.supportedReasoningLevels.map((choice) => <option key={choice} value={choice}>{choice}</option>)}</select>
                   </div>
                 </div>
               );
@@ -567,13 +567,6 @@ function RoutingSettings() {
         ) : null}
       </section>
 
-      {routePolicy.strategy === "coordinator" ? (
-        <section className="rounded-lg border border-border bg-card px-4 py-4 sm:px-5">
-          <h3 className="text-sm font-semibold text-foreground">Profile reasoning</h3>
-          <p className="mt-0.5 text-xs text-muted-foreground">Exact levels are checked against the selected model at dispatch. Model-default uses that model’s declared default.</p>
-          <div className="mt-3 grid gap-3 sm:grid-cols-4">{PROFILES.map((profile) => <label key={profile}><span className="mb-1 block text-xs font-medium text-foreground">{PROFILE_COPY[profile].label}</span><select value={routePolicy.profileReasoning[profile]} onChange={(event) => setRoutePolicy({ ...routePolicy, profileReasoning: { ...routePolicy.profileReasoning, [profile]: event.target.value as ReasoningChoice } })} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">{REASONING_CHOICES.map((choice) => <option key={choice} value={choice}>{choice}</option>)}</select></label>)}</div>
-        </section>
-      ) : null}
 
       {recommendations.length === 0 ? (
         <p className="text-xs text-muted-foreground">Measured recommendations appear after three completed samples for a profile and model. Routes never change automatically.</p>
@@ -619,7 +612,8 @@ function RoutingSettings() {
                 ) : (
                   <div className="space-y-3">
                     {PROFILES.map((profile) => {
-                      const selectedId = routes?.[profile] ?? "";
+                      const route = routes?.[profile];
+                      const selectedId = route?.modelId ?? "";
                       const selected = provider.models.find((model) => model.id === selectedId);
                       return (
                         <div key={profile} className="grid gap-1.5 sm:grid-cols-[9rem_minmax(0,1fr)] sm:items-center sm:gap-4">
@@ -627,15 +621,15 @@ function RoutingSettings() {
                             <span className="block text-sm font-medium text-foreground">{PROFILE_COPY[profile].label}</span>
                             <span className="block text-xs text-muted-foreground">{PROFILE_COPY[profile].description}</span>
                           </label>
-                          <div>
+                          <div className="grid gap-2 sm:grid-cols-2">
                             <select
                               id={`${provider.id}-${profile}`}
                               value={selectedId}
                               onChange={(event) => setDrafts((current) => ({
                                 ...current,
                                 [provider.id]: {
-                                  ...(current[provider.id] ?? provider.recommendedRoutes!),
-                                  [profile]: event.target.value,
+                                  ...(current[provider.id] ?? Object.fromEntries(PROFILES.map((item) => [item, { modelId: provider.recommendedRoutes?.[item] ?? provider.models[0]?.id ?? "", reasoningLevel: "model-default" }])) as Routes),
+                                  [profile]: { modelId: event.target.value, reasoningLevel: "model-default" },
                                 },
                               }))}
                               className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -643,6 +637,9 @@ function RoutingSettings() {
                               {provider.models.map((model) => (
                                 <option key={model.id} value={model.id}>{model.displayName}</option>
                               ))}
+                            </select>
+                            <select aria-label={`${provider.displayName} ${PROFILE_COPY[profile].label} reasoning`} value={route?.reasoningLevel ?? "model-default"} onChange={(event) => setDrafts((current) => ({ ...current, [provider.id]: { ...(current[provider.id]!), [profile]: { modelId: selectedId, reasoningLevel: event.target.value as ReasoningChoice } } }))} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                              <option value="model-default">model-default</option>{selected?.supportedReasoningLevels.map((choice) => <option key={choice} value={choice}>{choice}</option>)}
                             </select>
                             {selected === undefined ? null : (
                               <p className="mt-1 text-xs text-muted-foreground">

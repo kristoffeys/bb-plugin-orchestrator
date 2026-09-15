@@ -31,6 +31,7 @@ export interface WorkstreamRecord {
   complexityReason: string | null;
   providerId: string;
   model: string;
+  configuredReasoningLevel: string;
   requestedReasoningLevel: string;
   reasoningLevel: string;
   state: WorkstreamState;
@@ -160,14 +161,14 @@ export class OrchestratorStore {
     this.db.prepare(`
       INSERT INTO workstreams (
         coordinator_thread_id, key, parent_key, depth, access_mode, project_id, title, assignment, profile, complexity_reason,
-        provider_id, model, requested_reasoning_level, reasoning_level, state, thread_id, attempt_count, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        provider_id, model, configured_reasoning_level, requested_reasoning_level, reasoning_level, state, thread_id, attempt_count, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(coordinator_thread_id, key) DO UPDATE SET
         parent_key = excluded.parent_key, depth = excluded.depth, access_mode = excluded.access_mode,
         project_id = excluded.project_id, title = excluded.title, assignment = excluded.assignment,
         profile = excluded.profile, complexity_reason = excluded.complexity_reason,
         provider_id = excluded.provider_id, model = excluded.model,
-        requested_reasoning_level = excluded.requested_reasoning_level,
+        configured_reasoning_level = excluded.configured_reasoning_level, requested_reasoning_level = excluded.requested_reasoning_level,
         reasoning_level = excluded.reasoning_level, state = excluded.state,
         thread_id = excluded.thread_id, attempt_count = excluded.attempt_count,
         updated_at = excluded.updated_at, started_at = NULL, completed_at = NULL,
@@ -175,7 +176,7 @@ export class OrchestratorStore {
         result_json = NULL, error = NULL
     `).run(
       input.coordinatorThreadId, input.key, input.parentKey, input.depth, input.accessMode, input.projectId, input.title, input.assignment,
-      input.profile, input.complexityReason, input.providerId, input.model, input.requestedReasoningLevel, input.reasoningLevel,
+      input.profile, input.complexityReason, input.providerId, input.model, input.configuredReasoningLevel, input.requestedReasoningLevel, input.reasoningLevel,
       input.state, input.threadId, input.attemptCount, now, now,
     );
     return this.getWorkstream(input.coordinatorThreadId, input.key)!;
@@ -186,7 +187,7 @@ export class OrchestratorStore {
       SELECT coordinator_thread_id AS coordinatorThreadId, key, parent_key AS parentKey,
         depth, access_mode AS accessMode, project_id AS projectId, title,
         assignment, profile, complexity_reason AS complexityReason, provider_id AS providerId,
-        model, requested_reasoning_level AS requestedReasoningLevel,
+        model, configured_reasoning_level AS configuredReasoningLevel, requested_reasoning_level AS requestedReasoningLevel,
         reasoning_level AS reasoningLevel, state, thread_id AS threadId,
         attempt_count AS attemptCount, created_at AS createdAt, updated_at AS updatedAt,
         started_at AS startedAt, completed_at AS completedAt, lane_released_at AS laneReleasedAt,

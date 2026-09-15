@@ -5,7 +5,10 @@ import {
   DEFAULT_POLICY,
   DEFAULT_ROUTING_POLICY,
   effectiveProtectedBranches,
+  legacyProviderProfileRoutes,
+  legacyRoutingPolicy,
   orchestrationPolicy,
+  providerProfileRoutes,
   reasoningChoice,
   routingPolicy,
   workerProfile,
@@ -39,13 +42,13 @@ const startInput = z.object({
   attachments: z.array(attachment).optional(),
 });
 const enableInput = z.object({ threadId: z.string().min(1), label: z.string().trim().min(1).max(200), projectIds });
-const profileRoutes = z.object({ quick: z.string().min(1), standard: z.string().min(1), complex: z.string().min(1), critical: z.string().min(1) });
-const routingMap = z.record(z.string().min(1), profileRoutes);
+const profileModels = z.object({ quick: z.string().min(1), standard: z.string().min(1), complex: z.string().min(1), critical: z.string().min(1) });
+const routingMap = z.record(z.string().min(1), providerProfileRoutes);
 const catalogModel = z.object({
   id: z.string(), model: z.string(), displayName: z.string(), description: z.string(), isDefault: z.boolean(),
   defaultReasoningLevel: reasoningLevel, supportedReasoningLevels: z.array(reasoningLevel),
 });
-const catalogProvider = z.object({ id: z.string(), displayName: z.string(), models: z.array(catalogModel), modelLoadError: z.string().nullable(), recommendedRoutes: profileRoutes.nullable() });
+const catalogProvider = z.object({ id: z.string(), displayName: z.string(), models: z.array(catalogModel), modelLoadError: z.string().nullable(), recommendedRoutes: profileModels.nullable() });
 const routeMetric = z.object({ providerId: z.string(), model: z.string(), profile: workerProfile, samples: z.number(), successes: z.number(), failures: z.number(), averageDurationMs: z.number(), averageTokens: z.number() });
 const routeRecommendation = z.object({ profile: workerProfile, providerId: z.string(), model: z.string(), samples: z.number(), successRate: z.number(), reason: z.string() });
 const threadOrchestrationState = z.object({
@@ -60,7 +63,7 @@ export const rpcContract = defineRpcContract({
   thread_orchestration_disable: { input: z.object({ threadId: z.string().min(1) }), output: z.null() },
   routing_catalog: { input: z.null(), output: z.object({ providers: z.array(catalogProvider) }) },
   routing_get: { input: z.null(), output: z.object({ routes: routingMap, policy: routingPolicy, metrics: z.array(routeMetric), recommendations: z.array(routeRecommendation) }) },
-  routing_set_provider: { input: z.object({ providerId: z.string().min(1), routes: profileRoutes }), output: z.object({ routes: routingMap }) },
+  routing_set_provider: { input: z.object({ providerId: z.string().min(1), routes: providerProfileRoutes }), output: z.object({ routes: routingMap }) },
   routing_policy_set: { input: routingPolicy, output: routingPolicy },
   policy_get: { input: z.null(), output: orchestrationPolicy },
   policy_set: { input: orchestrationPolicy, output: orchestrationPolicy },
@@ -174,14 +177,35 @@ export default async function plugin(bb: BbPluginApi) {
     `ALTER TABLE workstreams ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE workstreams ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'mutating'`,
     `ALTER TABLE workstreams ADD COLUMN requested_reasoning_level TEXT NOT NULL DEFAULT 'model-default'`,
+    `ALTER TABLE workstreams ADD COLUMN configured_reasoning_level TEXT NOT NULL DEFAULT 'model-default'`,
     `CREATE INDEX IF NOT EXISTS workstreams_parent_idx ON workstreams(coordinator_thread_id, parent_key)`,
   ]);
   const store = new OrchestratorStore(db);
   const ROUTING_KEY = "provider-routes";
   const ROUTING_POLICY_KEY = "routing-policy";
   const POLICY_KEY = "orchestration-policy";
-  const readRoutes = async () => { const parsed = routingMap.safeParse(await bb.storage.kv.get(ROUTING_KEY)); return parsed.success ? parsed.data : {}; };
-  const readRoutingPolicy = async () => { const parsed = routingPolicy.safeParse(await bb.storage.kv.get(ROUTING_POLICY_KEY)); return parsed.success ? parsed.data : DEFAULT_ROUTING_POLICY; };
+  const readRoutingSettings = async () => {
+    const [rawRoutes, rawPolicy] = await Promise.all([bb.storage.kv.get(ROUTING_KEY), bb.storage.kv.get(ROUTING_POLICY_KEY)]);
+    const hasLegacyPolicy = typeof rawPolicy === "object" && rawPolicy !== null && "profileReasoning" in rawPolicy;
+    const parsedPolicy = hasLegacyPolicy ? { success: false as const } : routingPolicy.safeParse(rawPolicy);
+    const legacyPolicy = legacyRoutingPolicy.safeParse(rawPolicy);
+    const policy = parsedPolicy.success ? parsedPolicy.data : legacyPolicy.success ? {
+      strategy: legacyPolicy.data.strategy,
+      profileRoutes: Object.fromEntries(workerProfile.options.map((profile) => {
+        const target = legacyPolicy.data.profileRoutes[profile];
+        return [profile, target === null ? null : { ...target, reasoningLevel: legacyPolicy.data.profileReasoning[profile] }];
+      })) as typeof DEFAULT_ROUTING_POLICY.profileRoutes,
+    } : DEFAULT_ROUTING_POLICY;
+    const parsedRoutes = routingMap.safeParse(rawRoutes);
+    const legacyRoutes = z.record(z.string().min(1), legacyProviderProfileRoutes).safeParse(rawRoutes);
+    const routes = (parsedRoutes.success ? parsedRoutes.data : legacyRoutes.success ? Object.fromEntries(Object.entries(legacyRoutes.data).map(([providerId, profiles]) => [providerId, Object.fromEntries(workerProfile.options.map((profile) => [profile, { modelId: profiles[profile], reasoningLevel: legacyPolicy.success ? legacyPolicy.data.profileReasoning[profile] : "model-default" }]))])) : {}) as z.output<typeof routingMap>;
+    if (legacyPolicy.success || legacyRoutes.success) {
+      await Promise.all([bb.storage.kv.set(ROUTING_POLICY_KEY, policy), bb.storage.kv.set(ROUTING_KEY, routes)]);
+    }
+    return { policy, routes };
+  };
+  const readRoutes = async () => (await readRoutingSettings()).routes;
+  const readRoutingPolicy = async () => (await readRoutingSettings()).policy;
   const readPolicy = async () => { const parsed = orchestrationPolicy.safeParse(await bb.storage.kv.get(POLICY_KEY)); return parsed.success ? parsed.data : DEFAULT_POLICY; };
 
   const providerCatalog = async () => Promise.all((await bb.sdk.providers.list()).filter((provider) => provider.available).map(async (provider) => {
@@ -199,7 +223,7 @@ export default async function plugin(bb: BbPluginApi) {
           const requested = BUILTIN_ROUTE_MODELS[provider.id]?.[profileId];
           const match = result.models.find((model) => model.id === requested || model.model === requested);
           return [profileId, (match ?? fallback).id];
-        })) as z.output<typeof profileRoutes>,
+        })) as z.output<typeof profileModels>,
       };
     } catch (error) {
       return { id: provider.id, displayName: provider.displayName, models: [], modelLoadError: error instanceof Error ? error.message : "Could not load models.", recommendedRoutes: null };
@@ -313,23 +337,30 @@ export default async function plugin(bb: BbPluginApi) {
     };
   };
 
-  const workerExecution = async (coordinatorProviderId: string, profileId: WorkerProfile, assignmentReasoning?: z.output<typeof reasoningChoice>) => {
+  const workerExecution = async (coordinatorProviderId: string, profileId: WorkerProfile, assignmentReasoning?: z.output<typeof reasoningChoice>, inheritedRoute?: { providerId: string; model: string }) => {
     const routePolicy = await readRoutingPolicy();
-    const target = routePolicy.strategy === "profile" ? routePolicy.profileRoutes[profileId] : null;
-    const providerId = target?.providerId ?? coordinatorProviderId;
+    const target = inheritedRoute === undefined && routePolicy.strategy === "profile" ? routePolicy.profileRoutes[profileId] : null;
+    const providerId = inheritedRoute?.providerId ?? target?.providerId ?? coordinatorProviderId;
     const result = await bb.sdk.providers.models({ providerId });
     if (result.modelLoadError !== null) throw new Error(`Could not load ${providerId} models: ${result.modelLoadError.code}.`);
-    const configuredModelId = target?.modelId ?? (await readRoutes())[providerId]?.[profileId] ?? BUILTIN_ROUTE_MODELS[providerId]?.[profileId];
+    const configuredRoutes = await readRoutes();
+    const configuredRoute = target === null ? configuredRoutes[providerId]?.[profileId] : undefined;
+    const configuredModelId = inheritedRoute?.model ?? target?.modelId ?? configuredRoute?.modelId ?? BUILTIN_ROUTE_MODELS[providerId]?.[profileId];
     if (configuredModelId === undefined) throw new Error(`No ${profileId} worker model is configured for provider ${providerId}. Open Orchestrator settings and save its routing.`);
     const selected = result.models.find((model) => model.id === configuredModelId || model.model === configuredModelId);
     if (selected === undefined) throw new Error(`Configured ${profileId} model ${configuredModelId} is no longer available for provider ${providerId}.`);
     const supported = selected.supportedReasoningEfforts.map((effort) => effort.reasoningEffort);
-    const requestedReasoningLevel = assignmentReasoning ?? routePolicy.profileReasoning[profileId];
+    const inheritedConfigured = inheritedRoute === undefined ? undefined : [
+      ...Object.values(routePolicy.profileRoutes).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null && candidate.providerId === providerId && candidate.modelId === configuredModelId),
+      ...Object.values(configuredRoutes[providerId] ?? {}).filter((candidate) => candidate.modelId === configuredModelId),
+    ][0];
+    const configuredReasoningLevel = target?.reasoningLevel ?? inheritedConfigured?.reasoningLevel ?? configuredRoute?.reasoningLevel ?? "model-default";
+    const requestedReasoningLevel = assignmentReasoning ?? configuredReasoningLevel;
     const selectedReasoning = requestedReasoningLevel === "model-default" ? selected.defaultReasoningEffort : requestedReasoningLevel;
     if (!supported.includes(selectedReasoning)) {
       throw new Error(`Configured ${profileId} reasoning ${requestedReasoningLevel} is not supported by ${providerId}/${selected.id}. Supported levels: ${supported.join(", ")}.`);
     }
-    return { providerId: selected.routeProviderId ?? providerId, model: selected.model, requestedReasoningLevel, reasoningLevel: selectedReasoning };
+    return { providerId: selected.routeProviderId ?? providerId, model: selected.model, configuredReasoningLevel, requestedReasoningLevel, reasoningLevel: selectedReasoning };
   };
 
   const workerPrompt = (item: WorkstreamRecord) => {
@@ -493,9 +524,12 @@ export default async function plugin(bb: BbPluginApi) {
     routing_set_provider: async ({ providerId, routes }) => {
       const provider = (await providerCatalog()).find((candidate) => candidate.id === providerId);
       if (provider === undefined) throw new Error(`Provider ${providerId} is not currently available.`);
-      const modelIds = new Set(provider.models.map((model) => model.id));
-      for (const [profileId, modelId] of Object.entries(routes)) {
-        if (!modelIds.has(modelId)) throw new Error(`Model ${modelId} is not available for ${provider.displayName} (${profileId}).`);
+      const models = new Map(provider.models.map((model) => [model.id, model]));
+      for (const [profileId, route] of Object.entries(routes)) {
+        const model = models.get(route.modelId);
+        if (model === undefined) throw new Error(`Model ${route.modelId} is not available for ${provider.displayName} (${profileId}).`);
+        const effective = route.reasoningLevel === "model-default" ? model.defaultReasoningLevel : route.reasoningLevel;
+        if (!model.supportedReasoningLevels.includes(effective)) throw new Error(`Reasoning ${route.reasoningLevel} is not supported by ${providerId}/${route.modelId} for ${profileId}.`);
       }
       const next = { ...(await readRoutes()), [providerId]: routes };
       await bb.storage.kv.set(ROUTING_KEY, next);
@@ -509,7 +543,7 @@ export default async function plugin(bb: BbPluginApi) {
         if (target !== null && !byProvider.get(target.providerId)?.models.some((model) => model.id === target.modelId)) throw new Error(`Selected route ${target.providerId}/${target.modelId} is not available.`);
         if (target !== null) {
           const selected = byProvider.get(target.providerId)?.models.find((model) => model.id === target.modelId);
-          const requested = input.profileReasoning[profileId as WorkerProfile];
+          const requested = target.reasoningLevel;
           const effective = requested === "model-default" ? selected?.defaultReasoningLevel : requested;
           if (selected !== undefined && effective !== undefined && !selected.supportedReasoningLevels.includes(effective)) {
             throw new Error(`Reasoning ${requested} is not supported by ${target.providerId}/${target.modelId} for ${profileId}.`);
@@ -610,6 +644,7 @@ export default async function plugin(bb: BbPluginApi) {
           && existing.profile === assignment.profile
           && existing.providerId === execution.providerId
           && existing.model === execution.model
+          && existing.configuredReasoningLevel === execution.configuredReasoningLevel
           && existing.requestedReasoningLevel === execution.requestedReasoningLevel
           && existing.reasoningLevel === execution.reasoningLevel;
         return unchanged || existing?.threadId === null || existing?.threadId === undefined ? [] : [existing.threadId];
@@ -630,6 +665,7 @@ export default async function plugin(bb: BbPluginApi) {
           && existing.profile === assignment.profile
           && existing.providerId === execution.providerId
           && existing.model === execution.model
+          && existing.configuredReasoningLevel === execution.configuredReasoningLevel
           && existing.requestedReasoningLevel === execution.requestedReasoningLevel
           && existing.reasoningLevel === execution.reasoningLevel;
         if (unchanged && existing.threadId !== null && !["failed", "cancelled"].includes(existing.state)) {
@@ -664,8 +700,9 @@ export default async function plugin(bb: BbPluginApi) {
           key: item.key, projectId: item.projectId, threadId: item.threadId,
           action: item.state === "queued" ? "queued" : item.state === "running" ? "spawned" : item.state,
           state: item.state, profile: item.profile,
-          providerId: item.providerId, model: item.model, requestedReasoningLevel: item.requestedReasoningLevel,
-          reasoningLevel: item.reasoningLevel, environmentId,
+          providerId: item.providerId, model: item.model, configuredReasoningLevel: item.configuredReasoningLevel,
+          requestedReasoningLevel: item.requestedReasoningLevel, reasoningLevel: item.reasoningLevel,
+          effectiveReasoningLevel: item.reasoningLevel, environmentId,
         });
       }
       const workers = assignments.map((assignment) => byKey.get(assignment.key)!);
@@ -709,7 +746,7 @@ export default async function plugin(bb: BbPluginApi) {
       const plans = await Promise.all(assignments.map(async (assignment, index) => ({
         assignment,
         key: desired[index]!,
-        execution: await workerExecution(coordinator.providerId, assignment.profile, assignment.reasoningLevel),
+        execution: await workerExecution(coordinator.providerId, assignment.profile, assignment.reasoningLevel, { providerId: parent.providerId, model: parent.model }),
       })));
       const additional = plans.filter(({ key }) => store.getWorkstream(meta.coordinatorThreadId, key) === null).length;
       if (store.listWorkstreams(meta.coordinatorThreadId).length + additional > run.policy.maxWorkersPerRun) {
@@ -726,6 +763,7 @@ export default async function plugin(bb: BbPluginApi) {
           && existing.profile === assignment.profile
           && existing.providerId === execution.providerId
           && existing.model === execution.model
+          && existing.configuredReasoningLevel === execution.configuredReasoningLevel
           && existing.requestedReasoningLevel === execution.requestedReasoningLevel
           && existing.reasoningLevel === execution.reasoningLevel;
         if (unchanged && existing.threadId !== null && !["failed", "cancelled"].includes(existing.state)) {
@@ -771,6 +809,7 @@ export default async function plugin(bb: BbPluginApi) {
       const environmentByProject = new Map(environments.map((item) => [item.projectId, item.environmentId]));
       const workstreams = store.listWorkstreams(coordinatorThreadId).map((item) => ({
         ...item,
+        effectiveReasoningLevel: item.reasoningLevel,
         environmentId: environmentByProject.get(item.projectId) ?? null,
       }));
       return JSON.stringify({
