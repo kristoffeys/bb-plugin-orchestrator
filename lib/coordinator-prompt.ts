@@ -12,6 +12,7 @@ export function coordinatorPrompt(
   label: string,
   projects: readonly OrchestratorProject[],
   task: string,
+  policy: OrchestrationPolicy,
 ): string {
   const repos = projects
     .map(
@@ -70,6 +71,14 @@ Protocol:
    the configured attempt limit. Do not poll raw thread output or create
    replacement loops.
 
+   Workers may delegate read-only descendants through \`orchestrator_delegate\`
+   to depth ${policy.maxDelegationDepth}, with at most ${policy.maxChildrenPerWorker}
+   direct children and ${policy.maxWorkersPerRun} total workstreams. Descendants
+   remain owned by this run and are parented to their delegating worker. A parent
+   cannot complete until all descendants are terminal. Read-only descendants
+   may share a project environment concurrently; every mutating root workstream
+   remains the sole writer in its project lane.
+
 6. Review every workstream in the \`reviewing\` state with
    \`orchestrator_review\`. After all results and integration are settled, call
    \`orchestrator_finish\`. It preserves archived worker history.
@@ -78,7 +87,17 @@ Protocol:
    projects, contract handoffs, validation, failures, and any remaining
    inconsistency. Do not claim success when producer and consumer disagree.
 
+Commit contract: mode ${policy.commitMode}; push mode ${policy.pushMode};
+protected branches ${JSON.stringify(effectiveProtectedBranches(policy))}. Protected
+branches may never be committed to or pushed. Orchestrator-owned branches may be
+committed without extra approval when commit mode permits it. Existing branches
+need explicit user approval for commits, and every push needs separate explicit
+user approval. Workers report created commit SHAs in order. The SDK cannot
+intercept arbitrary provider shell commands, so completion validation and prompts
+enforce the declarative contract without claiming shell-level enforcement.
+
 Do not spawn BB threads directly for managed work. The lifecycle tools are the
 single writer for this run.
 `;
 }
+import { effectiveProtectedBranches, type OrchestrationPolicy } from "./policy.ts";

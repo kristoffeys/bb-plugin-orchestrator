@@ -6,17 +6,26 @@ export type WorkerProfile = z.infer<typeof workerProfile>;
 export const approvalPolicy = z.enum(["never", "first-dispatch", "critical", "every-dispatch"]);
 export const evaluatorPolicy = z.enum(["never", "critical", "always"]);
 export const providerStrategy = z.enum(["coordinator", "profile"]);
+export const reasoningChoice = z.enum(["model-default", "none", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"]);
+export const commitMode = z.enum(["disabled", "owned-only", "owned-or-approved-existing"]);
+export const pushMode = z.enum(["disabled", "explicit-approval"]);
 
 export const orchestrationPolicy = z.object({
   maxParallelWorkers: z.number().int().min(1).max(20),
   maxWorkersPerRun: z.number().int().min(1).max(50),
   maxAttemptsPerWorkstream: z.number().int().min(1).max(5),
+  maxDelegationDepth: z.number().int().min(0).max(5).default(2),
+  maxChildrenPerWorker: z.number().int().min(1).max(20).default(3),
   workerTimeoutMinutes: z.number().int().min(5).max(24 * 60),
   runTimeoutMinutes: z.number().int().min(10).max(7 * 24 * 60),
   inactiveCleanupMinutes: z.number().int().min(10).max(30 * 24 * 60),
   tokenBudget: z.number().int().min(0).max(100_000_000),
   approval: approvalPolicy,
   evaluator: evaluatorPolicy,
+  commitMode: commitMode.default("owned-or-approved-existing"),
+  pushMode: pushMode.default("explicit-approval"),
+  protectedBranches: z.array(z.string().trim().min(1).max(200)).max(50).default(["main", "develop"])
+    .transform((branches) => [...new Set(branches)]),
 });
 export type OrchestrationPolicy = z.infer<typeof orchestrationPolicy>;
 
@@ -24,13 +33,26 @@ export const DEFAULT_POLICY: OrchestrationPolicy = {
   maxParallelWorkers: 3,
   maxWorkersPerRun: 8,
   maxAttemptsPerWorkstream: 2,
+  maxDelegationDepth: 2,
+  maxChildrenPerWorker: 3,
   workerTimeoutMinutes: 45,
   runTimeoutMinutes: 180,
   inactiveCleanupMinutes: 120,
   tokenBudget: 0,
   approval: "critical",
   evaluator: "critical",
+  commitMode: "owned-or-approved-existing",
+  pushMode: "explicit-approval",
+  protectedBranches: ["main", "develop"],
 };
+
+export function parseOrchestrationPolicy(value: unknown): OrchestrationPolicy {
+  return orchestrationPolicy.parse(value);
+}
+
+export function effectiveProtectedBranches(policy: Pick<OrchestrationPolicy, "protectedBranches">): string[] {
+  return policy.protectedBranches;
+}
 
 export const routeTarget = z.object({
   providerId: z.string().min(1),
@@ -54,10 +76,17 @@ export const EMPTY_PROFILE_ROUTES: ProfileRouteTargets = {
 export const routingPolicy = z.object({
   strategy: providerStrategy,
   profileRoutes: profileRouteTargets,
+  profileReasoning: z.object({
+    quick: reasoningChoice,
+    standard: reasoningChoice,
+    complex: reasoningChoice,
+    critical: reasoningChoice,
+  }).default({ quick: "low", standard: "medium", complex: "high", critical: "xhigh" }),
 });
 export type RoutingPolicy = z.infer<typeof routingPolicy>;
 
 export const DEFAULT_ROUTING_POLICY: RoutingPolicy = {
   strategy: "coordinator",
   profileRoutes: EMPTY_PROFILE_ROUTES,
+  profileReasoning: { quick: "low", standard: "medium", complex: "high", critical: "xhigh" },
 };

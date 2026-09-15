@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import type { OrchestrationPolicy, WorkerProfile } from "./policy.ts";
+import { parseOrchestrationPolicy, type OrchestrationPolicy, type WorkerProfile } from "./policy.ts";
 
 export type RunState = "configured" | "running" | "awaiting_approval" | "blocked" | "completed" | "failed" | "cancelled";
 export type WorkstreamState = "planned" | "awaiting_approval" | "queued" | "running" | "reviewing" | "completed" | "failed" | "cancelled";
@@ -21,6 +21,9 @@ export interface RunRecord {
 export interface WorkstreamRecord {
   coordinatorThreadId: string;
   key: string;
+  parentKey: string | null;
+  depth: number;
+  accessMode: "mutating" | "read-only";
   projectId: string;
   title: string | null;
   assignment: string;
@@ -28,6 +31,7 @@ export interface WorkstreamRecord {
   complexityReason: string | null;
   providerId: string;
   model: string;
+  requestedReasoningLevel: string;
   reasoningLevel: string;
   state: WorkstreamState;
   threadId: string | null;
@@ -121,7 +125,7 @@ export class OrchestratorStore {
     return row === undefined ? null : {
       ...row,
       allowedProjectIds: parseJson<string[]>(row.allowedProjectIdsJson),
-      policy: parseJson<OrchestrationPolicy>(row.policyJson),
+      policy: parseOrchestrationPolicy(parseJson(row.policyJson)),
       firstDispatchApproved: row.firstDispatchApproved === 1,
     };
   }
@@ -155,21 +159,23 @@ export class OrchestratorStore {
     const now = Date.now();
     this.db.prepare(`
       INSERT INTO workstreams (
-        coordinator_thread_id, key, project_id, title, assignment, profile, complexity_reason,
-        provider_id, model, reasoning_level, state, thread_id, attempt_count, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        coordinator_thread_id, key, parent_key, depth, access_mode, project_id, title, assignment, profile, complexity_reason,
+        provider_id, model, requested_reasoning_level, reasoning_level, state, thread_id, attempt_count, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(coordinator_thread_id, key) DO UPDATE SET
+        parent_key = excluded.parent_key, depth = excluded.depth, access_mode = excluded.access_mode,
         project_id = excluded.project_id, title = excluded.title, assignment = excluded.assignment,
         profile = excluded.profile, complexity_reason = excluded.complexity_reason,
         provider_id = excluded.provider_id, model = excluded.model,
+        requested_reasoning_level = excluded.requested_reasoning_level,
         reasoning_level = excluded.reasoning_level, state = excluded.state,
         thread_id = excluded.thread_id, attempt_count = excluded.attempt_count,
         updated_at = excluded.updated_at, started_at = NULL, completed_at = NULL,
         lane_released_at = NULL, last_event_seq = 0, total_tokens = 0,
         result_json = NULL, error = NULL
     `).run(
-      input.coordinatorThreadId, input.key, input.projectId, input.title, input.assignment,
-      input.profile, input.complexityReason, input.providerId, input.model, input.reasoningLevel,
+      input.coordinatorThreadId, input.key, input.parentKey, input.depth, input.accessMode, input.projectId, input.title, input.assignment,
+      input.profile, input.complexityReason, input.providerId, input.model, input.requestedReasoningLevel, input.reasoningLevel,
       input.state, input.threadId, input.attemptCount, now, now,
     );
     return this.getWorkstream(input.coordinatorThreadId, input.key)!;
@@ -177,9 +183,11 @@ export class OrchestratorStore {
 
   getWorkstream(coordinatorThreadId: string, key: string): WorkstreamRecord | null {
     const row = this.db.prepare(`
-      SELECT coordinator_thread_id AS coordinatorThreadId, key, project_id AS projectId, title,
+      SELECT coordinator_thread_id AS coordinatorThreadId, key, parent_key AS parentKey,
+        depth, access_mode AS accessMode, project_id AS projectId, title,
         assignment, profile, complexity_reason AS complexityReason, provider_id AS providerId,
-        model, reasoning_level AS reasoningLevel, state, thread_id AS threadId,
+        model, requested_reasoning_level AS requestedReasoningLevel,
+        reasoning_level AS reasoningLevel, state, thread_id AS threadId,
         attempt_count AS attemptCount, created_at AS createdAt, updated_at AS updatedAt,
         started_at AS startedAt, completed_at AS completedAt, lane_released_at AS laneReleasedAt,
         last_event_seq AS lastEventSeq,
@@ -199,6 +207,24 @@ export class OrchestratorStore {
     return keys.map(({ key }) => this.getWorkstream(coordinatorThreadId, key)!);
   }
 
+  listChildren(coordinatorThreadId: string, parentKey: string): WorkstreamRecord[] {
+    const keys = this.db.prepare("SELECT key FROM workstreams WHERE coordinator_thread_id = ? AND parent_key = ? ORDER BY created_at, key")
+      .all(coordinatorThreadId, parentKey) as Array<{ key: string }>;
+    return keys.map(({ key }) => this.getWorkstream(coordinatorThreadId, key)!);
+  }
+
+  listDescendants(coordinatorThreadId: string, parentKey: string): WorkstreamRecord[] {
+    const descendants: WorkstreamRecord[] = [];
+    const visit = (key: string) => {
+      for (const child of this.listChildren(coordinatorThreadId, key)) {
+        descendants.push(child);
+        visit(child.key);
+      }
+    };
+    visit(parentKey);
+    return descendants;
+  }
+
   listTerminalWorkstreams(): WorkstreamRecord[] {
     const rows = this.db.prepare(`
       SELECT coordinator_thread_id AS coordinatorThreadId, key
@@ -206,6 +232,12 @@ export class OrchestratorStore {
       WHERE thread_id IS NOT NULL AND state IN ('completed', 'failed', 'cancelled')
       ORDER BY updated_at, coordinator_thread_id, key
     `).all() as Array<{ coordinatorThreadId: string; key: string }>;
+    return rows.map(({ coordinatorThreadId, key }) => this.getWorkstream(coordinatorThreadId, key)!);
+  }
+
+  listRunningWorkstreams(): WorkstreamRecord[] {
+    const rows = this.db.prepare("SELECT coordinator_thread_id AS coordinatorThreadId, key FROM workstreams WHERE state = 'running' ORDER BY updated_at")
+      .all() as Array<{ coordinatorThreadId: string; key: string }>;
     return rows.map(({ coordinatorThreadId, key }) => this.getWorkstream(coordinatorThreadId, key)!);
   }
 
@@ -252,9 +284,9 @@ export class OrchestratorStore {
     return this.getWorkstream(coordinatorThreadId, key);
   }
 
-  removeWorkstreamsNotIn(coordinatorThreadId: string, keys: readonly string[]) {
+  removeWorkstreamsNotIn(coordinatorThreadId: string, keys: readonly string[], parentKey: string | null = null) {
     const desired = new Set(keys);
-    return this.listWorkstreams(coordinatorThreadId).filter((item) => !desired.has(item.key));
+    return this.listWorkstreams(coordinatorThreadId).filter((item) => item.parentKey === parentKey && !desired.has(item.key));
   }
 
   getProjectEnvironment(coordinatorThreadId: string, projectId: string): ProjectEnvironmentRecord | null {

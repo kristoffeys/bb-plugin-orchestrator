@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createFakePluginHost, makeThreadResponse, makeTurnFailedEvent } from "@get-bb/plugin-sdk/testing";
-import plugin from "../server.ts";
+import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadResponse, makeTurnFailedEvent } from "@get-bb/plugin-sdk/testing";
+import plugin, { waitForEnvironmentAttachment } from "../server.ts";
+import { DEFAULT_POLICY, effectiveProtectedBranches, parseOrchestrationPolicy } from "../lib/policy.ts";
 
 const projects = [
   { id: "personal", name: "Personal", kind: "personal", sources: [] },
@@ -27,7 +28,7 @@ const providerModels: Record<string, ReturnType<typeof model>[]> = {
   opencode: [model("budget-code", "low"), model("balanced-code"), model("deep-code", "high")],
 };
 
-async function load(providerId = "codex") {
+async function load(providerId = "codex", options: { delayedAttachmentGets?: number; provisioningStatus?: "error"; failFirstReuseProvisioning?: boolean } = {}) {
   const metadata = new Map<string, Record<string, unknown>>();
   const threads = new Map<string, ReturnType<typeof makeThreadResponse>>();
   const spawned: Array<Record<string, unknown>> = [];
@@ -36,7 +37,10 @@ async function load(providerId = "codex") {
   const stopped: string[] = [];
   const retries: Array<Record<string, unknown>> = [];
   const eventRows = new Map<string, unknown[]>();
+  const attachmentTargets = new Map<string, string>();
+  const attachmentGets = new Map<string, number>();
   let nextId = 1;
+  let reuseFailureRemaining = options.failFirstReuseProvisioning ? 1 : 0;
   threads.set("coord", makeThreadResponse({ id: "coord", projectId: "personal", providerId }));
   metadata.set("coord", { role: "coordinator", label: "Product", allowedProjectIds: ["api", "web"] });
 
@@ -58,6 +62,15 @@ async function load(providerId = "codex") {
         get: async ({ threadId }: { threadId: string }) => {
           const thread = threads.get(threadId);
           if (thread === undefined) throw new Error("not found");
+          const remaining = attachmentGets.get(threadId);
+          if (remaining !== undefined) {
+            if (remaining <= 1) {
+              thread.environmentId = attachmentTargets.get(threadId) ?? null;
+              attachmentGets.delete(threadId);
+            } else {
+              attachmentGets.set(threadId, remaining - 1);
+            }
+          }
           return thread;
         },
         getPluginMetadata: async ({ threadId }: { threadId: string }) => (metadata.get(threadId) ?? {}) as never,
@@ -74,19 +87,27 @@ async function load(providerId = "codex") {
           spawned.push(input);
           const id = `spawned-${nextId++}`;
           const environment = input.environment as { type?: string; environmentId?: string } | undefined;
-          const environmentId = environment?.type === "reuse"
+          const intendedEnvironmentId = environment?.type === "reuse"
             ? environment.environmentId ?? null
             : `env-${String(input.projectId)}`;
+          const reuseFailure = environment?.type === "reuse" && reuseFailureRemaining > 0;
+          if (reuseFailure) reuseFailureRemaining -= 1;
+          const provisional = (options.delayedAttachmentGets ?? 0) > 0 || options.provisioningStatus === "error" || reuseFailure;
           const thread = makeThreadResponse({
             id,
             projectId: String(input.projectId),
-            environmentId,
+            environmentId: provisional ? null : intendedEnvironmentId,
+            status: options.provisioningStatus ?? (reuseFailure ? "error" : "idle"),
             parentThreadId: typeof input.parentThreadId === "string" ? input.parentThreadId : null,
             visibility: input.visibility === "hidden" ? "hidden" : "visible",
             providerId: typeof input.providerId === "string" ? input.providerId : providerId,
             updatedAt: nextId,
           });
           threads.set(id, thread);
+          if (provisional && intendedEnvironmentId !== null && options.provisioningStatus !== "error" && !reuseFailure) {
+            attachmentTargets.set(id, intendedEnvironmentId);
+            attachmentGets.set(id, options.delayedAttachmentGets ?? 1);
+          }
           metadata.set(id, (input.pluginMetadata as Record<string, unknown> | undefined) ?? {});
           return thread;
         },
@@ -141,6 +162,8 @@ test("start creates a personal coordinator with generic Orchestrator identity", 
   const text = ((state.spawned[0]?.input as Array<{ text?: string }>)[0]?.text) ?? "";
   assert.match(text, /stable `key`/);
   assert.match(text, /one at a time in a shared project environment/);
+  assert.match(text, /read-only descendants/);
+  assert.match(text, /protected branches \["main","develop"\]/);
 });
 
 test("same-project workstreams serialize and share the captured project environment", async () => {
@@ -399,6 +422,8 @@ test("run and workstream state survive a plugin reload", async () => {
   assert.equal(status.workstreams[0].attemptCount, 1);
   assert.equal(status.workstreams[0].environmentId, "env-api");
   assert.equal(status.routing.policy.strategy, "coordinator");
+  assert.equal(status.run.policy.commitMode, "owned-or-approved-existing");
+  assert.deepEqual(status.run.policy.protectedBranches, ["main", "develop"]);
   assert.deepEqual(status.routing.configuredRoutes, {});
   assert.deepEqual(status.environments.map(({ projectId, environmentId }: { projectId: string; environmentId: string }) => ({ projectId, environmentId })), [
     { projectId: "api", environmentId: "env-api" },
@@ -545,4 +570,419 @@ test("profile routing can select another active provider", async () => {
   assert.equal(dispatched.workers[0].providerId, "opencode");
   assert.equal(dispatched.workers[0].model, "budget-code");
   assert.equal(state.spawned[0]?.providerId, "opencode");
+});
+
+test("provisioning polling waits for delayed attachment and is reload durable", async () => {
+  const state = await load("codex", { delayedAttachmentGets: 1 });
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool(
+    "orchestrator_dispatch",
+    { assignments: [{ key: "delayed", projectId: "api", prompt: "Wait for the worktree." }] },
+    { threadId: "coord", projectId: "personal" },
+  ) as string);
+  assert.equal(dispatched.workers[0].state, "running");
+  assert.equal(state.stopped.length, 0, "a healthy provisioning thread is not stopped");
+  const reloaded = await state.harness.lifecycle.reload(plugin);
+  const status = JSON.parse(await reloaded.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.environments[0].environmentId, "env-api");
+});
+
+test("provisioning helper handles timeout, terminal error, and cancellation", async () => {
+  const provisional = { id: "worker", environmentId: null, status: "active", archivedAt: null };
+  let clock = 0;
+  await assert.rejects(waitForEnvironmentAttachment({
+    initial: provisional,
+    getThread: async () => provisional,
+    timeoutMs: 10,
+    pollIntervalMs: 5,
+    now: () => clock,
+    sleep: async (milliseconds) => { clock += milliseconds; },
+  }), /within 10ms/);
+  await assert.rejects(waitForEnvironmentAttachment({
+    initial: { ...provisional, status: "error" },
+    getThread: async () => provisional,
+  }), /ended with status error/);
+  const controller = new AbortController();
+  await assert.rejects(waitForEnvironmentAttachment({
+    initial: provisional,
+    getThread: async () => provisional,
+    signal: controller.signal,
+    sleep: async () => { controller.abort(); },
+  }), (error: unknown) => error instanceof Error && error.name === "AbortError");
+});
+
+test("definitive provisioning failure cleans up the spawned thread", async () => {
+  const state = await load("codex", { provisioningStatus: "error" });
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool(
+    "orchestrator_dispatch",
+    { assignments: [{ key: "broken", projectId: "api", prompt: "Provision." }] },
+    { threadId: "coord", projectId: "personal" },
+  ) as string);
+  assert.equal(dispatched.workers[0].state, "failed");
+  assert.deepEqual(state.stopped, ["spawned-1"]);
+  assert.deepEqual(state.archived, ["spawned-1"]);
+});
+
+test("dispatch cancellation aborts provisioning and cleans up without spawning more workers", async () => {
+  const state = await load("codex", { delayedAttachmentGets: 10 });
+  const controller = new AbortController();
+  const pending = state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [
+      { key: "first", projectId: "api", prompt: "Provision slowly." },
+      { key: "second", projectId: "web", prompt: "Must not spawn after cancellation." },
+    ],
+  }, { threadId: "coord", projectId: "personal", signal: controller.signal });
+  setTimeout(() => controller.abort(), 10);
+  await assert.rejects(pending, (error: unknown) => error instanceof Error && error.name === "AbortError");
+  assert.equal(state.spawned.length, 1);
+  assert.deepEqual(state.stopped, ["spawned-1"]);
+});
+
+test("a stale durable environment lease is cleared and reprovisioned", async () => {
+  const state = await load("codex", { failFirstReuseProvisioning: true });
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [
+      { key: "first", projectId: "api", prompt: "First." },
+      { key: "second", projectId: "api", prompt: "Second." },
+    ],
+  }, { threadId: "coord", projectId: "personal" }) as string);
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", { status: "success", summary: "First done.", changedFiles: [], validation: [], blockers: [] }, { threadId: dispatched.workers[0].threadId, projectId: "api" });
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread: state.threads.get(dispatched.workers[0].threadId)!, lastAssistantText: "Done." });
+  assert.deepEqual(state.spawned.map((item) => item.environment), [
+    { type: "project-default" },
+    { type: "reuse", environmentId: "env-api" },
+    { type: "project-default" },
+  ]);
+  assert.ok(state.stopped.includes("spawned-2"));
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.workstreams[1].state, "running");
+  assert.equal(status.environments[0].environmentId, "env-api");
+});
+
+test("nested delegation is namespaced, visible under its parent, read-only, and shares the run environment", async () => {
+  const state = await load();
+  const root = JSON.parse(await state.harness.behavior.callAgentTool(
+    "orchestrator_dispatch",
+    { assignments: [{ key: "root", projectId: "api", prompt: "Own the change." }] },
+    { threadId: "coord", projectId: "personal" },
+  ) as string).workers[0];
+  const delegated = JSON.parse(await state.harness.behavior.callAgentTool(
+    "orchestrator_delegate",
+    { assignments: [{ key: "inspect", projectId: "api", prompt: "Inspect only." }] },
+    { threadId: root.threadId, projectId: "api" },
+  ) as string);
+  assert.equal(delegated.workers[0].key, "root/inspect");
+  assert.equal(delegated.workers[0].accessMode, "read-only");
+  assert.equal(state.spawned[1]?.parentThreadId, root.threadId);
+  assert.deepEqual(state.spawned[1]?.environment, { type: "reuse", environmentId: "env-api" });
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: root.threadId, projectId: "api" }) as string);
+  assert.deepEqual(status.workstreams.map((item: { key: string; parentKey: string | null; depth: number }) => [item.key, item.parentKey, item.depth]), [
+    ["root", null, 0], ["root/inspect", "root", 1],
+  ]);
+});
+
+test("parent completion joins deterministically after descendants finish", async () => {
+  const state = await load();
+  const root = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "root", projectId: "api", prompt: "Coordinate." }],
+  }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  const child = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_delegate", {
+    assignments: [{ key: "child", projectId: "api", prompt: "Read only." }],
+  }, { threadId: root.threadId, projectId: "api" }) as string).workers[0];
+  await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "Too early.", changedFiles: [], validation: [], blockers: [],
+  }, { threadId: root.threadId, projectId: "api" }), /descendants are live/);
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread: state.threads.get(root.threadId)!, lastAssistantText: "Waiting for child." });
+  let status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.workstreams[0].state, "running", "an idle parent waiting on descendants remains healthy");
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "Inspection complete.", changedFiles: [], validation: [], blockers: [],
+  }, { threadId: child.threadId, projectId: "api" });
+  assert.ok(state.sent.some((message) => message.threadId === root.threadId && message.text.includes("Child workstream")));
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "Joined child result.", changedFiles: [], validation: [], blockers: [],
+  }, { threadId: root.threadId, projectId: "api" });
+  status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.deepEqual(status.workstreams.map((item: { state: string }) => item.state), ["completed", "completed"]);
+});
+
+test("delegation enforces project, fan-out, depth, and total-run limits", async () => {
+  const state = await load();
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, maxChildrenPerWorker: 1, maxDelegationDepth: 1, maxWorkersPerRun: 2 });
+  const root = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "root", projectId: "api", prompt: "Coordinate." }],
+  }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_delegate", {
+    assignments: [{ key: "a", projectId: "api", prompt: "A" }, { key: "b", projectId: "web", prompt: "B" }],
+  }, { threadId: root.threadId, projectId: "api" }), /at most 1 direct children/);
+  await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_delegate", {
+    assignments: [{ key: "bad", projectId: "personal", prompt: "Bad project" }],
+  }, { threadId: root.threadId, projectId: "api" }), /not allowed/);
+  const child = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_delegate", {
+    assignments: [{ key: "child", projectId: "api", prompt: "Inspect." }],
+  }, { threadId: root.threadId, projectId: "api" }) as string).workers[0];
+  await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_delegate", {
+    assignments: [{ key: "grandchild", projectId: "api", prompt: "Too deep." }],
+  }, { threadId: child.threadId, projectId: "api" }), /depth limit 1/);
+
+  const capped = await load();
+  await capped.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, maxChildrenPerWorker: 2, maxDelegationDepth: 2, maxWorkersPerRun: 2 });
+  const cappedRoot = JSON.parse(await capped.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "root", projectId: "api", prompt: "Root." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  await assert.rejects(capped.harness.behavior.callAgentTool("orchestrator_delegate", {
+    assignments: [{ key: "a", projectId: "api", prompt: "A" }, { key: "b", projectId: "web", prompt: "B" }],
+  }, { threadId: cappedRoot.threadId, projectId: "api" }), /run cap of 2/);
+});
+
+test("replacement and parent failure recursively clean up descendants", async () => {
+  const state = await load();
+  const root = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "root", projectId: "api", prompt: "Version one." }],
+  }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  const child = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_delegate", {
+    assignments: [{ key: "child", projectId: "api", prompt: "Inspect." }],
+  }, { threadId: root.threadId, projectId: "api" }) as string).workers[0];
+  await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "root", projectId: "api", prompt: "Version two." }],
+  }, { threadId: "coord", projectId: "personal" });
+  assert.ok(state.stopped.includes(child.threadId));
+  const replacementId = "spawned-3";
+  const nextChild = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_delegate", {
+    assignments: [{ key: "next", projectId: "api", prompt: "Inspect next." }],
+  }, { threadId: replacementId, projectId: "api" }) as string).workers[0];
+  await state.harness.behavior.emitThreadEvent("turn.failed", makeTurnFailedEvent({ threadId: replacementId, requestId: "failure-1", attemptNumber: 1 }));
+  await state.harness.behavior.emitThreadEvent("turn.failed", makeTurnFailedEvent({ threadId: replacementId, requestId: "failure-1", attemptNumber: 2 }));
+  assert.ok(state.stopped.includes(nextChild.threadId));
+});
+
+test("read-only descendants cannot report writes or commits", async () => {
+  const state = await load();
+  const root = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "root", projectId: "api", prompt: "Root." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  const child = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_delegate", { assignments: [{ key: "child", projectId: "api", prompt: "Read." }] }, { threadId: root.threadId, projectId: "api" }) as string).workers[0];
+  await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "I wrote.", changedFiles: ["x.ts"], validation: [], blockers: [], commits: ["abcdef1"], branch: { name: "feature", ownership: "orchestrator" },
+  }, { threadId: child.threadId, projectId: "api" }), /Read-only/);
+});
+
+test("commit policy defaults and protected branch normalization are durable and replaceable", async () => {
+  assert.equal(DEFAULT_POLICY.commitMode, "owned-or-approved-existing");
+  assert.equal(DEFAULT_POLICY.pushMode, "explicit-approval");
+  assert.deepEqual(effectiveProtectedBranches(DEFAULT_POLICY), ["main", "develop"]);
+  const parsed = parseOrchestrationPolicy({ ...DEFAULT_POLICY, protectedBranches: [" release ", "release", "master"] });
+  assert.deepEqual(parsed.protectedBranches, ["release", "master"]);
+  const removed = parseOrchestrationPolicy({ ...DEFAULT_POLICY, protectedBranches: [] });
+  assert.deepEqual(removed.protectedBranches, []);
+  assert.throws(() => parseOrchestrationPolicy({ ...DEFAULT_POLICY, protectedBranches: ["  "] }), /too_small|Too small/i);
+  const state = await load();
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, protectedBranches: [" release ", "release"] });
+  assert.deepEqual((await state.harness.behavior.callRpc("policy_get", null) as typeof DEFAULT_POLICY).protectedBranches, ["release"]);
+});
+
+async function commitPolicyWorker(policy: Partial<typeof DEFAULT_POLICY> = {}) {
+  const state = await load();
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, evaluator: "never", ...policy });
+  const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "commit", projectId: "api", prompt: "Commit atomically." }],
+  }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  return { state, worker };
+}
+
+test("commit modes enforce owned, approved-existing, and disabled behavior", async () => {
+  const disabled = await commitPolicyWorker({ commitMode: "disabled" });
+  await assert.rejects(disabled.state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "Committed.", changedFiles: ["a.ts"], validation: [], blockers: [], commits: ["aaaaaaa"], branch: { name: "feature", ownership: "orchestrator" },
+  }, { threadId: disabled.worker.threadId, projectId: "api" }), /Commits are disabled/);
+
+  const ownedOnly = await commitPolicyWorker({ commitMode: "owned-only" });
+  await assert.rejects(ownedOnly.state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "Committed.", changedFiles: ["a.ts"], validation: [], blockers: [], commits: ["bbbbbbb"], branch: { name: "feature", ownership: "existing" }, commitApproval: { approvedByUser: true, evidence: "User approved commit." },
+  }, { threadId: ownedOnly.worker.threadId, projectId: "api" }), /only on Orchestrator-owned/);
+  await ownedOnly.state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "Two atomic commits.", changedFiles: ["a.ts"], validation: [], blockers: [], commits: ["bbbbbbb", "ccccccc"], branch: { name: "orchestrator/run", ownership: "orchestrator" },
+  }, { threadId: ownedOnly.worker.threadId, projectId: "api" });
+  const status = JSON.parse(await ownedOnly.state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.deepEqual(status.workstreams[0].result.commits, ["bbbbbbb", "ccccccc"]);
+
+  const approvedExisting = await commitPolicyWorker();
+  const input = { status: "success" as const, summary: "Existing branch commit.", changedFiles: ["a.ts"], validation: [], blockers: [], commits: ["ddddddd"], branch: { name: "feature", ownership: "existing" as const } };
+  await assert.rejects(approvedExisting.state.harness.behavior.callAgentTool("orchestrator_worker_done", input, { threadId: approvedExisting.worker.threadId, projectId: "api" }), /requires explicit user approval/);
+  await approvedExisting.state.harness.behavior.callAgentTool("orchestrator_worker_done", { ...input, commitApproval: { approvedByUser: true, evidence: "User approved this commit action." } }, { threadId: approvedExisting.worker.threadId, projectId: "api" });
+});
+
+test("protected branches and push approval are enforced independently", async () => {
+  const protectedRun = await commitPolicyWorker();
+  await assert.rejects(protectedRun.state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "Bad target.", changedFiles: ["a.ts"], validation: [], blockers: [], commits: ["eeeeeee"], branch: { name: "main", ownership: "orchestrator" },
+  }, { threadId: protectedRun.worker.threadId, projectId: "api" }), /main is protected/);
+
+  const masterDefault = await commitPolicyWorker();
+  await masterDefault.state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "Approved master commit.", changedFiles: ["a.ts"], validation: [], blockers: [], commits: ["abababa"], branch: { name: "master", ownership: "existing" }, commitApproval: { approvedByUser: true, evidence: "User approved committing to master." },
+  }, { threadId: masterDefault.worker.threadId, projectId: "api" });
+
+  const configuredMaster = await commitPolicyWorker({ protectedBranches: ["master"] });
+  await assert.rejects(configuredMaster.state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "Protected master.", changedFiles: ["a.ts"], validation: [], blockers: [], commits: ["acacaca"], branch: { name: "master", ownership: "existing" }, commitApproval: { approvedByUser: true, evidence: "Approval cannot override protection." },
+  }, { threadId: configuredMaster.worker.threadId, projectId: "api" }), /master is protected/);
+
+  const pushDisabled = await commitPolicyWorker({ pushMode: "disabled", protectedBranches: [] });
+  await assert.rejects(pushDisabled.state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "Push.", changedFiles: ["a.ts"], validation: [], blockers: [], commits: ["fffffff"], pushedCommits: ["fffffff"], branch: { name: "master", ownership: "orchestrator" }, pushApproval: { approvedByUser: true, evidence: "Approved push." },
+  }, { threadId: pushDisabled.worker.threadId, projectId: "api" }), /Pushes are disabled/);
+
+  const pushAllowed = await commitPolicyWorker({ protectedBranches: [] });
+  const pushed = { status: "success" as const, summary: "Push.", changedFiles: ["a.ts"], validation: [], blockers: [], commits: ["1234567"], pushedCommits: ["1234567"], branch: { name: "master", ownership: "orchestrator" as const } };
+  await assert.rejects(pushAllowed.state.harness.behavior.callAgentTool("orchestrator_worker_done", pushed, { threadId: pushAllowed.worker.threadId, projectId: "api" }), /Every push requires separate explicit user approval/);
+  await pushAllowed.state.harness.behavior.callAgentTool("orchestrator_worker_done", { ...pushed, pushApproval: { approvedByUser: true, evidence: "User explicitly approved this push." } }, { threadId: pushAllowed.worker.threadId, projectId: "api" });
+});
+
+test("configured reasoning is passed explicitly to spawned threads for every supported level", async () => {
+  for (const level of ["low", "medium", "high", "xhigh"] as const) {
+    const state = await load();
+    await state.harness.behavior.callRpc("routing_policy_set", {
+      strategy: "coordinator",
+      profileRoutes: { quick: null, standard: null, complex: null, critical: null },
+      profileReasoning: { quick: level, standard: "medium", complex: "high", critical: "xhigh" },
+    });
+    const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+      assignments: [{ key: `reason-${level}`, projectId: "api", prompt: "Use configured reasoning." }],
+    }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+    assert.equal(state.spawned[0]?.reasoningLevel, level);
+    assert.deepEqual(state.spawned[0]?.executionInputSources, { providerId: "explicit", model: "explicit", reasoningLevel: "explicit" });
+    assert.equal(worker.requestedReasoningLevel, level);
+    assert.equal(worker.reasoningLevel, level);
+    assert.equal(state.threads.get(worker.threadId)!.providerId, "codex");
+  }
+});
+
+test("reasoning rejects unsupported levels and model-default uses the declared default", async () => {
+  const invalid = await load();
+  await assert.rejects(invalid.harness.behavior.callRpc("routing_policy_set", {
+    strategy: "profile",
+    profileRoutes: { quick: { providerId: "codex", modelId: "gpt-5.6-luna" }, standard: null, complex: null, critical: null },
+    profileReasoning: { quick: "max", standard: "medium", complex: "high", critical: "xhigh" },
+  }), /not supported/);
+  await invalid.harness.behavior.callRpc("routing_policy_set", {
+    strategy: "coordinator",
+    profileRoutes: { quick: null, standard: null, complex: null, critical: null },
+    profileReasoning: { quick: "max", standard: "medium", complex: "high", critical: "xhigh" },
+  });
+  await assert.rejects(invalid.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "invalid", projectId: "api", prompt: "Invalid reasoning." }],
+  }, { threadId: "coord", projectId: "personal" }), /Supported levels/);
+
+  const defaults = await load();
+  await defaults.harness.behavior.callRpc("routing_policy_set", {
+    strategy: "coordinator",
+    profileRoutes: { quick: null, standard: null, complex: null, critical: null },
+    profileReasoning: { quick: "model-default", standard: "medium", complex: "high", critical: "xhigh" },
+  });
+  const worker = JSON.parse(await defaults.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "default", projectId: "api", prompt: "Use model default." }],
+  }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  assert.equal(worker.requestedReasoningLevel, "model-default");
+  assert.equal(worker.reasoningLevel, "low");
+  assert.equal(defaults.spawned[0]?.reasoningLevel, "low");
+});
+
+test("reasoning policy survives reload and descendants inherit or override their profile route", async () => {
+  const state = await load();
+  await state.harness.behavior.callRpc("routing_policy_set", {
+    strategy: "profile",
+    profileRoutes: { quick: { providerId: "opencode", modelId: "budget-code" }, standard: null, complex: null, critical: null },
+    profileReasoning: { quick: "high", standard: "medium", complex: "high", critical: "xhigh" },
+  });
+  const root = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "root", projectId: "api", prompt: "Root.", reasoningLevel: "low" }],
+  }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  const delegated = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_delegate", {
+    assignments: [
+      { key: "inherited", projectId: "api", prompt: "Inherit." },
+      { key: "override", projectId: "api", prompt: "Override.", reasoningLevel: "medium" },
+    ],
+  }, { threadId: root.threadId, projectId: "api" }) as string);
+  assert.deepEqual(delegated.workers.map((item: { reasoningLevel: string }) => item.reasoningLevel), ["high", "medium"]);
+  assert.deepEqual(delegated.workers.map((item: { providerId: string; model: string }) => [item.providerId, item.model]), [["opencode", "budget-code"], ["opencode", "budget-code"]]);
+  const reloaded = await state.harness.lifecycle.reload(plugin);
+  const status = JSON.parse(await reloaded.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.routing.policy.profileReasoning.quick, "high");
+  assert.deepEqual(status.workstreams.map((item: { requestedReasoningLevel: string; reasoningLevel: string }) => [item.requestedReasoningLevel, item.reasoningLevel]), [
+    ["low", "low"], ["high", "high"], ["medium", "medium"],
+  ]);
+});
+
+test("only terminal coordinators regain orchestrator_enable discoverability", async () => {
+  const state = await load();
+  const active = await state.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({
+    thread: state.threads.get("coord")!, pluginMetadata: state.metadata.get("coord")! as never,
+  }));
+  assert.equal(active.tools.some((tool) => tool.name === "orchestrator_enable"), false);
+  const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "done", projectId: "api", prompt: "Finish." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  const workerConfig = await state.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({
+    thread: state.threads.get(worker.threadId)!, pluginMetadata: state.metadata.get(worker.threadId)! as never,
+  }));
+  assert.equal(workerConfig.tools.some((tool) => tool.name === "orchestrator_enable"), false);
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", { status: "success", summary: "Done.", changedFiles: [], validation: [], blockers: [] }, { threadId: worker.threadId, projectId: "api" });
+  await state.harness.behavior.callAgentTool("orchestrator_finish", { workerThreadIds: [worker.threadId] }, { threadId: "coord", projectId: "personal" });
+  const terminal = await state.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({
+    thread: state.threads.get("coord")!, pluginMetadata: state.metadata.get("coord")! as never,
+  }));
+  assert.ok(terminal.tools.some((tool) => tool.name === "orchestrator_enable"));
+  await state.harness.behavior.callAgentTool("orchestrator_enable", { label: "Reset", projectIds: ["web"] }, { threadId: "coord", projectId: "personal" });
+  const refreshed = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(refreshed.run.state, "configured");
+  assert.deepEqual(refreshed.run.allowedProjectIds, ["web"]);
+});
+
+test("reload reconciliation resumes an idle parent after a missed descendant event", async () => {
+  const state = await load();
+  const root = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "root", projectId: "api", prompt: "Join." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  const child = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_delegate", { assignments: [{ key: "child", projectId: "api", prompt: "Inspect." }] }, { threadId: root.threadId, projectId: "api" }) as string).workers[0];
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", { status: "success", summary: "Child done.", changedFiles: [], validation: [], blockers: [] }, { threadId: child.threadId, projectId: "api" });
+  state.sent.length = 0;
+  const reloaded = await state.harness.lifecycle.reload(plugin);
+  await reloaded.harness.behavior.runSchedule("cleanup-expired-runs");
+  const status = JSON.parse(await reloaded.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.workstreams.find((item: { key: string }) => item.key === "root").state, "running");
+  assert.ok(state.sent.some((message) => message.threadId === root.threadId && message.text.includes("All managed descendants")));
+  assert.ok(state.archived.includes(child.threadId));
+});
+
+test("disable, worker timeout, and run expiry recursively clean nested threads", async () => {
+  const disabled = await load();
+  const disabledRoot = JSON.parse(await disabled.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "root", projectId: "api", prompt: "Root." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  const disabledChild = JSON.parse(await disabled.harness.behavior.callAgentTool("orchestrator_delegate", { assignments: [{ key: "child", projectId: "api", prompt: "Read." }] }, { threadId: disabledRoot.threadId, projectId: "api" }) as string).workers[0];
+  await disabled.harness.behavior.callRpc("thread_orchestration_disable", { threadId: "coord" });
+  assert.ok(disabled.stopped.includes(disabledRoot.threadId));
+  assert.ok(disabled.stopped.includes(disabledChild.threadId));
+
+  const originalNow = Date.now;
+  try {
+    const timed = await load();
+    await timed.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, workerTimeoutMinutes: 5 });
+    const timedRoot = JSON.parse(await timed.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "root", projectId: "api", prompt: "Root." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+    const timedChild = JSON.parse(await timed.harness.behavior.callAgentTool("orchestrator_delegate", { assignments: [{ key: "child", projectId: "api", prompt: "Read." }] }, { threadId: timedRoot.threadId, projectId: "api" }) as string).workers[0];
+    timed.threads.get(timedRoot.threadId)!.status = "active";
+    timed.threads.get(timedChild.threadId)!.status = "active";
+    const base = originalNow();
+    Date.now = () => base + 6 * 60_000;
+    await timed.harness.behavior.runSchedule("cleanup-expired-runs");
+    assert.ok(timed.stopped.includes(timedRoot.threadId));
+    assert.ok(timed.stopped.includes(timedChild.threadId));
+
+    Date.now = originalNow;
+    const expired = await load();
+    await expired.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, runTimeoutMinutes: 10 });
+    const expiredRoot = JSON.parse(await expired.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "root", projectId: "api", prompt: "Root." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+    const expiredChild = JSON.parse(await expired.harness.behavior.callAgentTool("orchestrator_delegate", { assignments: [{ key: "child", projectId: "api", prompt: "Read." }] }, { threadId: expiredRoot.threadId, projectId: "api" }) as string).workers[0];
+    expired.threads.get(expiredRoot.threadId)!.status = "active";
+    expired.threads.get(expiredChild.threadId)!.status = "active";
+    const expiryBase = originalNow();
+    Date.now = () => expiryBase + 11 * 60_000;
+    await expired.harness.behavior.runSchedule("cleanup-expired-runs");
+    assert.ok(expired.stopped.includes(expiredRoot.threadId));
+    assert.ok(expired.stopped.includes(expiredChild.threadId));
+    const status = JSON.parse(await expired.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+    assert.equal(status.run.state, "cancelled");
+  } finally {
+    Date.now = originalNow;
+  }
 });

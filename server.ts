@@ -4,7 +4,9 @@ import { coordinatorPrompt, type OrchestratorProject } from "./lib/coordinator-p
 import {
   DEFAULT_POLICY,
   DEFAULT_ROUTING_POLICY,
+  effectiveProtectedBranches,
   orchestrationPolicy,
+  reasoningChoice,
   routingPolicy,
   workerProfile,
   type WorkerProfile,
@@ -65,12 +67,13 @@ export const rpcContract = defineRpcContract({
 });
 
 const workerAssignment = z.object({
-  key: z.string().trim().min(1).max(100),
+  key: z.string().trim().min(1).max(100).regex(/^[^/]+$/, "Keys cannot contain '/'."),
   projectId: z.string().min(1),
   prompt: z.string().trim().min(1).max(50_000),
   title: z.string().trim().min(1).max(200).optional(),
   profile: workerProfile.default("quick"),
   complexityReason: z.string().trim().min(1).max(500).optional(),
+  reasoningLevel: reasoningChoice.optional(),
 }).superRefine((assignment, ctx) => {
   if (assignment.profile !== "quick" && assignment.complexityReason === undefined) {
     ctx.addIssue({ code: "custom", path: ["complexityReason"], message: `The ${assignment.profile} profile needs a complexity reason.` });
@@ -82,6 +85,14 @@ const completionResult = z.object({
   changedFiles: z.array(z.string().max(1_000)).max(200).default([]),
   validation: z.array(z.object({ command: z.string().max(2_000), status: z.enum(["passed", "failed", "not-run"]), summary: z.string().max(2_000) })).max(50).default([]),
   blockers: z.array(z.string().max(2_000)).max(30).default([]),
+  commits: z.array(z.string().regex(/^[0-9a-f]{7,64}$/i, "Commit SHAs must be hexadecimal.")).max(50).default([]),
+  branch: z.object({
+    name: z.string().trim().min(1).max(500),
+    ownership: z.enum(["orchestrator", "existing"]),
+  }).optional(),
+  commitApproval: z.object({ approvedByUser: z.literal(true), evidence: z.string().trim().min(1).max(2_000) }).optional(),
+  pushedCommits: z.array(z.string().regex(/^[0-9a-f]{7,64}$/i, "Pushed commit SHAs must be hexadecimal.")).max(50).default([]),
+  pushApproval: z.object({ approvedByUser: z.literal(true), evidence: z.string().trim().min(1).max(2_000) }).optional(),
 });
 const artifactInput = z.object({
   kind: z.enum(["api-contract", "schema", "decision", "migration", "interface", "note"]),
@@ -89,7 +100,6 @@ const artifactInput = z.object({
   summary: z.string().trim().min(1).max(2_000), content: z.string().max(50_000).optional(), path: z.string().max(2_000).optional(),
   consumers: z.array(z.string().min(1).max(100)).max(50).default([]),
 });
-const PROFILE_REASONING = { quick: "low", standard: "medium", complex: "high", critical: "xhigh" } as const;
 const BUILTIN_ROUTE_MODELS: Record<string, Record<WorkerProfile, string>> = {
   "claude-code": { quick: "claude-haiku-4-5-20251001", standard: "claude-sonnet-5", complex: "claude-fable-5-1", critical: "claude-opus-5[1m]" },
   codex: { quick: "gpt-5.6-luna", standard: "gpt-5.6-terra", complex: "gpt-5.6-sol", critical: "gpt-6-astra" },
@@ -98,11 +108,57 @@ const metadataSchema = z.discriminatedUnion("role", [
   z.object({ role: z.literal("coordinator"), label: z.string().min(1), allowedProjectIds: z.array(z.string().min(1)) }),
   z.object({
     role: z.literal("worker"), coordinatorThreadId: z.string().min(1), key: z.string().min(1), projectId: z.string().min(1),
+    parentKey: z.string().nullable().default(null), depth: z.number().int().min(0).default(0), accessMode: z.enum(["mutating", "read-only"]).default("mutating"),
     assignment: z.string(), profile: workerProfile, complexityReason: z.string().optional(), providerId: z.string().min(1),
-    model: z.string().min(1), reasoningLevel,
+    model: z.string().min(1), requestedReasoningLevel: reasoningChoice.default("model-default"), reasoningLevel,
   }),
 ]);
 type OrchestratorMetadata = z.infer<typeof metadataSchema>;
+
+type ProvisioningThread = { id: string; environmentId: string | null; status: string; archivedAt?: number | null };
+
+const abortError = () => Object.assign(new Error("Worker provisioning was cancelled."), { name: "AbortError" });
+
+export async function waitForEnvironmentAttachment<T extends ProvisioningThread>(input: {
+  initial: T;
+  getThread: () => Promise<T>;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  now?: () => number;
+  sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+}): Promise<T> {
+  const timeoutMs = input.timeoutMs ?? 60_000;
+  const pollIntervalMs = input.pollIntervalMs ?? 250;
+  const now = input.now ?? Date.now;
+  const sleep = input.sleep ?? ((milliseconds, signal) => new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) { reject(abortError()); return; }
+    const onAbort = () => { clearTimeout(timer); reject(abortError()); };
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve(); }, milliseconds);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  }));
+  const started = now();
+  let thread = input.initial;
+  let lastGetError: unknown;
+  for (;;) {
+    if (input.signal?.aborted) throw abortError();
+    if (thread.environmentId !== null) return thread;
+    if (thread.status === "error" || thread.archivedAt != null) {
+      throw new Error(`Worker ${thread.id} provisioning ended with status ${thread.status}.`);
+    }
+    if (now() - started >= timeoutMs) {
+      const suffix = lastGetError === undefined ? "" : ` Last lookup failed: ${lastGetError instanceof Error ? lastGetError.message : String(lastGetError)}.`;
+      throw new Error(`Worker ${thread.id} did not receive a project environment within ${timeoutMs}ms.${suffix}`);
+    }
+    await sleep(Math.min(pollIntervalMs, Math.max(1, timeoutMs - (now() - started))), input.signal);
+    try {
+      thread = await input.getThread();
+      lastGetError = undefined;
+    } catch (error) {
+      lastGetError = error;
+    }
+  }
+}
 
 export default async function plugin(bb: BbPluginApi) {
   const db = bb.storage.database();
@@ -114,6 +170,11 @@ export default async function plugin(bb: BbPluginApi) {
     `CREATE INDEX IF NOT EXISTS workstreams_thread_id_idx ON workstreams(thread_id)`,
     `CREATE TABLE IF NOT EXISTS run_project_environments (coordinator_thread_id TEXT NOT NULL, project_id TEXT NOT NULL, environment_id TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (coordinator_thread_id, project_id))`,
     `ALTER TABLE workstreams ADD COLUMN lane_released_at INTEGER`,
+    `ALTER TABLE workstreams ADD COLUMN parent_key TEXT`,
+    `ALTER TABLE workstreams ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE workstreams ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'mutating'`,
+    `ALTER TABLE workstreams ADD COLUMN requested_reasoning_level TEXT NOT NULL DEFAULT 'model-default'`,
+    `CREATE INDEX IF NOT EXISTS workstreams_parent_idx ON workstreams(coordinator_thread_id, parent_key)`,
   ]);
   const store = new OrchestratorStore(db);
   const ROUTING_KEY = "provider-routes";
@@ -215,6 +276,15 @@ export default async function plugin(bb: BbPluginApi) {
     bb.realtime.publish("run-changed", { threadId: coordinatorThreadId });
   };
 
+  const cancelDescendants = async (coordinatorThreadId: string, parentKey: string, reason: string) => {
+    const descendants = store.listDescendants(coordinatorThreadId, parentKey);
+    const live = descendants.filter((item) => !["completed", "failed", "cancelled"].includes(item.state));
+    await Promise.allSettled(descendants.flatMap((item) => item.threadId === null ? [] : [retireWorker(item.threadId)]));
+    for (const item of live) store.setWorkstreamState(coordinatorThreadId, item.key, "cancelled", { error: reason });
+    for (const item of descendants) store.releaseProjectLane(coordinatorThreadId, item.key);
+    return descendants;
+  };
+
   const enable = async (input: z.output<typeof enableInput>) => {
     const thread = await bb.sdk.threads.get({ threadId: input.threadId });
     if (thread.parentThreadId !== null) throw new Error("Only a root thread can become an orchestrator.");
@@ -243,7 +313,7 @@ export default async function plugin(bb: BbPluginApi) {
     };
   };
 
-  const workerExecution = async (coordinatorProviderId: string, profileId: WorkerProfile) => {
+  const workerExecution = async (coordinatorProviderId: string, profileId: WorkerProfile, assignmentReasoning?: z.output<typeof reasoningChoice>) => {
     const routePolicy = await readRoutingPolicy();
     const target = routePolicy.strategy === "profile" ? routePolicy.profileRoutes[profileId] : null;
     const providerId = target?.providerId ?? coordinatorProviderId;
@@ -254,67 +324,99 @@ export default async function plugin(bb: BbPluginApi) {
     const selected = result.models.find((model) => model.id === configuredModelId || model.model === configuredModelId);
     if (selected === undefined) throw new Error(`Configured ${profileId} model ${configuredModelId} is no longer available for provider ${providerId}.`);
     const supported = selected.supportedReasoningEfforts.map((effort) => effort.reasoningEffort);
-    const requested = PROFILE_REASONING[profileId];
-    const selectedReasoning = supported.includes(requested) ? requested : supported.includes(selected.defaultReasoningEffort) ? selected.defaultReasoningEffort : supported[0] ?? selected.defaultReasoningEffort;
-    return { providerId: selected.routeProviderId ?? providerId, model: selected.model, reasoningLevel: selectedReasoning };
+    const requestedReasoningLevel = assignmentReasoning ?? routePolicy.profileReasoning[profileId];
+    const selectedReasoning = requestedReasoningLevel === "model-default" ? selected.defaultReasoningEffort : requestedReasoningLevel;
+    if (!supported.includes(selectedReasoning)) {
+      throw new Error(`Configured ${profileId} reasoning ${requestedReasoningLevel} is not supported by ${providerId}/${selected.id}. Supported levels: ${supported.join(", ")}.`);
+    }
+    return { providerId: selected.routeProviderId ?? providerId, model: selected.model, requestedReasoningLevel, reasoningLevel: selectedReasoning };
   };
 
-  const workerPrompt = (item: WorkstreamRecord) => `${item.assignment}\n\nManaged workstream contract:\n- This workstream shares one durable project environment with this run's other ${item.projectId} workstreams. Preserve unrelated changes and do not switch environments.\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers.\n- Before ending, call orchestrator_worker_done exactly once with changed files, validation, and blockers. An idle turn without that record is treated as a failed workstream.`;
+  const workerPrompt = (item: WorkstreamRecord) => {
+    const run = store.getRun(item.coordinatorThreadId)!;
+    const protectedBranches = effectiveProtectedBranches(run.policy);
+    const access = item.accessMode === "read-only"
+      ? "This delegated workstream is read-only. Do not edit files, create commits, or push. Report findings through messages/artifacts and worker_done."
+      : "This is the sole mutating workstream in its project lane. Nested delegation is read-only only, so descendants cannot race this writer.";
+    return `${item.assignment}\n\nManaged workstream contract:\n- This workstream shares one durable project environment with this run's other ${item.projectId} workstreams. Preserve unrelated changes and do not switch environments.\n- ${access}\n- You may delegate bounded read-only subtasks only with orchestrator_delegate; never spawn threads directly.\n- Commit mode is ${run.policy.commitMode}; push mode is ${run.policy.pushMode}; protected branches are ${JSON.stringify(protectedBranches)}. Protected branches cannot be committed to or pushed. Existing branches require separate explicit user approval for commits and pushes. Orchestrator-owned branches need no commit approval. Never push without explicit user approval.\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers.\n- Before ending, call orchestrator_worker_done exactly once with ordered commit SHAs, changed files, validation, and blockers. Parent completion is rejected while descendants are live. An idle turn without that record is treated as a failed workstream.`;
+  };
 
-  const launchQueuedUnlocked = async (coordinatorThreadId: string) => {
+  const launchQueuedUnlocked = async (coordinatorThreadId: string, signal?: AbortSignal) => {
     const run = store.getRun(coordinatorThreadId);
     if (run === null || ["completed", "failed", "cancelled", "awaiting_approval"].includes(run.state)) return [];
     const all = store.listWorkstreams(coordinatorThreadId);
     let available = Math.max(0, run.policy.maxParallelWorkers - all.filter((item) => item.state === "running").length);
-    const activeProjects = new Set(all.filter((item) =>
+    const activeProjects = new Set(all.filter((item) => item.accessMode === "mutating" && (
       item.state === "running"
       || item.state === "reviewing"
-      || (item.threadId !== null && item.laneReleasedAt === null && ["completed", "failed", "cancelled"].includes(item.state)),
+      || (item.threadId !== null && item.laneReleasedAt === null && ["completed", "failed", "cancelled"].includes(item.state))),
     ).map((item) => item.projectId));
     const launched: WorkstreamRecord[] = [];
     for (const item of all.filter((candidate) => candidate.state === "queued" && candidate.attemptCount < run.policy.maxAttemptsPerWorkstream)) {
+      if (signal?.aborted) throw abortError();
       if (available <= 0) break;
-      if (activeProjects.has(item.projectId)) continue;
+      if (item.accessMode === "mutating" && activeProjects.has(item.projectId)) continue;
+      const parent = item.parentKey === null ? null : store.getWorkstream(coordinatorThreadId, item.parentKey);
+      if (item.parentKey !== null && (parent?.threadId == null || parent.state !== "running")) {
+        store.setWorkstreamState(coordinatorThreadId, item.key, "cancelled", { error: "Delegating parent is no longer live." });
+        continue;
+      }
       const spawn = async (environment: { type: "project-default" } | { type: "reuse"; environmentId: string }) => bb.sdk.threads.spawn({
           projectId: item.projectId,
           environment,
-          parentThreadId: coordinatorThreadId,
+          parentThreadId: parent?.threadId ?? coordinatorThreadId,
           visibility: "visible",
           title: item.title ?? `${run.label}: ${item.key}`,
           prompt: workerPrompt(item),
           providerId: item.providerId,
           model: item.model,
           reasoningLevel: item.reasoningLevel as z.output<typeof reasoningLevel>,
+          executionInputSources: { providerId: "explicit", model: "explicit", reasoningLevel: "explicit" },
           pluginMetadata: {
-            role: "worker", coordinatorThreadId, key: item.key, projectId: item.projectId, assignment: item.assignment,
+            role: "worker", coordinatorThreadId, key: item.key, parentKey: item.parentKey, depth: item.depth,
+            accessMode: item.accessMode, projectId: item.projectId, assignment: item.assignment,
             profile: item.profile, ...(item.complexityReason === null ? {} : { complexityReason: item.complexityReason }),
-            providerId: item.providerId, model: item.model, reasoningLevel: item.reasoningLevel,
+            providerId: item.providerId, model: item.model, requestedReasoningLevel: item.requestedReasoningLevel,
+            reasoningLevel: item.reasoningLevel,
           },
         });
+      const spawnAttached = async (environment: { type: "project-default" } | { type: "reuse"; environmentId: string }) => {
+        const provisional = await spawn(environment);
+        try {
+          const attached = await waitForEnvironmentAttachment({
+            initial: provisional,
+            getThread: () => bb.sdk.threads.get({ threadId: provisional.id }),
+            signal,
+          });
+          if (attached.environmentId === null) throw new Error(`Worker ${attached.id} environment attachment was lost.`);
+          return attached as typeof attached & { environmentId: string };
+        } catch (error) {
+          await retireWorker(provisional.id);
+          throw error;
+        }
+      };
       try {
         let lease = store.getProjectEnvironment(coordinatorThreadId, item.projectId);
-        let spawned;
+        let spawned: Awaited<ReturnType<typeof spawnAttached>>;
         try {
-          spawned = await spawn(lease === null ? { type: "project-default" } : { type: "reuse", environmentId: lease.environmentId });
+          spawned = await spawnAttached(lease === null ? { type: "project-default" } : { type: "reuse", environmentId: lease.environmentId });
         } catch (error) {
-          if (lease === null) throw error;
+          if (lease === null || (error instanceof Error && error.name === "AbortError")) throw error;
           store.clearProjectEnvironment(coordinatorThreadId, item.projectId);
           lease = null;
-          spawned = await spawn({ type: "project-default" });
-        }
-        if (spawned.environmentId === null) {
-          await retireWorker(spawned.id);
-          throw new Error(`Worker ${spawned.id} did not receive a project environment.`);
+          spawned = await spawnAttached({ type: "project-default" });
         }
         store.setProjectEnvironment(coordinatorThreadId, item.projectId, spawned.environmentId);
         launched.push(store.setWorkstreamState(coordinatorThreadId, item.key, "running", { threadId: spawned.id, incrementAttempt: true })!);
-        activeProjects.add(item.projectId);
+        if (item.accessMode === "mutating") activeProjects.add(item.projectId);
         available -= 1;
       } catch (error) {
-        store.setWorkstreamState(coordinatorThreadId, item.key, "failed", {
+        const cancelled = error instanceof Error && error.name === "AbortError";
+        store.setWorkstreamState(coordinatorThreadId, item.key, cancelled ? "cancelled" : "failed", {
           error: `Could not launch worker: ${error instanceof Error ? error.message : String(error)}`,
         });
         store.releaseProjectLane(coordinatorThreadId, item.key);
+        if (cancelled) throw error;
       }
     }
     if (launched.length > 0) store.setRunState(coordinatorThreadId, "running");
@@ -322,7 +424,7 @@ export default async function plugin(bb: BbPluginApi) {
   };
 
   const launchLocks = new Map<string, Promise<void>>();
-  const launchQueued = async (coordinatorThreadId: string) => {
+  const launchQueued = async (coordinatorThreadId: string, signal?: AbortSignal) => {
     const previous = launchLocks.get(coordinatorThreadId) ?? Promise.resolve();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -330,7 +432,7 @@ export default async function plugin(bb: BbPluginApi) {
     launchLocks.set(coordinatorThreadId, tail);
     await previous.catch(() => undefined);
     try {
-      return await launchQueuedUnlocked(coordinatorThreadId);
+      return await launchQueuedUnlocked(coordinatorThreadId, signal);
     } finally {
       release();
       if (launchLocks.get(coordinatorThreadId) === tail) launchLocks.delete(coordinatorThreadId);
@@ -339,7 +441,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.rpc.register(rpcContract, {
     start: async ({ label, task, projectIds: ids, attachments, ...execution }) => {
-      const { all, selected } = await resolveProjects(ids);
+      const [{ all, selected }, policy] = await Promise.all([resolveProjects(ids), readPolicy()]);
       const personal = all.find((project) => project.kind === "personal");
       if (personal === undefined) throw new Error("No personal project is available.");
       const thread = await bb.sdk.threads.spawn({
@@ -348,9 +450,9 @@ export default async function plugin(bb: BbPluginApi) {
         title: `Orchestrator: ${label}`,
         pluginMetadata: { role: "coordinator", label, allowedProjectIds: ids },
         ...execution,
-        input: [{ type: "text", text: coordinatorPrompt(label, selected, task), mentions: [] }, ...(attachments ?? [])],
+        input: [{ type: "text", text: coordinatorPrompt(label, selected, task, policy), mentions: [] }, ...(attachments ?? [])],
       });
-      store.upsertRun({ coordinatorThreadId: thread.id, label, allowedProjectIds: ids, policy: await readPolicy() });
+      store.upsertRun({ coordinatorThreadId: thread.id, label, allowedProjectIds: ids, policy });
       return { threadId: thread.id };
     },
     enable,
@@ -403,8 +505,16 @@ export default async function plugin(bb: BbPluginApi) {
     routing_policy_set: async (input) => {
       const catalog = await providerCatalog();
       const byProvider = new Map(catalog.map((provider) => [provider.id, provider]));
-      for (const target of Object.values(input.profileRoutes)) {
+      for (const [profileId, target] of Object.entries(input.profileRoutes)) {
         if (target !== null && !byProvider.get(target.providerId)?.models.some((model) => model.id === target.modelId)) throw new Error(`Selected route ${target.providerId}/${target.modelId} is not available.`);
+        if (target !== null) {
+          const selected = byProvider.get(target.providerId)?.models.find((model) => model.id === target.modelId);
+          const requested = input.profileReasoning[profileId as WorkerProfile];
+          const effective = requested === "model-default" ? selected?.defaultReasoningLevel : requested;
+          if (selected !== undefined && effective !== undefined && !selected.supportedReasoningLevels.includes(effective)) {
+            throw new Error(`Reasoning ${requested} is not supported by ${target.providerId}/${target.modelId} for ${profileId}.`);
+          }
+        }
       }
       await bb.storage.kv.set(ROUTING_POLICY_KEY, input);
       bb.realtime.publish("routing-changed", { providerId: "*" });
@@ -443,7 +553,7 @@ export default async function plugin(bb: BbPluginApi) {
         coordinatorThreadId: threadId, label: coordinatorMetadata.label,
         allowedProjectIds: coordinatorMetadata.allowedProjectIds, policy: await readPolicy(),
       });
-      if (assignments.length > run.policy.maxWorkersPerRun) throw new Error(`This run allows at most ${run.policy.maxWorkersPerRun} workstreams.`);
+      if (assignments.length > run.policy.maxWorkersPerRun) throw new Error(`This run allows at most ${run.policy.maxWorkersPerRun} workstreams including descendants.`);
       const { selected } = await resolveProjects(coordinatorMetadata.allowedProjectIds);
       const projectsById = new Map(selected.map((project) => [project.id, project]));
       for (const assignment of assignments) {
@@ -478,6 +588,9 @@ export default async function plugin(bb: BbPluginApi) {
 
       const stale = store.removeWorkstreamsNotIn(threadId, assignments.map((item) => item.key));
       const retired = stale.flatMap((item) => item.threadId === null ? [] : [item.threadId]);
+      for (const item of stale) {
+        await cancelDescendants(threadId, item.key, "Ancestor was removed from the coordinator plan.");
+      }
       await stopWorkers(retired);
       for (const item of stale) {
         store.setWorkstreamState(threadId, item.key, "cancelled", { error: "Removed from desired workstream set." });
@@ -487,7 +600,7 @@ export default async function plugin(bb: BbPluginApi) {
       const kept: Array<Record<string, unknown>> = [];
       const plans = await Promise.all(assignments.map(async (assignment) => ({
         assignment,
-        execution: await workerExecution(coordinator.providerId, assignment.profile),
+        execution: await workerExecution(coordinator.providerId, assignment.profile, assignment.reasoningLevel),
       })));
       const changedThreadIds = plans.flatMap(({ assignment, execution }) => {
         const existing = store.getWorkstream(threadId, assignment.key);
@@ -496,11 +609,19 @@ export default async function plugin(bb: BbPluginApi) {
           && existing.assignment === assignment.prompt
           && existing.profile === assignment.profile
           && existing.providerId === execution.providerId
-          && existing.model === execution.model;
+          && existing.model === execution.model
+          && existing.requestedReasoningLevel === execution.requestedReasoningLevel
+          && existing.reasoningLevel === execution.reasoningLevel;
         return unchanged || existing?.threadId === null || existing?.threadId === undefined ? [] : [existing.threadId];
       });
       await stopWorkers(changedThreadIds);
       retired.push(...changedThreadIds);
+      for (const id of changedThreadIds) {
+        const changed = store.getWorkstreamByThread(id);
+        if (changed !== null) {
+          await cancelDescendants(threadId, changed.key, "Ancestor workstream was replaced.");
+        }
+      }
       for (const { assignment, execution } of plans) {
         const existing = store.getWorkstream(threadId, assignment.key);
         const unchanged = existing !== null
@@ -508,7 +629,9 @@ export default async function plugin(bb: BbPluginApi) {
           && existing.assignment === assignment.prompt
           && existing.profile === assignment.profile
           && existing.providerId === execution.providerId
-          && existing.model === execution.model;
+          && existing.model === execution.model
+          && existing.requestedReasoningLevel === execution.requestedReasoningLevel
+          && existing.reasoningLevel === execution.reasoningLevel;
         if (unchanged && existing.threadId !== null && !["failed", "cancelled"].includes(existing.state)) {
           kept.push({
             key: assignment.key, projectId: assignment.projectId, threadId: existing.threadId,
@@ -519,14 +642,17 @@ export default async function plugin(bb: BbPluginApi) {
           continue;
         }
         store.upsertWorkstream({
-          coordinatorThreadId: threadId, key: assignment.key, projectId: assignment.projectId,
+          coordinatorThreadId: threadId, key: assignment.key, parentKey: null, depth: 0, accessMode: "mutating", projectId: assignment.projectId,
           title: assignment.title ?? `${coordinatorMetadata.label}: ${projectsById.get(assignment.projectId)!.name} · ${assignment.key}`,
           assignment: assignment.prompt, profile: assignment.profile, complexityReason: assignment.complexityReason ?? null,
           ...execution, state: "queued", threadId: null, attemptCount: 0,
         });
       }
+      const activeDesiredRoots = new Set(assignments.map((item) => item.key));
+      const retainedCount = store.listWorkstreams(threadId).filter((item) => item.parentKey === null ? activeDesiredRoots.has(item.key) : [...activeDesiredRoots].some((root) => item.key.startsWith(`${root}/`))).length;
+      if (retainedCount > run.policy.maxWorkersPerRun) throw new Error(`This plan would retain ${retainedCount} workstreams including descendants; the run cap is ${run.policy.maxWorkersPerRun}.`);
       store.setRunState(threadId, "running");
-      const launched = await launchQueued(threadId);
+      const launched = await launchQueued(threadId, signal);
       await archiveWorkers(retired);
       const launchedByKey = new Map(launched.map((item) => [item.key, item]));
       const byKey = new Map(kept.map((item) => [String(item.key), item]));
@@ -538,7 +664,8 @@ export default async function plugin(bb: BbPluginApi) {
           key: item.key, projectId: item.projectId, threadId: item.threadId,
           action: item.state === "queued" ? "queued" : item.state === "running" ? "spawned" : item.state,
           state: item.state, profile: item.profile,
-          providerId: item.providerId, model: item.model, reasoningLevel: item.reasoningLevel, environmentId,
+          providerId: item.providerId, model: item.model, requestedReasoningLevel: item.requestedReasoningLevel,
+          reasoningLevel: item.reasoningLevel, environmentId,
         });
       }
       const workers = assignments.map((assignment) => byKey.get(assignment.key)!);
@@ -546,6 +673,87 @@ export default async function plugin(bb: BbPluginApi) {
         approved: true, workers, retired,
         limits: { maxParallelWorkers: run.policy.maxParallelWorkers, maxAttemptsPerWorkstream: run.policy.maxAttemptsPerWorkstream, tokenBudget: run.policy.tokenBudget },
       });
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "orchestrator_delegate",
+    description: "Reconcile this managed worker's complete set of bounded read-only child workstreams.",
+    instructions: "Use local stable keys. Children are always read-only, root-run-owned, and use quick routing by default. Do not spawn threads directly.",
+    presentation: { label: { pending: "Delegating read-only subtasks", completed: "Delegated read-only subtasks" } },
+    parameters: z.object({
+      assignments: z.array(workerAssignment).max(20).refine((items) => new Set(items.map((item) => item.key)).size === items.length, "Child keys must be unique."),
+    }),
+    async execute({ assignments }, { threadId, signal }) {
+      const meta = await metadata(threadId);
+      if (meta?.role !== "worker") throw new Error("Only a managed worker can delegate managed subtasks.");
+      const parent = store.getWorkstreamByThread(threadId);
+      const run = store.getRun(meta.coordinatorThreadId);
+      if (parent === null || run === null || parent.state !== "running") throw new Error("This workstream is no longer live.");
+      if (parent.depth >= run.policy.maxDelegationDepth) throw new Error(`Delegation depth limit ${run.policy.maxDelegationDepth} was reached.`);
+      if (assignments.length > run.policy.maxChildrenPerWorker) throw new Error(`A worker may have at most ${run.policy.maxChildrenPerWorker} direct children.`);
+      const { selected } = await resolveProjects(run.allowedProjectIds);
+      const projectsById = new Map(selected.map((project) => [project.id, project]));
+      for (const assignment of assignments) {
+        if (!projectsById.has(assignment.projectId)) throw new Error(`Project ${assignment.projectId} is not allowed in this run.`);
+      }
+      const desired = assignments.map((assignment) => `${parent.key}/${assignment.key}`);
+      const stale = store.removeWorkstreamsNotIn(meta.coordinatorThreadId, desired, parent.key);
+      for (const item of stale) {
+        await cancelDescendants(meta.coordinatorThreadId, item.key, "Ancestor delegated subtask was removed.");
+        if (item.threadId !== null) await retireWorker(item.threadId);
+        store.setWorkstreamState(meta.coordinatorThreadId, item.key, "cancelled", { error: "Removed from delegating worker's desired set." });
+        store.releaseProjectLane(meta.coordinatorThreadId, item.key);
+      }
+      const coordinator = await bb.sdk.threads.get({ threadId: meta.coordinatorThreadId });
+      const plans = await Promise.all(assignments.map(async (assignment, index) => ({
+        assignment,
+        key: desired[index]!,
+        execution: await workerExecution(coordinator.providerId, assignment.profile, assignment.reasoningLevel),
+      })));
+      const additional = plans.filter(({ key }) => store.getWorkstream(meta.coordinatorThreadId, key) === null).length;
+      if (store.listWorkstreams(meta.coordinatorThreadId).length + additional > run.policy.maxWorkersPerRun) {
+        throw new Error(`Delegation would exceed the run cap of ${run.policy.maxWorkersPerRun} total workstreams.`);
+      }
+      const retired: string[] = [];
+      const kept: Array<Record<string, unknown>> = [];
+      for (const { assignment, key, execution } of plans) {
+        const existing = store.getWorkstream(meta.coordinatorThreadId, key);
+        const unchanged = existing !== null
+          && existing.parentKey === parent.key
+          && existing.projectId === assignment.projectId
+          && existing.assignment === assignment.prompt
+          && existing.profile === assignment.profile
+          && existing.providerId === execution.providerId
+          && existing.model === execution.model
+          && existing.requestedReasoningLevel === execution.requestedReasoningLevel
+          && existing.reasoningLevel === execution.reasoningLevel;
+        if (unchanged && existing.threadId !== null && !["failed", "cancelled"].includes(existing.state)) {
+          kept.push({ key, localKey: assignment.key, action: "kept", state: existing.state, threadId: existing.threadId, ...execution });
+          continue;
+        }
+        if (existing !== null) {
+          await cancelDescendants(meta.coordinatorThreadId, key, "Ancestor delegated subtask was replaced.");
+          if (existing.threadId !== null) { await retireWorker(existing.threadId); retired.push(existing.threadId); }
+        }
+        store.upsertWorkstream({
+          coordinatorThreadId: meta.coordinatorThreadId, key, parentKey: parent.key, depth: parent.depth + 1,
+          accessMode: "read-only", projectId: assignment.projectId,
+          title: assignment.title ?? `${run.label}: ${assignment.key}`,
+          assignment: assignment.prompt, profile: assignment.profile, complexityReason: assignment.complexityReason ?? null,
+          ...execution, state: "queued", threadId: null, attemptCount: 0,
+        });
+      }
+      const launched = await launchQueued(meta.coordinatorThreadId, signal);
+      const launchedByKey = new Map(launched.map((item) => [item.key, item]));
+      const keptByKey = new Map(kept.map((item) => [String(item.key), item]));
+      const workers = plans.map(({ assignment, key, execution }) => {
+        const retained = keptByKey.get(key);
+        if (retained !== undefined) return retained;
+        const item = launchedByKey.get(key) ?? store.getWorkstream(meta.coordinatorThreadId, key)!;
+        return { key, localKey: assignment.key, action: item.state === "running" ? "spawned" : item.state, state: item.state, threadId: item.threadId, accessMode: item.accessMode, ...execution };
+      });
+      return JSON.stringify({ workers, retired, parentKey: parent.key, depth: parent.depth + 1, accessMode: "read-only" });
     },
   });
 
@@ -634,6 +842,30 @@ export default async function plugin(bb: BbPluginApi) {
       const run = store.getRun(meta.coordinatorThreadId);
       const item = store.getWorkstream(meta.coordinatorThreadId, meta.key);
       if (run === null || item === null) throw new Error("The durable workstream record is missing.");
+      const liveDescendants = store.listDescendants(meta.coordinatorThreadId, meta.key)
+        .filter((child) => !["completed", "failed", "cancelled"].includes(child.state));
+      if (liveDescendants.length > 0) throw new Error(`Cannot complete while descendants are live: ${liveDescendants.map((child) => child.key).join(", ")}.`);
+      if (item.accessMode === "read-only" && (result.changedFiles.length > 0 || result.commits.length > 0 || result.pushedCommits.length > 0)) {
+        throw new Error("Read-only delegated workstreams cannot report file changes, commits, or pushes.");
+      }
+      const hasVcsAction = result.commits.length > 0 || result.pushedCommits.length > 0;
+      if (hasVcsAction && result.branch === undefined) throw new Error("A branch record is required when commits or pushes are reported.");
+      if (result.branch !== undefined && effectiveProtectedBranches(run.policy).includes(result.branch.name) && hasVcsAction) {
+        throw new Error(`Branch ${result.branch.name} is protected by this run and cannot be committed to or pushed.`);
+      }
+      if (result.commits.length > 0) {
+        if (run.policy.commitMode === "disabled") throw new Error("Commits are disabled by this run's policy.");
+        if (result.branch?.ownership === "existing") {
+          if (run.policy.commitMode !== "owned-or-approved-existing") throw new Error("This run permits commits only on Orchestrator-owned branches.");
+          if (result.commitApproval === undefined) throw new Error("Committing to an existing branch requires explicit user approval evidence.");
+        }
+      }
+      if (result.pushedCommits.length > 0) {
+        if (run.policy.pushMode === "disabled") throw new Error("Pushes are disabled by this run's policy.");
+        if (result.pushApproval === undefined) throw new Error("Every push requires separate explicit user approval evidence.");
+        const commits = new Set(result.commits);
+        if (result.pushedCommits.some((sha) => !commits.has(sha))) throw new Error("Pushed commit SHAs must be included in this workstream's ordered commits.");
+      }
       const review = result.status === "success" && (run.policy.evaluator === "always" || (run.policy.evaluator === "critical" && item.profile === "critical"));
       const state = result.status === "success" ? (review ? "reviewing" : "completed") : "failed";
       const next = store.setWorkstreamState(meta.coordinatorThreadId, meta.key, state, { result, error: result.status === "success" ? null : result.summary })!;
@@ -641,6 +873,12 @@ export default async function plugin(bb: BbPluginApi) {
         store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: result.status === "success", durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
       }
       await notify(meta.coordinatorThreadId, `Workstream ${meta.key} ${review ? "is ready for review" : state}: ${result.summary}`, threadId);
+      if (item.parentKey !== null) {
+        const parent = store.getWorkstream(meta.coordinatorThreadId, item.parentKey);
+        if (parent?.threadId !== null && parent?.threadId !== undefined) {
+          await notify(parent.threadId, `Child workstream ${meta.key} ${review ? "is ready for review" : state}: ${result.summary}`, threadId);
+        }
+      }
       return JSON.stringify({ key: meta.key, state: next.state, reviewRequired: review });
     },
   });
@@ -720,12 +958,16 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     if (item.state !== "running") return;
+    const liveDescendants = store.listDescendants(item.coordinatorThreadId, item.key)
+      .filter((child) => !["completed", "failed", "cancelled"].includes(child.state));
+    if (liveDescendants.length > 0) return;
     store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", {
       error: "Worker became idle without a structured completion record.",
       result: { status: "failed", summary: lastAssistantText ?? "No worker output was recorded.", changedFiles: [], validation: [], blockers: ["Missing orchestrator_worker_done call."] },
     });
     store.releaseProjectLane(item.coordinatorThreadId, item.key);
     store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
+    await cancelDescendants(item.coordinatorThreadId, item.key, "Parent worker failed its completion contract.");
     await notify(item.coordinatorThreadId, `Workstream ${item.key} failed its completion contract: the worker became idle without orchestrator_worker_done.`, thread.id);
     await launchQueued(item.coordinatorThreadId);
     await retireWorker(thread.id);
@@ -741,6 +983,7 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", { error: event.errorInfo === null ? "Provider turn failed and retry limit was reached." : `${event.errorInfo.category}${event.errorInfo.providerCode === null ? "" : ` (${event.errorInfo.providerCode})`}` });
+    await cancelDescendants(item.coordinatorThreadId, item.key, "Parent worker exhausted its retry limit.");
     store.releaseProjectLane(item.coordinatorThreadId, item.key);
     store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
     await notify(item.coordinatorThreadId, `Workstream ${item.key} failed after ${item.attemptCount} attempt(s).`, event.threadId);
@@ -775,6 +1018,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (intentionallyStoppingWorkerIds.has(thread.id)) return;
       if (item !== null && !["completed", "failed", "cancelled"].includes(item.state)) {
         store.setWorkstreamState(item.coordinatorThreadId, item.key, "cancelled", { error: `Worker was ${eventName === "thread.archived" ? "archived" : "deleted"}.` });
+        await cancelDescendants(item.coordinatorThreadId, item.key, `Parent worker was ${eventName === "thread.archived" ? "archived" : "deleted"}.`);
         store.releaseProjectLane(item.coordinatorThreadId, item.key);
         await notify(item.coordinatorThreadId, `Workstream ${item.key} was ${eventName === "thread.archived" ? "archived" : "deleted"} before completion.`);
         await launchQueued(item.coordinatorThreadId);
@@ -795,16 +1039,42 @@ export default async function plugin(bb: BbPluginApi) {
         bb.log.warn(`Could not reconcile terminal worker ${item.threadId}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+    for (const item of store.listRunningWorkstreams()) {
+      if (item.threadId === null) continue;
+      try {
+        const thread = await bb.sdk.threads.get({ threadId: item.threadId });
+        if (thread.status !== "idle" && thread.status !== "error") continue;
+        const descendants = store.listDescendants(item.coordinatorThreadId, item.key);
+        const liveDescendants = descendants
+          .filter((child) => !["completed", "failed", "cancelled"].includes(child.state));
+        if (liveDescendants.length > 0) continue;
+        if (descendants.length > 0) {
+          await notify(item.threadId, `All managed descendants of ${item.key} are terminal. Join their durable results and call orchestrator_worker_done.`, item.coordinatorThreadId);
+          continue;
+        }
+        store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", {
+          error: "Reload reconciliation found an idle worker without a structured completion record.",
+          result: { status: "failed", summary: "No structured completion was recorded.", changedFiles: [], validation: [], blockers: ["Missing orchestrator_worker_done call."], commits: [], pushedCommits: [] },
+        });
+        await cancelDescendants(item.coordinatorThreadId, item.key, "Parent worker failed reload reconciliation.");
+        store.releaseProjectLane(item.coordinatorThreadId, item.key);
+        await notify(item.coordinatorThreadId, `Workstream ${item.key} failed reload reconciliation without orchestrator_worker_done.`);
+        await retireWorker(item.threadId);
+      } catch (error) {
+        bb.log.warn(`Could not reconcile running worker ${item.threadId}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     const timedOut = store.listTimedOutWorkstreams(Date.now());
     const timedOutThreadIds = timedOut.flatMap((item) => item.threadId === null ? [] : [item.threadId]);
     await stopWorkers(timedOutThreadIds);
     for (const item of timedOut) {
       store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", { error: "Worker timeout was reached." });
+      await cancelDescendants(item.coordinatorThreadId, item.key, "Parent worker timed out.");
       store.releaseProjectLane(item.coordinatorThreadId, item.key);
       store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
     }
     await Promise.all(timedOut.map((item) => notify(item.coordinatorThreadId, `Workstream ${item.key} was stopped after reaching its worker timeout.`)));
-    await Promise.all([...new Set(timedOut.map((item) => item.coordinatorThreadId))].map(launchQueued));
+    await Promise.all([...new Set(timedOut.map((item) => item.coordinatorThreadId))].map((id) => launchQueued(id)));
     await archiveWorkers(timedOutThreadIds);
     await Promise.all(store.listExpiredRuns(Date.now()).map((run) => cleanupRun(run.coordinatorThreadId, "cancelled", "Run expired due to its runtime or inactivity limit.")));
   });
@@ -812,6 +1082,14 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.configure((context) => {
     const parsed = metadataSchema.safeParse(context.pluginMetadata);
     if (parsed.success && parsed.data.role === "coordinator") {
+      const run = store.getRun(context.thread.id);
+      if (run !== null && ["completed", "failed", "cancelled"].includes(run.state)) {
+        return {
+          tools: ["orchestrator_enable", "orchestrator_status"],
+          skills: [],
+          instructions: "This Orchestrator run is terminal. You may call orchestrator_enable when the user asks to reset the run and refresh its allowed projects.",
+        };
+      }
       return {
         tools: ["orchestrator_dispatch", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_review", "orchestrator_finish"],
         skills: [],
@@ -819,10 +1097,12 @@ export default async function plugin(bb: BbPluginApi) {
       };
     }
     if (parsed.success && parsed.data.role === "worker") {
+      const run = store.getRun(parsed.data.coordinatorThreadId);
+      const policy = run?.policy ?? DEFAULT_POLICY;
       return {
-        tools: ["orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_worker_done"],
+        tools: ["orchestrator_delegate", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_worker_done"],
         skills: [],
-        instructions: `You are managed workstream ${JSON.stringify(parsed.data.key)}. Publish contracts early, communicate blockers, and call orchestrator_worker_done exactly once before ending. Do not spawn threads.`,
+        instructions: `You are managed workstream ${JSON.stringify(parsed.data.key)} at depth ${parsed.data.depth} with ${parsed.data.accessMode} access. Delegate only bounded read-only children through orchestrator_delegate and never spawn threads directly. Commit mode: ${policy.commitMode}; push mode: ${policy.pushMode}; protected branches: ${JSON.stringify(effectiveProtectedBranches(policy))}. Existing branches require explicit user approval for commits and a separate explicit approval for pushes. Report ordered commit SHAs. Publish contracts early, communicate blockers, and call orchestrator_worker_done exactly once after every descendant is terminal.`,
       };
     }
     if (context.thread.parentThreadId === null) {
