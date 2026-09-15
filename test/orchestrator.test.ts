@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
 import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadResponse, makeTurnFailedEvent } from "@get-bb/plugin-sdk/testing";
-import plugin, { ORCHESTRATOR_MIGRATIONS, waitForEnvironmentAttachment } from "../server.ts";
+import plugin, { deriveCoordinatorTitle, ORCHESTRATOR_MIGRATIONS, waitForEnvironmentAttachment } from "../server.ts";
 import { DEFAULT_POLICY, effectiveProtectedBranches, parseOrchestrationPolicy } from "../lib/policy.ts";
 
 const projects = [
@@ -161,7 +161,7 @@ async function load(providerId = "codex", options: { delayedAttachmentGets?: num
   return { bb, harness, metadata, threads, spawned, sent, archived, stopped, retries, eventRows };
 }
 
-test("start creates a personal coordinator with generic Orchestrator identity", async () => {
+test("start creates a personal coordinator titled from its task", async () => {
   const state = await load();
   const result = await state.harness.behavior.callRpc("start", {
     label: "Product",
@@ -171,6 +171,7 @@ test("start creates a personal coordinator with generic Orchestrator identity", 
   });
   assert.deepEqual(result, { threadId: "spawned-1" });
   assert.deepEqual(state.spawned[0]?.environment, { type: "host", workspace: { type: "personal" } });
+  assert.equal(state.spawned[0]?.title, "Ship the shared API");
   assert.deepEqual(state.spawned[0]?.pluginMetadata, {
     role: "coordinator",
     label: "Product",
@@ -181,6 +182,16 @@ test("start creates a personal coordinator with generic Orchestrator identity", 
   assert.match(text, /one at a time in a shared project environment/);
   assert.match(text, /read-only descendants/);
   assert.match(text, /protected branches \["main","develop"\]/);
+});
+
+test("coordinator titles skip prompt scaffolding and remain compact", () => {
+  assert.equal(deriveCoordinatorTitle("# Task\n\nPlease fix the checkout timeout. Preserve retry behavior.", "o2o"), "Fix the checkout timeout");
+  const title = deriveCoordinatorTitle(
+    "Investigate why synchronizing a very large customer catalog intermittently fails during the final indexing stage and implement a safe fix",
+    "o2o",
+  );
+  assert.equal(title, "Investigate why synchronizing a very large customer catalog intermittently…");
+  assert.ok(title.length <= 80);
 });
 
 test("auto planning classifies small requests before taking the fast path", async () => {

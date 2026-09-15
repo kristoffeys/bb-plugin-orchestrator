@@ -125,6 +125,28 @@ const planInput = z.object({
 });
 type WorkerAssignment = z.infer<typeof workerAssignment>;
 
+const THREAD_TITLE_LIMIT = 80;
+const GENERIC_PROMPT_HEADINGS = /^(?:task|request|goal|objective|instructions?|description|context)\s*:?$/i;
+
+export function deriveCoordinatorTitle(task: string, label: string): string {
+  const lines = task.split(/\r?\n/).map((line) => line.trim()).map((line) => line
+    .replace(/^#{1,6}\s+/, "")
+    .replace(/^(?:[-*+]\s+|\d+[.)]\s+)/, "")
+    .trim());
+  const candidateLine = lines.find((line) => line !== "" && !/^```/.test(line) && !GENERIC_PROMPT_HEADINGS.test(line));
+  let title = (candidateLine ?? "").replace(/\s+/g, " ").trim();
+  const directTitle = title.replace(/^(?:please\s+|could you\s+|can you\s+|would you\s+|we need to\s+|i(?:'d| would) like you to\s+)/i, "");
+  if (directTitle !== title) title = directTitle.replace(/^[a-z]/, (letter) => letter.toUpperCase());
+  const firstSentence = title.match(/^(.+?)[.!?](?:\s|$)/)?.[1]?.trim();
+  if (firstSentence !== undefined) title = firstSentence;
+  title = title.replace(/[\s.:;,!?]+$/g, "");
+  if (title === "") return `Orchestrator: ${label}`;
+  if (title.length <= THREAD_TITLE_LIMIT) return title;
+  const clipped = title.slice(0, THREAD_TITLE_LIMIT - 1);
+  const lastSpace = clipped.lastIndexOf(" ");
+  return `${(lastSpace >= Math.floor(THREAD_TITLE_LIMIT * 0.6) ? clipped.slice(0, lastSpace) : clipped).trimEnd()}…`;
+}
+
 const dependencyCycle = (steps: readonly WorkerAssignment[]): string[] | null => {
   const byKey = new Map(steps.map((step) => [step.key, step]));
   const visiting = new Set<string>();
@@ -556,7 +578,7 @@ export default async function plugin(bb: BbPluginApi) {
       const thread = await bb.sdk.threads.spawn({
         projectId: personal.id,
         environment: { type: "host", workspace: { type: "personal" } },
-        title: `Orchestrator: ${label}`,
+        title: deriveCoordinatorTitle(task, label),
         pluginMetadata: { role: "coordinator", label, allowedProjectIds: ids },
         ...execution,
         input: [{ type: "text", text: coordinatorPrompt(label, selected, task, policy), mentions: [] }, ...(attachments ?? [])],

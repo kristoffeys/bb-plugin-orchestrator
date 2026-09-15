@@ -14,6 +14,8 @@ messaging, cleanup, approval and evaluator gates, structured artifacts,
 configurable commit policy, and cost-aware model and reasoning routing.
 Callers such as the Sidebar plugin provide a label, task, and allowed project
 ids through the `start` RPC; they do not manage worker threads themselves.
+The coordinator thread title is derived from the task prompt, while the label
+remains the durable worker-group identity.
 
 Ordinary root project threads can orchestrate too. Click the workflow icon in
 the chat composer or thread header to open the Orchestration modal, choose the
