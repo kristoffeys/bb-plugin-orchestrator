@@ -422,6 +422,86 @@ test("a changed workstream stops its old worker and reuses the project environme
   assert.deepEqual(state.spawned[1]?.environment, { type: "reuse", environmentId: "env-api" });
 });
 
+test("transient idle between bootstrap and the real turn does not fail a worker", async () => {
+  const state = await load();
+  const worker = JSON.parse(await state.harness.behavior.callAgentTool(
+    "orchestrator_dispatch",
+    { assignments: [{ key: "bootstrap", projectId: "api", prompt: "Investigate." }] },
+    { threadId: "coord", projectId: "personal" },
+  ) as string).workers[0];
+  const thread = state.threads.get(worker.threadId)!;
+  thread.status = "idle";
+  const idle = state.harness.behavior.emitThreadEvent("thread.idle", { thread, lastAssistantText: null });
+  thread.status = "active";
+  await state.harness.behavior.emitThreadEvent("thread.active", { thread });
+  await idle;
+  let status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.workstreams[0].state, "running");
+  assert.equal(state.stopped.includes(worker.threadId), false);
+
+  thread.status = "idle";
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread, lastAssistantText: "Stopped without reporting." });
+  status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.workstreams[0].state, "failed");
+  assert.deepEqual(status.workstreams[0].result.blockers, ["Missing orchestrator_worker_done call."]);
+});
+
+test("reconciling a new desired set preserves terminal workstream outcomes", async () => {
+  const state = await load();
+  const first = JSON.parse(await state.harness.behavior.callAgentTool(
+    "orchestrator_dispatch",
+    { assignments: [{ key: "investigate", projectId: "api", prompt: "Investigate." }] },
+    { threadId: "coord", projectId: "personal" },
+  ) as string).workers[0];
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "failed", summary: "Investigation failed.", changedFiles: [], validation: [], blockers: ["No access"],
+  }, { threadId: first.threadId, projectId: "api" });
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread: state.threads.get(first.threadId)!, lastAssistantText: "Failed." });
+  const next = JSON.parse(await state.harness.behavior.callAgentTool(
+    "orchestrator_dispatch",
+    { assignments: [{ key: "implement", projectId: "web", prompt: "Implement." }] },
+    { threadId: "coord", projectId: "personal" },
+  ) as string);
+  assert.deepEqual(next.retired, []);
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  const investigation = status.workstreams.find((item: { key: string }) => item.key === "investigate");
+  assert.equal(investigation.state, "failed");
+  assert.equal(investigation.error, "Investigation failed.");
+  assert.deepEqual(investigation.result.blockers, ["No access"]);
+});
+
+test("a new plan resets a terminal run and direct dispatch cannot reuse its old clock", async () => {
+  const state = await load();
+  const worker = JSON.parse(await state.harness.behavior.callAgentTool(
+    "orchestrator_dispatch",
+    { assignments: [{ key: "old", projectId: "api", prompt: "Old task." }] },
+    { threadId: "coord", projectId: "personal" },
+  ) as string).workers[0];
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "failed", summary: "Old task failed.", changedFiles: [], validation: [], blockers: ["Old blocker"],
+  }, { threadId: worker.threadId, projectId: "api" });
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread: state.threads.get(worker.threadId)!, lastAssistantText: "Failed." });
+  await state.harness.behavior.callAgentTool("orchestrator_finish", { workerThreadIds: [worker.threadId] }, { threadId: "coord", projectId: "personal" });
+  const before = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(before.run.state, "failed");
+  await assert.rejects(state.harness.behavior.callAgentTool(
+    "orchestrator_dispatch",
+    { assignments: [{ key: "new", projectId: "web", prompt: "New task." }] },
+    { threadId: "coord", projectId: "personal" },
+  ), /Start the next request with orchestrator_plan/);
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  const planned = JSON.parse(await state.harness.behavior.callAgentTool(
+    "orchestrator_plan",
+    { scale: "small", rationale: "A fresh bounded request.", steps: [] },
+    { threadId: "coord", projectId: "personal" },
+  ) as string);
+  assert.equal(planned.restarted, true);
+  const after = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(after.run.state, "configured");
+  assert.ok(after.run.createdAt > before.run.createdAt);
+  assert.deepEqual(after.workstreams, []);
+});
+
 test("workers exchange handoffs and finish archives plus stops managed threads", async () => {
   const state = await load("claude-code");
   const dispatched = JSON.parse(await state.harness.behavior.callAgentTool(
@@ -1091,6 +1171,7 @@ test("only terminal coordinators regain orchestrator_enable discoverability", as
     thread: state.threads.get("coord")!, pluginMetadata: state.metadata.get("coord")! as never,
   }));
   assert.ok(terminal.tools.some((tool) => tool.name === "orchestrator_enable"));
+  assert.ok(terminal.tools.some((tool) => tool.name === "orchestrator_plan"));
   await state.harness.behavior.callAgentTool("orchestrator_enable", { label: "Reset", projectIds: ["web"] }, { threadId: "coord", projectId: "personal" });
   const refreshed = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(refreshed.run.state, "configured");
@@ -1147,6 +1228,18 @@ test("disable, worker timeout, and run expiry recursively clean nested threads",
     assert.ok(expired.stopped.includes(expiredChild.threadId));
     const status = JSON.parse(await expired.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
     assert.equal(status.run.state, "cancelled");
+    assert.equal(status.run.error, "Run exceeded its 10-minute runtime limit.");
+
+    Date.now = originalNow;
+    const inactive = await load();
+    await inactive.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off", runTimeoutMinutes: 120, inactiveCleanupMinutes: 10 });
+    const inactiveRoot = JSON.parse(await inactive.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "root", projectId: "api", prompt: "Root." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+    inactive.threads.get(inactiveRoot.threadId)!.status = "active";
+    const inactiveBase = originalNow();
+    Date.now = () => inactiveBase + 11 * 60_000;
+    await inactive.harness.behavior.runSchedule("cleanup-expired-runs");
+    const inactiveStatus = JSON.parse(await inactive.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+    assert.equal(inactiveStatus.run.error, "Run was inactive for 10 minutes.");
   } finally {
     Date.now = originalNow;
   }

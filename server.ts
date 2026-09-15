@@ -170,6 +170,12 @@ type WorkerAssignment = z.infer<typeof workerAssignment>;
 
 const THREAD_TITLE_LIMIT = 80;
 const GENERIC_PROMPT_HEADINGS = /^(?:task|request|goal|objective|instructions?|description|context)\s*:?$/i;
+const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled"]);
+const TERMINAL_WORKSTREAM_STATES = new Set(["completed", "failed", "cancelled"]);
+const WORKER_IDLE_SETTLE_MS = 250;
+
+const isTerminalRun = (state: string) => TERMINAL_RUN_STATES.has(state);
+const isTerminalWorkstream = (state: string) => TERMINAL_WORKSTREAM_STATES.has(state);
 
 export function deriveCoordinatorTitle(task: string, label: string): string {
   const lines = task.split(/\r?\n/).map((line) => line.trim()).map((line) => line
@@ -383,6 +389,7 @@ export default async function plugin(bb: BbPluginApi) {
   };
   const retiredWorkerIds = new Set<string>();
   const intentionallyStoppingWorkerIds = new Set<string>();
+  const workerActivityEpochs = new Map<string, number>();
   const retireWorker = async (threadId: string) => {
     if (retiredWorkerIds.has(threadId)) return;
     intentionallyStoppingWorkerIds.add(threadId);
@@ -872,24 +879,28 @@ export default async function plugin(bb: BbPluginApi) {
     parameters: planInput,
     async execute({ scale, rationale, steps }, { threadId }) {
       const coordinatorMetadata = await requireCoordinator(threadId);
-      const run = store.getRun(threadId) ?? store.upsertRun({
-        coordinatorThreadId: threadId, label: coordinatorMetadata.label,
-        allowedProjectIds: coordinatorMetadata.allowedProjectIds, policy: await readPolicy(),
-      });
+      let run = store.getRun(threadId);
+      const restart = run !== null && isTerminalRun(run.state);
+      const policy = restart || run === null ? await readPolicy() : run.policy;
       const { selected } = await resolveProjects(coordinatorMetadata.allowedProjectIds);
       const allowed = new Set(selected.map((project) => project.id));
       for (const step of steps) if (!allowed.has(step.projectId)) throw new Error(`Project ${step.projectId} is not allowed in this run.`);
-      if (steps.length > run.policy.maxWorkersPerRun) throw new Error(`This run allows at most ${run.policy.maxWorkersPerRun} planned workstreams including descendants.`);
+      if (steps.length > policy.maxWorkersPerRun) throw new Error(`This run allows at most ${policy.maxWorkersPerRun} planned workstreams including descendants.`);
       const cycle = dependencyCycle(steps);
       if (cycle !== null) throw new Error(`Worker plan contains a dependency cycle: ${cycle.join(" -> ")}.`);
       if (scale === "small" && steps.length > 0 && !isSmallRequest(steps)) {
         throw new Error("The proposed steps exceed the small-request fast path. Classify this request as large.");
       }
-      if (run.policy.planningMode === "always" && steps.length === 0) {
+      if (policy.planningMode === "always" && steps.length === 0) {
         throw new Error("Planning mode is always, so even a small request needs explicit plan steps.");
       }
+      if (restart) store.resetRun(threadId);
+      run = restart || run === null ? store.upsertRun({
+        coordinatorThreadId: threadId, label: coordinatorMetadata.label,
+        allowedProjectIds: coordinatorMetadata.allowedProjectIds, policy,
+      }) : run;
       const plan = store.setPlan({ coordinatorThreadId: threadId, scale, rationale, steps });
-      return JSON.stringify({ plan, fastPath: scale === "small" && steps.length === 0, planningMode: run.policy.planningMode });
+      return JSON.stringify({ plan, restarted: restart, fastPath: scale === "small" && steps.length === 0, planningMode: run.policy.planningMode });
     },
   });
 
@@ -907,6 +918,7 @@ export default async function plugin(bb: BbPluginApi) {
         coordinatorThreadId: threadId, label: coordinatorMetadata.label,
         allowedProjectIds: coordinatorMetadata.allowedProjectIds, policy: await readPolicy(),
       });
+      if (isTerminalRun(run.state)) throw new Error(`This Orchestrator run is ${run.state}. Start the next request with orchestrator_plan so it can reset the run and its timeout clock.`);
       if (assignments.length > run.policy.maxWorkersPerRun) throw new Error(`This run allows at most ${run.policy.maxWorkersPerRun} workstreams including descendants.`);
       const { selected } = await resolveProjects(coordinatorMetadata.allowedProjectIds);
       const projectsById = new Map(selected.map((project) => [project.id, project]));
@@ -962,7 +974,8 @@ export default async function plugin(bb: BbPluginApi) {
         run = store.getRun(threadId)!;
       }
 
-      const stale = store.removeWorkstreamsNotIn(threadId, assignments.map((item) => item.key));
+      const stale = store.removeWorkstreamsNotIn(threadId, assignments.map((item) => item.key))
+        .filter((item) => !isTerminalWorkstream(item.state));
       const retired = stale.flatMap((item) => item.threadId === null ? [] : [item.threadId]);
       for (const item of stale) {
         await cancelDescendants(threadId, item.key, "Ancestor was removed from the coordinator plan.");
@@ -1080,7 +1093,8 @@ export default async function plugin(bb: BbPluginApi) {
         if (!projectsById.has(assignment.projectId)) throw new Error(`Project ${assignment.projectId} is not allowed in this run.`);
       }
       const desired = assignments.map((assignment) => `${parent.key}/${assignment.key}`);
-      const stale = store.removeWorkstreamsNotIn(meta.coordinatorThreadId, desired, parent.key);
+      const stale = store.removeWorkstreamsNotIn(meta.coordinatorThreadId, desired, parent.key)
+        .filter((item) => !isTerminalWorkstream(item.state));
       for (const item of stale) {
         await cancelDescendants(meta.coordinatorThreadId, item.key, "Ancestor delegated subtask was removed.");
         if (item.threadId !== null) await retireWorker(item.threadId);
@@ -1332,14 +1346,15 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.events.on("thread.active", async ({ thread }) => {
+    workerActivityEpochs.set(thread.id, (workerActivityEpochs.get(thread.id) ?? 0) + 1);
     const item = store.getWorkstreamByThread(thread.id);
     if (item !== null && item.state === "queued") store.setWorkstreamState(item.coordinatorThreadId, item.key, "running");
   });
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
     if (intentionallyStoppingWorkerIds.has(thread.id)) return;
-    const item = store.getWorkstreamByThread(thread.id);
+    let item = store.getWorkstreamByThread(thread.id);
     if (item === null) return;
-    if (item.state === "completed" || item.state === "failed" || item.state === "cancelled") {
+    if (isTerminalWorkstream(item.state)) {
       store.releaseProjectLane(item.coordinatorThreadId, item.key);
       await launchQueued(item.coordinatorThreadId);
       await retireWorker(thread.id);
@@ -1347,8 +1362,24 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (item.state !== "running") return;
     const liveDescendants = store.listDescendants(item.coordinatorThreadId, item.key)
-      .filter((child) => !["completed", "failed", "cancelled"].includes(child.state));
+      .filter((child) => !isTerminalWorkstream(child.state));
     if (liveDescendants.length > 0) return;
+    const idleEpoch = workerActivityEpochs.get(thread.id) ?? 0;
+    await new Promise<void>((resolve) => setTimeout(resolve, WORKER_IDLE_SETTLE_MS));
+    if (intentionallyStoppingWorkerIds.has(thread.id) || (workerActivityEpochs.get(thread.id) ?? 0) !== idleEpoch) return;
+    let settledThread;
+    try {
+      settledThread = await bb.sdk.threads.get({ threadId: thread.id });
+    } catch (error) {
+      bb.log.warn(`Could not confirm idle worker ${thread.id}: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    if (settledThread.status !== "idle") return;
+    item = store.getWorkstreamByThread(thread.id);
+    if (item === null || item.state !== "running") return;
+    const settledLiveDescendants = store.listDescendants(item.coordinatorThreadId, item.key)
+      .filter((child) => !isTerminalWorkstream(child.state));
+    if (settledLiveDescendants.length > 0) return;
     store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", {
       error: "Worker became idle without a structured completion record.",
       result: { status: "failed", summary: lastAssistantText ?? "No worker output was recorded.", changedFiles: [], validation: [], blockers: ["Missing orchestrator_worker_done call."] },
@@ -1464,7 +1495,14 @@ export default async function plugin(bb: BbPluginApi) {
     await Promise.all(timedOut.map((item) => notify(item.coordinatorThreadId, `Workstream ${item.key} was stopped after reaching its worker timeout.`)));
     await Promise.all([...new Set(timedOut.map((item) => item.coordinatorThreadId))].map((id) => launchQueued(id)));
     await archiveWorkers(timedOutThreadIds);
-    await Promise.all(store.listExpiredRuns(Date.now()).map((run) => cleanupRun(run.coordinatorThreadId, "cancelled", "Run expired due to its runtime or inactivity limit.")));
+    const expiryNow = Date.now();
+    await Promise.all(store.listExpiredRuns(expiryNow).map((run) => {
+      const runtimeExpired = expiryNow >= run.createdAt + run.policy.runTimeoutMinutes * 60_000;
+      const reason = runtimeExpired
+        ? `Run exceeded its ${run.policy.runTimeoutMinutes}-minute runtime limit.`
+        : `Run was inactive for ${run.policy.inactiveCleanupMinutes} minutes.`;
+      return cleanupRun(run.coordinatorThreadId, "cancelled", reason);
+    }));
   });
 
   bb.agents.configure((context) => {
@@ -1473,9 +1511,9 @@ export default async function plugin(bb: BbPluginApi) {
       const run = store.getRun(context.thread.id);
       if (run !== null && ["completed", "failed", "cancelled"].includes(run.state)) {
         return {
-          tools: ["orchestrator_enable", "orchestrator_status"],
+          tools: ["orchestrator_plan", "orchestrator_enable", "orchestrator_status"],
           skills: [],
-          instructions: "This Orchestrator run is terminal. You may call orchestrator_enable when the user asks to reset the run and refresh its allowed projects.",
+          instructions: "This Orchestrator run is terminal. For a new user request, begin with orchestrator_plan; it resets the prior run and refreshes the timeout clock. Use orchestrator_enable only when the user asks to change the allowed projects.",
         };
       }
       return {
