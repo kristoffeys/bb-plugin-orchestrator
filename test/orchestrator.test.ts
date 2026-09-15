@@ -89,6 +89,11 @@ async function load(providerId = "codex", options: { delayedAttachmentGets?: num
           }
           return thread;
         },
+        output: async () => ({ output: "Worker output." }) as never,
+        conversationOutline: async () => ({ items: [] }) as never,
+        context: async () => ({ usage: null }) as never,
+        timeline: async () => ({ maxSeq: 0, rows: [], pendingTodos: null }) as never,
+        storageFiles: async () => ({ storageRootPath: "/thread-storage", files: [], truncated: false }) as never,
         getPluginMetadata: async ({ threadId }: { threadId: string }) => (metadata.get(threadId) ?? {}) as never,
         updatePluginMetadata: async ({ threadId, set, remove }: { threadId: string; set?: Record<string, unknown>; remove?: string[] }) => {
           const next = { ...(metadata.get(threadId) ?? {}), ...set };
@@ -154,6 +159,11 @@ async function load(providerId = "codex", options: { delayedAttachmentGets?: num
           list: async ({ threadId }: { threadId: string }) => (eventRows.get(threadId) ?? []) as never,
         },
       } as never,
+      environments: {
+        diffFiles: async ({ environmentId }: { environmentId: string }) => ({
+          environmentId, outcome: "available", shortstat: "", mergeBaseRef: null, truncated: false, files: [],
+        }) as never,
+      } as never,
     },
   });
   await plugin(bb);
@@ -211,6 +221,36 @@ test("auto planning classifies small requests before taking the fast path", asyn
   const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(status.plan.scale, "small");
   assert.equal(status.plan.version, 1);
+});
+
+test("run dashboard combines live worker state with captured completion evidence", async () => {
+  const state = await load();
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "dashboard", projectId: "api", prompt: "Build the dashboard." }],
+  }, { threadId: "coord", projectId: "personal" }) as string);
+  const workerThreadId = dispatched.workers[0].threadId as string;
+
+  const live = await state.harness.behavior.callRpc("run_dashboard_get", { threadId: "coord" }) as {
+    available: boolean; counts: { active: number }; workstreams: Array<{ live: { outputPreview: string | null } | null }>;
+  };
+  assert.equal(live.available, true);
+  assert.equal(live.counts.active, 1);
+  assert.equal(live.workstreams[0]?.live?.outputPreview, "Worker output.");
+
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "Dashboard complete.", changedFiles: ["app.tsx"], validation: [], blockers: [],
+  }, { threadId: workerThreadId, projectId: "api" });
+
+  const completed = await state.harness.behavior.callRpc("run_dashboard_get", { threadId: workerThreadId }) as {
+    counts: { completed: number };
+    workstreams: Array<{ evidence: { output: string | null; storage: { rootPath: string } | null; environmentDiff: { environmentId: string; outcome: string } | null } | null }>;
+  };
+  assert.equal(completed.counts.completed, 1);
+  assert.equal(completed.workstreams[0]?.evidence?.output, "Worker output.");
+  assert.equal(completed.workstreams[0]?.evidence?.storage?.rootPath, "/thread-storage");
+  assert.deepEqual(completed.workstreams[0]?.evidence?.environmentDiff, {
+    environmentId: "env-api", outcome: "available", shortstat: "", mergeBaseRef: null, truncated: false, files: [], message: null,
+  });
 });
 
 test("large plans run independent investigations in parallel and gate dependent mutation", async () => {

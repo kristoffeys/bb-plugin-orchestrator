@@ -1,13 +1,15 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
   definePluginApp,
   experimental_Icon as Icon,
   useRealtime,
   useRpc,
+  useBbNavigate,
   useComposerView,
   type PluginPendingInteractionProps,
   type PluginThreadHeaderActionProps,
+  type PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server.ts";
 
@@ -51,6 +53,31 @@ type ThreadOrchestrationState = {
   label: string;
   allowedProjectIds: string[];
   projects: Array<{ id: string; name: string; current: boolean }>;
+};
+type DashboardEvidence = {
+  capturedAt: number;
+  output: string | null;
+  conversation: Array<{ id: string; role: "assistant" | "user"; preview: string }>;
+  context: { usedTokens: number; modelContextWindow: number; estimated: boolean } | null;
+  timeline: { maxSeq: number; rowCount: number; pendingTodos: Array<{ id: string; status: "completed" | "in_progress" | "pending"; text: string }> } | null;
+  storage: { rootPath: string; files: Array<{ name: string; path: string }>; truncated: boolean } | null;
+  environmentDiff: { environmentId: string; outcome: string; shortstat: string | null; mergeBaseRef: string | null; truncated: boolean; files: Array<{ path: string; changeKind: string; additions: number; deletions: number; binary: boolean }>; message: string | null } | null;
+  warnings: string[];
+};
+type DashboardResult = { status?: string; summary?: string; changedFiles?: string[]; blockers?: string[]; validation?: Array<{ command: string; status: string; summary: string }>; evidence?: DashboardEvidence };
+type DashboardWorkstream = {
+  key: string; title: string | null; projectId: string; parentKey: string | null; depth: number; accessMode: "mutating" | "read-only";
+  profile: Profile; providerId: string; model: string; state: string; threadId: string | null; attemptCount: number; totalTokens: number;
+  createdAt: number; updatedAt: number; startedAt: number | null; completedAt: number | null; error: string | null; result: unknown | null;
+  evidence: DashboardEvidence | null; live: { status: string | null; displayStatus: string | null; queuedMessageCount: number; outputPreview: string | null; context: { usedTokens: number; modelContextWindow: number; estimated: boolean } | null; pendingTodos: Array<{ id: string; status: "completed" | "in_progress" | "pending"; text: string }>; tokenHistory: Array<{ at: number; tokens: number }> } | null;
+  dependencies: string[]; nextAction: string | null;
+};
+type DashboardData = {
+  available: boolean; coordinatorThreadId: string | null;
+  run: { label: string; state: string; createdAt: number; updatedAt: number; lastActivityAt: number; totalTokens: number; tokenBudget: number; error: string | null } | null;
+  counts: { total: number; active: number; queued: number; completed: number; failed: number; reviewing: number };
+  workstreams: DashboardWorkstream[];
+  artifacts: Array<{ id: number; workstreamKey: string; kind: string; name: string; version: string | null; summary: string; path: string | null; createdAt: number }>;
 };
 const OPEN_ORCHESTRATION_EVENT = "bb-orchestrator:open";
 
@@ -136,6 +163,7 @@ function ProjectPicker({
 
 function ThreadOrchestrationLauncher({ threadId }: PluginThreadHeaderActionProps) {
   const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
   const [state, setState] = useState<ThreadOrchestrationState | null>(null);
 
   const load = useCallback(async () => {
@@ -153,24 +181,31 @@ function ThreadOrchestrationLauncher({ threadId }: PluginThreadHeaderActionProps
   if (state === null || !state.eligible) return null;
 
   return (
-    <button
-      type="button"
-      aria-label={state.enabled ? "Configure orchestration" : "Enable orchestration"}
-      title={state.enabled ? "Orchestration enabled" : "Enable orchestration"}
-      onClick={() => window.dispatchEvent(new CustomEvent(OPEN_ORCHESTRATION_EVENT, {
-        detail: { threadId },
-      }))}
-      className={`relative grid size-7 place-items-center rounded-md outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring ${
-        state.enabled
-          ? "bg-primary/12 text-primary hover:bg-primary/20"
-          : "text-muted-foreground hover:bg-accent hover:text-foreground"
-      }`}
-    >
-      <Icon name="Workflow" className="size-4" aria-hidden="true" />
+    <div className="flex items-center gap-0.5">
       {state.enabled ? (
-        <span className="absolute right-0.5 top-0.5 size-1.5 rounded-full bg-primary ring-1 ring-background" />
+        <button
+          type="button"
+          aria-label="Open orchestration run dashboard"
+          title="Open run dashboard"
+          onClick={() => navigate.openThreadPanel({ actionId: "run-command-center", title: state.label })}
+          className="grid size-7 place-items-center rounded-md text-primary outline-none transition-colors hover:bg-primary/15 focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <Icon name="Activity" className="size-4" aria-hidden="true" />
+        </button>
       ) : null}
-    </button>
+      <button
+        type="button"
+        aria-label={state.enabled ? "Configure orchestration" : "Enable orchestration"}
+        title={state.enabled ? "Configure orchestration" : "Enable orchestration"}
+        onClick={() => window.dispatchEvent(new CustomEvent(OPEN_ORCHESTRATION_EVENT, { detail: { threadId } }))}
+        className={`relative grid size-7 place-items-center rounded-md outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring ${
+          state.enabled ? "bg-primary/12 text-primary hover:bg-primary/20" : "text-muted-foreground hover:bg-accent hover:text-foreground"
+        }`}
+      >
+        <Icon name="Workflow" className="size-4" aria-hidden="true" />
+        {state.enabled ? <span className="absolute right-0.5 top-0.5 size-1.5 rounded-full bg-primary ring-1 ring-background" /> : null}
+      </button>
+    </div>
   );
 }
 
@@ -350,6 +385,327 @@ function OrchestrationOverlay() {
         </>
       )}
     </Dialog.Root>
+  );
+}
+
+const STATE_STYLE: Record<string, string> = {
+  running: "bg-blue-500/15 text-blue-700 dark:text-blue-300",
+  reviewing: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
+  completed: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300",
+  failed: "bg-destructive/15 text-destructive",
+  cancelled: "bg-muted text-muted-foreground",
+  queued: "bg-violet-500/15 text-violet-700 dark:text-violet-300",
+  awaiting_approval: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
+  blocked: "bg-destructive/15 text-destructive",
+};
+const formatCount = (value: number) => new Intl.NumberFormat(undefined, { notation: value >= 10_000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(value);
+const formatDuration = (start: number | null, end: number | null) => {
+  if (start === null) return "Not started";
+  const seconds = Math.max(0, Math.round(((end ?? Date.now()) - start) / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return minutes < 60 ? `${minutes}m ${seconds % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+};
+const dashboardResult = (value: unknown): DashboardResult | null => typeof value === "object" && value !== null ? value as DashboardResult : null;
+
+type ResultItem = { key: string; text: string };
+type ResultBlock =
+  | { key: string; kind: "heading"; text: string }
+  | { key: string; kind: "paragraph"; text: string }
+  | { key: string; kind: "bullets"; items: ResultItem[] }
+  | { key: string; kind: "numbers"; items: ResultItem[] }
+  | { key: string; kind: "checks"; items: Array<ResultItem & { checked: boolean }> }
+  | { key: string; kind: "code"; text: string };
+
+function parseResultBlocks(text: string): ResultBlock[] {
+  const blocks: ResultBlock[] = [];
+  const lines = text.trim().split(/\r?\n/);
+  let paragraph: string[] = [];
+  let paragraphStart = 0;
+  let code: string[] | null = null;
+  let codeStart = 0;
+  const flushParagraph = () => {
+    if (paragraph.length > 0) blocks.push({ key: `paragraph:${paragraphStart}`, kind: "paragraph", text: paragraph.join(" ") });
+    paragraph = [];
+  };
+  for (const [lineIndex, rawLine] of lines.entries()) {
+    const line = rawLine.trimEnd();
+    if (line.trimStart().startsWith("```")) {
+      flushParagraph();
+      if (code === null) { code = []; codeStart = lineIndex; }
+      else { blocks.push({ key: `code:${codeStart}`, kind: "code", text: code.join("\n") }); code = null; }
+      continue;
+    }
+    if (code !== null) { code.push(rawLine); continue; }
+    if (line.trim() === "") { flushParagraph(); continue; }
+    const heading = line.match(/^#{1,4}\s+(.+)/);
+    if (heading?.[1] !== undefined) { flushParagraph(); blocks.push({ key: `heading:${lineIndex}`, kind: "heading", text: heading[1] }); continue; }
+    const check = line.match(/^[-*]\s+\[([ xX])\]\s+(.+)/);
+    if (check?.[2] !== undefined) {
+      flushParagraph();
+      const previous = blocks.at(-1);
+      const item = { key: `check:${lineIndex}`, checked: check[1]?.toLowerCase() === "x", text: check[2] };
+      if (previous?.kind === "checks") previous.items.push(item); else blocks.push({ key: item.key, kind: "checks", items: [item] });
+      continue;
+    }
+    const bullet = line.match(/^[-*]\s+(.+)/);
+    if (bullet?.[1] !== undefined) {
+      flushParagraph();
+      const previous = blocks.at(-1);
+      const item = { key: `bullet:${lineIndex}`, text: bullet[1] };
+      if (previous?.kind === "bullets") previous.items.push(item); else blocks.push({ key: item.key, kind: "bullets", items: [item] });
+      continue;
+    }
+    const number = line.match(/^\d+[.)]\s+(.+)/);
+    if (number?.[1] !== undefined) {
+      flushParagraph();
+      const previous = blocks.at(-1);
+      const item = { key: `number:${lineIndex}`, text: number[1] };
+      if (previous?.kind === "numbers") previous.items.push(item); else blocks.push({ key: item.key, kind: "numbers", items: [item] });
+      continue;
+    }
+    if (paragraph.length === 0) paragraphStart = lineIndex;
+    paragraph.push(line.trim());
+  }
+  flushParagraph();
+  if (code !== null && code.length > 0) blocks.push({ key: `code:${codeStart}`, kind: "code", text: code.join("\n") });
+  return blocks;
+}
+
+function InlineResultText({ text }: { text: string }) {
+  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+  let offset = 0;
+  return <>{parts.map((part) => { const key = `${offset}:${part}`; offset += part.length; return part.startsWith("`") && part.endsWith("`") ? <code key={key} className="rounded bg-muted px-1 py-0.5 text-[0.92em] text-foreground">{part.slice(1, -1)}</code> : part.startsWith("**") && part.endsWith("**") ? <strong key={key} className="font-semibold text-foreground">{part.slice(2, -2)}</strong> : <span key={key}>{part}</span>; })}</>;
+}
+
+function FormattedResult({ text }: { text: string }) {
+  const blocks = parseResultBlocks(text);
+  const renderItems = (items: ResultItem[]) => items.map((item) => <li key={item.key}><InlineResultText text={item.text} /></li>);
+  return (
+    <div className="space-y-2 text-xs leading-relaxed text-muted-foreground">
+      {blocks.map((block): ReactNode => {
+        if (block.kind === "heading") return <h5 key={block.key} className="pt-1 text-xs font-semibold text-foreground">{block.text}</h5>;
+        if (block.kind === "paragraph") return <p key={block.key}><InlineResultText text={block.text} /></p>;
+        if (block.kind === "bullets") return <ul key={block.key} className="space-y-1 pl-4 marker:text-muted-foreground/70" style={{ listStyleType: "disc" }}>{renderItems(block.items)}</ul>;
+        if (block.kind === "numbers") return <ol key={block.key} className="space-y-1 pl-4 marker:font-medium marker:text-foreground" style={{ listStyleType: "decimal" }}>{renderItems(block.items)}</ol>;
+        if (block.kind === "checks") return <ul key={block.key} className="space-y-1">{block.items.map((item) => <li key={item.key} className="flex gap-2"><span className={item.checked ? "text-emerald-600" : "text-muted-foreground"}>{item.checked ? "✓" : "○"}</span><span><InlineResultText text={item.text} /></span></li>)}</ul>;
+        return <pre key={block.key} className="max-h-56 overflow-auto rounded-md bg-muted/40 p-2.5 font-mono text-[11px] leading-relaxed text-foreground"><code>{block.text}</code></pre>;
+      })}
+    </div>
+  );
+}
+
+type ResultDigest = { outcome: string; changes: string[]; assumptions: string[]; validation: string[] };
+
+function splitDigestItems(text: string) {
+  return text
+    .split(/(?<=[.!?])\s+(?=[A-Z`])|;\s+(?=[A-Z`])/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function digestResultSummary(text: string): ResultDigest {
+  const markers = [...text.matchAll(/\b(assumptions(?:\/deviations)?(?: from the artifact)?|caveats?|validation|tests?):\s*/gi)];
+  const mainEnd = markers[0]?.index ?? text.length;
+  const mainItems = splitDigestItems(text.slice(0, mainEnd).trim());
+  const digest: ResultDigest = { outcome: mainItems[0] ?? text.trim(), changes: mainItems.slice(1), assumptions: [], validation: [] };
+  for (const [index, marker] of markers.entries()) {
+    const start = (marker.index ?? 0) + marker[0].length;
+    const end = markers[index + 1]?.index ?? text.length;
+    const items = splitDigestItems(text.slice(start, end).trim());
+    if (marker[1]?.toLowerCase().startsWith("assumption") || marker[1]?.toLowerCase().startsWith("caveat")) digest.assumptions.push(...items);
+    else digest.validation.push(...items);
+  }
+  return digest;
+}
+
+function ResultChecks({ checks }: { checks: NonNullable<DashboardResult["validation"]> }) {
+  if (checks.length === 0) return null;
+  return <section><h5 className="text-[11px] font-semibold text-foreground">Checks</h5><ul className="mt-1.5 space-y-1.5">{checks.map((check) => <li key={`${check.command}:${check.summary}`} className="flex items-start gap-2 text-xs"><span className={check.status === "passed" ? "text-emerald-600" : check.status === "failed" ? "text-destructive" : "text-muted-foreground"}>{check.status === "passed" ? "✓" : check.status === "failed" ? "×" : "○"}</span><span className="min-w-0"><code className="rounded bg-muted px-1 py-0.5 text-[11px] text-foreground">{check.command}</code>{check.summary === "" ? null : <span className="ml-1.5 text-muted-foreground">{check.summary}</span>}</span></li>)}</ul></section>;
+}
+
+function ResultPanel({ result }: { result: DashboardResult }) {
+  const summary = result.summary ?? "";
+  const hasAuthoredStructure = /(^|\n)\s*(#{1,4}\s|[-*]\s|\d+[.)]\s)/m.test(summary);
+  const digest = digestResultSummary(summary);
+  const structuredChecks = result.validation ?? [];
+  const inferredChecks = structuredChecks.length === 0 ? digest.validation.map((text) => ({ command: text.match(/`([^`]+)`/)?.[1] ?? "Validation", status: "passed" as const, summary: text.replace(/`[^`]+`\s*(?:→|:)?\s*/, "") })) : [];
+  if (summary.length < 280 || hasAuthoredStructure) {
+    return <div className="space-y-3"><FormattedResult text={summary} /><ResultChecks checks={structuredChecks} />{result.changedFiles?.length ? <ChangedFiles files={result.changedFiles} /> : null}</div>;
+  }
+  const visibleChanges = digest.changes.slice(0, 5);
+  const hiddenChanges = digest.changes.slice(5);
+  return (
+    <div className="space-y-3">
+      <p className="border-l-2 border-emerald-500 pl-2.5 text-xs font-medium leading-relaxed text-foreground"><InlineResultText text={digest.outcome} /></p>
+      {visibleChanges.length === 0 ? null : <section><h5 className="text-[11px] font-semibold text-foreground">What changed</h5><ul className="mt-1.5 space-y-1.5 pl-4 text-xs leading-relaxed text-muted-foreground marker:text-muted-foreground/70" style={{ listStyleType: "disc" }}>{visibleChanges.map((item) => <li key={item}><InlineResultText text={item} /></li>)}</ul>{hiddenChanges.length === 0 ? null : <details className="mt-1.5"><summary className="cursor-pointer list-none text-[11px] font-medium text-primary">Show {hiddenChanges.length} more detail{hiddenChanges.length === 1 ? "" : "s"}</summary><ul className="mt-1.5 space-y-1.5 pl-4 text-xs leading-relaxed text-muted-foreground" style={{ listStyleType: "disc" }}>{hiddenChanges.map((item) => <li key={item}><InlineResultText text={item} /></li>)}</ul></details>}</section>}
+      {digest.assumptions.length === 0 ? null : <section className="rounded-md border border-amber-500/25 bg-amber-500/5 px-2.5 py-2"><h5 className="text-[11px] font-semibold text-amber-700 dark:text-amber-300">Assumptions and deviations</h5><ul className="mt-1 space-y-1 pl-4 text-xs leading-relaxed text-muted-foreground" style={{ listStyleType: "disc" }}>{digest.assumptions.map((item) => <li key={item}><InlineResultText text={item} /></li>)}</ul></section>}
+      <ResultChecks checks={[...structuredChecks, ...inferredChecks]} />
+      {result.changedFiles?.length ? <ChangedFiles files={result.changedFiles} /> : null}
+    </div>
+  );
+}
+
+function ChangedFiles({ files }: { files: string[] }) {
+  return <details><summary className="cursor-pointer list-none text-[11px] font-medium text-primary">{files.length} changed file{files.length === 1 ? "" : "s"}</summary><ul className="mt-1.5 max-h-36 space-y-1 overflow-y-auto rounded-md bg-muted/25 p-2 text-[11px] text-muted-foreground">{files.map((file) => <li key={file} className="truncate font-mono" title={file}>{file}</li>)}</ul></details>;
+}
+
+function TokenSparkline({ samples }: { samples: Array<{ at: number; tokens: number }> }) {
+  if (samples.length < 2) return <span className="text-[11px] text-muted-foreground">Collecting trajectory…</span>;
+  const values = samples.map((sample) => sample.tokens);
+  const min = Math.min(...values); const max = Math.max(...values); const spread = Math.max(1, max - min);
+  const points = samples.map((sample, index) => `${(index / (samples.length - 1)) * 116 + 2},${26 - ((sample.tokens - min) / spread) * 22}`).join(" ");
+  return <svg viewBox="0 0 120 30" className="h-7 w-28" role="img" aria-label={`Token usage rose from ${min} to ${max}`}><polyline points={points} fill="none" stroke="currentColor" strokeWidth="2" vectorEffect="non-scaling-stroke" className="text-primary" /></svg>;
+}
+
+function EvidenceOutput({ output }: { output: string | null }) {
+  if (output === null) return null;
+  return <div><p className="font-medium text-foreground">Final worker output</p><div className="mt-1 max-h-64 overflow-y-auto pr-1"><FormattedResult text={output} /></div></div>;
+}
+
+function EvidenceConversation({ items }: { items: DashboardEvidence["conversation"] }) {
+  if (items.length === 0) return null;
+  return <div><p className="font-medium text-foreground">Recent turn outline</p><div className="mt-1 space-y-1">{items.map((item) => <p key={item.id} className="line-clamp-2 text-muted-foreground"><span className="font-medium capitalize text-foreground">{item.role}:</span> {item.preview}</p>)}</div></div>;
+}
+
+function EvidenceContext({ context }: { context: DashboardEvidence["context"] }) {
+  if (context === null) return null;
+  return <div><p className="font-medium text-foreground">Context snapshot</p><p className="mt-1 text-muted-foreground">{formatCount(context.usedTokens)} / {formatCount(context.modelContextWindow)} tokens ({Math.round(context.usedTokens / Math.max(1, context.modelContextWindow) * 100)}%){context.estimated ? " · estimated" : ""}</p></div>;
+}
+
+function EvidenceStorage({ storage }: { storage: DashboardEvidence["storage"] }) {
+  if (storage === null || storage.files.length === 0) return null;
+  return <div><p className="font-medium text-foreground">Thread storage files</p><ul className="mt-1 space-y-1 text-muted-foreground">{storage.files.map((file) => <li key={file.path} className="truncate" title={file.path}>{file.name}</li>)}</ul>{storage.truncated ? <p className="mt-1 text-muted-foreground">Additional files were omitted.</p> : null}</div>;
+}
+
+function EvidenceDiff({ diff }: { diff: DashboardEvidence["environmentDiff"] }) {
+  if (diff === null) return null;
+  return <div><p className="font-medium text-foreground">Shared project environment</p><p className="mt-1 text-muted-foreground">{diff.shortstat ?? diff.message ?? diff.outcome}{diff.mergeBaseRef === null ? "" : ` · base ${diff.mergeBaseRef}`}</p>{diff.files.length === 0 ? null : <div className="mt-2 max-h-40 overflow-y-auto rounded border border-border bg-background"><table className="w-full text-left"><tbody>{diff.files.map((file) => <tr key={`${file.path}-${file.changeKind}`} className="border-b border-border last:border-0"><td className="max-w-0 truncate px-2 py-1.5" title={file.path}>{file.path}</td><td className="whitespace-nowrap px-2 py-1.5 text-emerald-600">+{file.additions}</td><td className="whitespace-nowrap px-2 py-1.5 text-destructive">−{file.deletions}</td></tr>)}</tbody></table></div>}</div>;
+}
+
+function EvidenceWarnings({ warnings }: { warnings: string[] }) {
+  if (warnings.length === 0) return null;
+  return <div><p className="font-medium text-amber-700 dark:text-amber-300">Partial evidence</p><ul className="mt-1 list-disc space-y-1 pl-4 text-muted-foreground">{warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div>;
+}
+
+function EvidenceBundle({ evidence }: { evidence: DashboardEvidence }) {
+  return (
+    <details className="group mt-3 rounded-md border border-border bg-muted/15">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2 text-xs font-medium text-foreground">
+        <span>Completion evidence · {new Date(evidence.capturedAt).toLocaleString()}</span>
+        <Icon name="ChevronDown" className="size-3.5 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" />
+      </summary>
+      <div className="space-y-3 border-t border-border px-3 py-3 text-xs">
+        <EvidenceOutput output={evidence.output} />
+        <EvidenceConversation items={evidence.conversation} />
+        <EvidenceContext context={evidence.context} />
+        <EvidenceStorage storage={evidence.storage} />
+        <EvidenceDiff diff={evidence.environmentDiff} />
+        <EvidenceWarnings warnings={evidence.warnings} />
+      </div>
+    </details>
+  );
+}
+
+const ATTENTION_STATES = new Set(["failed", "blocked", "awaiting_approval"]);
+const ACTIVE_STATES = new Set(["running", "reviewing"]);
+
+function WorkstreamDetail({ item, result, evidence }: { item: DashboardWorkstream; result: DashboardResult | null; evidence: DashboardEvidence | null }) {
+  const context = item.live?.context ?? evidence?.context ?? null;
+  const contextPercent = context === null ? null : Math.min(100, Math.round(context.usedTokens / Math.max(1, context.modelContextWindow) * 100));
+  const blockers = [...(result?.blockers ?? []), ...(item.error === null ? [] : [item.error])];
+  return (
+    <div className="border-t border-border px-3 pb-3 pt-3">
+      <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+        <span>{item.projectId}</span><span>{item.profile}</span><span>{item.providerId}/{item.model}</span><span>attempt {item.attemptCount}</span>
+      </div>
+      <div className="mt-3 grid grid-cols-3 divide-x divide-border rounded-md bg-muted/25 py-2 text-center">
+        <div><p className="text-xs font-semibold text-foreground">{formatDuration(item.startedAt, item.completedAt)}</p><p className="text-[10px] text-muted-foreground">Runtime</p></div>
+        <div><p className="text-xs font-semibold text-foreground">{formatCount(item.totalTokens)}</p><p className="text-[10px] text-muted-foreground">Tokens</p></div>
+        <div><p className="text-xs font-semibold text-foreground">{contextPercent === null ? "—" : `${contextPercent}%`}</p><p className="text-[10px] text-muted-foreground">Context</p></div>
+      </div>
+      {item.live === null ? null : <div className="mt-3 flex items-center justify-between gap-3"><div className="min-w-0"><p className="text-xs font-medium text-foreground">{item.nextAction ?? "Worker is active"}</p>{item.live.queuedMessageCount > 0 ? <p className="text-[11px] text-muted-foreground">{item.live.queuedMessageCount} queued message{item.live.queuedMessageCount === 1 ? "" : "s"}</p> : null}</div><TokenSparkline samples={item.live.tokenHistory} /></div>}
+      {item.live?.pendingTodos.length ? <div className="mt-3"><p className="text-[11px] font-medium text-foreground">Current checklist</p><ul className="mt-1 space-y-1">{item.live.pendingTodos.slice(0, 4).map((todo) => <li key={todo.id} className="flex gap-2 text-xs text-muted-foreground"><span className={todo.status === "completed" ? "text-emerald-600" : todo.status === "in_progress" ? "text-primary" : "text-muted-foreground"}>{todo.status === "completed" ? "✓" : todo.status === "in_progress" ? "●" : "○"}</span><span>{todo.text}</span></li>)}</ul></div> : null}
+      {item.live?.outputPreview === null || item.live?.outputPreview === undefined ? null : <details className="group mt-3"><summary className="cursor-pointer list-none text-xs font-medium text-muted-foreground hover:text-foreground">Show live output</summary><div className="mt-2 max-h-64 overflow-y-auto rounded-md bg-muted/20 p-2.5"><FormattedResult text={item.live.outputPreview} /></div></details>}
+      {result?.summary === undefined ? null : <div className="mt-3"><p className="mb-1.5 text-[11px] font-semibold text-foreground">Result</p><ResultPanel result={result} /></div>}
+      {blockers.length === 0 ? null : <div className="mt-3 rounded-md border border-destructive/25 bg-destructive/5 px-2.5 py-2 text-xs text-destructive">{blockers.join(" · ")}</div>}
+      {evidence === null ? null : <EvidenceBundle evidence={evidence} />}
+    </div>
+  );
+}
+
+function WorkstreamRow({ item }: { item: DashboardWorkstream }) {
+  const navigate = useBbNavigate();
+  const result = dashboardResult(item.result);
+  const evidence = item.evidence ?? result?.evidence ?? null;
+  const blockers = [...(result?.blockers ?? []), ...(item.error === null ? [] : [item.error])];
+  const headline = blockers[0] ?? item.nextAction ?? result?.summary ?? item.live?.outputPreview ?? null;
+  return (
+    <details className="group border-b border-border last:border-0">
+      <summary className="flex cursor-pointer list-none items-center gap-2.5 px-3 py-2.5 outline-none hover:bg-muted/30 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
+        <span className={`size-2 shrink-0 rounded-full ${item.state === "completed" ? "bg-emerald-500" : ATTENTION_STATES.has(item.state) ? "bg-destructive" : ACTIVE_STATES.has(item.state) ? "bg-blue-500" : "bg-muted-foreground/50"}`} aria-hidden="true" />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2"><h4 className="truncate text-xs font-semibold text-foreground">{item.title ?? item.key}</h4><span className={`shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold ${STATE_STYLE[item.state] ?? "bg-muted text-muted-foreground"}`}>{item.state.replaceAll("_", " ")}</span></div>
+          {headline === null ? null : <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{headline}</p>}
+        </div>
+        <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">{formatCount(item.totalTokens)}</span>
+        <Icon name="ChevronDown" className="size-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" />
+      </summary>
+      <WorkstreamDetail item={item} result={result} evidence={evidence} />
+      {item.threadId === null ? null : <button type="button" onClick={() => navigate.toThread(item.threadId!)} className="mx-3 mb-3 flex items-center gap-1.5 text-xs font-medium text-primary hover:underline"><Icon name="ArrowUpRight" className="size-3.5" aria-hidden="true" />Open worker thread</button>}
+    </details>
+  );
+}
+
+function WorkstreamGroup({ title, items, tone = "default" }: { title: string; items: DashboardWorkstream[]; tone?: "default" | "attention" }) {
+  if (items.length === 0) return null;
+  return <section><div className="mb-1.5 flex items-center gap-2"><h3 className={`text-xs font-semibold ${tone === "attention" ? "text-destructive" : "text-foreground"}`}>{title}</h3><span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums text-muted-foreground">{items.length}</span></div><div className={`overflow-hidden rounded-md border bg-card ${tone === "attention" ? "border-destructive/35" : "border-border"}`}>{items.map((item) => <WorkstreamRow key={item.key} item={item} />)}</div></section>;
+}
+
+function RunCommandCenter({ threadId }: PluginThreadPanelProps) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [data, setData] = useState<DashboardData | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const load = useCallback(async () => {
+    setRefreshing(true);
+    try { setData(await rpc.call("run_dashboard_get", { threadId }) as DashboardData); setError(null); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "Could not load this run."); }
+    finally { setRefreshing(false); }
+  }, [rpc, threadId]);
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(), 5_000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+  useRealtime("run-changed", load);
+
+  if (data === null && error === null) return <div className="p-4 text-sm text-muted-foreground">Loading live run…</div>;
+  if (error !== null && data === null) return <div role="alert" className="p-4 text-sm text-destructive">{error}</div>;
+  if (data === null || !data.available || data.run === null) return <div className="p-4 text-sm text-muted-foreground">This thread is not part of a managed Orchestrator run.</div>;
+  const attention = data.workstreams.filter((item) => ATTENTION_STATES.has(item.state));
+  const active = data.workstreams.filter((item) => ACTIVE_STATES.has(item.state));
+  const waiting = data.workstreams.filter((item) => !ATTENTION_STATES.has(item.state) && !ACTIVE_STATES.has(item.state) && item.state !== "completed");
+  const completed = data.workstreams.filter((item) => item.state === "completed");
+  const budgetPercent = data.run.tokenBudget === 0 ? null : Math.min(100, Math.round(data.run.totalTokens / data.run.tokenBudget * 100));
+  const pulse = attention.length > 0
+    ? `${attention.length} need${attention.length === 1 ? "s" : ""} attention`
+    : active.length > 0
+      ? `${active.length} moving now`
+      : completed.length === data.counts.total && data.counts.total > 0
+        ? "All workstreams complete"
+        : "Waiting to begin";
+  return (
+    <div className="space-y-4 pb-6">
+      <header className="overflow-hidden rounded-lg border border-border bg-card">
+        <div className="flex items-start justify-between gap-3 px-3 pb-3 pt-3"><div className="min-w-0"><div className="flex items-center gap-2"><span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${STATE_STYLE[data.run.state] ?? "bg-muted text-muted-foreground"}`}>{data.run.state.replaceAll("_", " ")}</span><span className="truncate text-[10px] text-muted-foreground">{new Date(data.run.updatedAt).toLocaleTimeString()}</span></div><h2 className="mt-1 truncate text-base font-semibold text-foreground">{data.run.label}</h2><p className={`mt-0.5 text-xs font-medium ${attention.length > 0 ? "text-destructive" : "text-muted-foreground"}`}>{pulse}</p></div><button type="button" onClick={() => void load()} disabled={refreshing} className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50" aria-label="Refresh run"><Icon name="RefreshCw" className={`size-3.5 ${refreshing ? "animate-spin" : ""}`} aria-hidden="true" /></button></div>
+        <div className="grid grid-cols-4 border-t border-border bg-muted/15">{([['Moving', active.length], ['Waiting', waiting.length], ['Done', completed.length], ['Issues', attention.length]] as const).map(([label, value]) => <div key={label} className="border-r border-border px-2 py-2 text-center last:border-r-0"><p className={`text-sm font-semibold ${label === "Issues" && value > 0 ? "text-destructive" : "text-foreground"}`}>{value}</p><p className="text-[10px] text-muted-foreground">{label}</p></div>)}</div>
+        <div className="border-t border-border px-3 py-2"><div className="flex items-center justify-between text-[10px] text-muted-foreground"><span>{formatCount(data.run.totalTokens)} tokens</span><span>{budgetPercent === null ? "No budget" : `${budgetPercent}% of ${formatCount(data.run.tokenBudget)}`}</span></div>{budgetPercent === null ? null : <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-muted"><div className={`h-full rounded-full ${budgetPercent >= 90 ? "bg-destructive" : budgetPercent >= 70 ? "bg-amber-500" : "bg-primary"}`} style={{ width: `${budgetPercent}%` }} /></div>}</div>
+        {data.run.error === null ? null : <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">{data.run.error}</p>}
+      </header>
+      {data.workstreams.length === 0 ? <p className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">No workstreams have been dispatched.</p> : <div className="space-y-4"><WorkstreamGroup title="Needs attention" items={attention} tone="attention" /><WorkstreamGroup title="In progress" items={active} /><WorkstreamGroup title="Waiting" items={waiting} /><WorkstreamGroup title="Completed" items={completed} /></div>}
+      {data.artifacts.length === 0 ? null : <details className="group rounded-md border border-border bg-card"><summary className="flex cursor-pointer list-none items-center justify-between px-3 py-2.5 text-xs font-semibold text-foreground"><span>Artifacts <span className="ml-1 font-normal text-muted-foreground">{data.artifacts.length}</span></span><Icon name="ChevronDown" className="size-3.5 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" /></summary><div className="divide-y divide-border border-t border-border">{data.artifacts.map((artifact) => <div key={artifact.id} className="px-3 py-2"><p className="truncate text-xs font-medium text-foreground">{artifact.name}{artifact.version === null ? "" : ` · ${artifact.version}`}</p><p className="mt-0.5 line-clamp-2 text-[11px] text-muted-foreground">{artifact.workstreamKey} · {artifact.summary}</p></div>)}</div></details>}
+    </div>
   );
 }
 
@@ -667,6 +1023,12 @@ function RoutingSettings() {
 
 export default definePluginApp((app) => {
   app.slots.pendingInteraction({ id: "dispatch-approval", component: DispatchApproval });
+  app.slots.threadPanelAction({
+    id: "run-command-center",
+    title: "Orchestrator run",
+    icon: "Activity",
+    component: RunCommandCenter,
+  });
   app.slots.experimental_appOverlay({
     id: "orchestration-dialog",
     component: OrchestrationOverlay,

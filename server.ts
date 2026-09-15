@@ -55,11 +55,54 @@ const threadOrchestrationState = z.object({
   eligible: z.boolean(), enabled: z.boolean(), label: z.string(), allowedProjectIds: z.array(z.string()),
   projects: z.array(z.object({ id: z.string(), name: z.string(), current: z.boolean() })),
 });
+const evidenceContext = z.object({ usedTokens: z.number(), modelContextWindow: z.number(), estimated: z.boolean() });
+const evidenceTodo = z.object({ id: z.string(), status: z.enum(["completed", "in_progress", "pending"]), text: z.string() });
+const evidenceDiffFile = z.object({
+  path: z.string(), changeKind: z.string(), additions: z.number(), deletions: z.number(), binary: z.boolean(),
+});
+const completionEvidence = z.object({
+  capturedAt: z.number(),
+  output: z.string().nullable(),
+  conversation: z.array(z.object({ id: z.string(), role: z.enum(["assistant", "user"]), preview: z.string() })),
+  context: evidenceContext.nullable(),
+  timeline: z.object({ maxSeq: z.number(), rowCount: z.number(), pendingTodos: z.array(evidenceTodo) }).nullable(),
+  storage: z.object({ rootPath: z.string(), files: z.array(z.object({ name: z.string(), path: z.string() })), truncated: z.boolean() }).nullable(),
+  environmentDiff: z.object({
+    environmentId: z.string(), outcome: z.enum(["available", "not_applicable", "unavailable"]),
+    shortstat: z.string().nullable(), mergeBaseRef: z.string().nullable(), truncated: z.boolean(), files: z.array(evidenceDiffFile),
+    message: z.string().nullable(),
+  }).nullable(),
+  warnings: z.array(z.string()),
+});
+const liveWorkerSnapshot = z.object({
+  status: z.string().nullable(), displayStatus: z.string().nullable(), queuedMessageCount: z.number(),
+  outputPreview: z.string().nullable(), context: evidenceContext.nullable(), pendingTodos: z.array(evidenceTodo),
+  tokenHistory: z.array(z.object({ at: z.number(), tokens: z.number() })),
+});
+const dashboardWorkstream = z.object({
+  key: z.string(), title: z.string().nullable(), projectId: z.string(), parentKey: z.string().nullable(), depth: z.number(),
+  accessMode: z.enum(["mutating", "read-only"]), profile: workerProfile, providerId: z.string(), model: z.string(),
+  state: z.string(), threadId: z.string().nullable(), attemptCount: z.number(), totalTokens: z.number(),
+  createdAt: z.number(), updatedAt: z.number(), startedAt: z.number().nullable(), completedAt: z.number().nullable(),
+  error: z.string().nullable(), result: z.unknown().nullable(), evidence: completionEvidence.nullable(), live: liveWorkerSnapshot.nullable(),
+  dependencies: z.array(z.string()), nextAction: z.string().nullable(),
+});
+const runDashboard = z.object({
+  available: z.boolean(), coordinatorThreadId: z.string().nullable(),
+  run: z.object({
+    label: z.string(), state: z.string(), createdAt: z.number(), updatedAt: z.number(), lastActivityAt: z.number(),
+    totalTokens: z.number(), tokenBudget: z.number(), error: z.string().nullable(),
+  }).nullable(),
+  counts: z.object({ total: z.number(), active: z.number(), queued: z.number(), completed: z.number(), failed: z.number(), reviewing: z.number() }),
+  workstreams: z.array(dashboardWorkstream),
+  artifacts: z.array(z.object({ id: z.number(), workstreamKey: z.string(), kind: z.string(), name: z.string(), version: z.string().nullable(), summary: z.string(), path: z.string().nullable(), createdAt: z.number() })),
+});
 
 export const rpcContract = defineRpcContract({
   start: { input: startInput, output: z.object({ threadId: z.string() }) },
   enable: { input: enableInput, output: z.object({ threadId: z.string() }) },
   thread_orchestration_get: { input: z.object({ threadId: z.string().min(1) }), output: threadOrchestrationState },
+  run_dashboard_get: { input: z.object({ threadId: z.string().min(1) }), output: runDashboard },
   thread_orchestration_disable: { input: z.object({ threadId: z.string().min(1) }), output: z.null() },
   routing_catalog: { input: z.null(), output: z.object({ providers: z.array(catalogProvider) }) },
   routing_get: { input: z.null(), output: z.object({ routes: routingMap, policy: routingPolicy, metrics: z.array(routeMetric), recommendations: z.array(routeRecommendation) }) },
@@ -570,6 +613,100 @@ export default async function plugin(bb: BbPluginApi) {
     }
   };
 
+  const clip = (value: string | null, limit: number) => value === null || value.length <= limit ? value : `${value.slice(0, limit)}\n…truncated`;
+  const captureCompletionEvidence = async (item: WorkstreamRecord, threadId: string): Promise<z.output<typeof completionEvidence>> => {
+    const environmentId = store.getProjectEnvironment(item.coordinatorThreadId, item.projectId)?.environmentId ?? null;
+    const [outputResult, outlineResult, contextResult, timelineResult, storageResult, diffResult] = await Promise.allSettled([
+      bb.sdk.threads.output({ threadId }),
+      bb.sdk.threads.conversationOutline({ threadId }),
+      bb.sdk.threads.context({ threadId }),
+      bb.sdk.threads.timeline({ threadId, summaryOnly: "true", segmentLimit: "12" }),
+      bb.sdk.threads.storageFiles({ threadId, limit: "25" }),
+      environmentId === null ? Promise.resolve(null) : bb.sdk.environments.diffFiles({ environmentId, target: "uncommitted" }),
+    ]);
+    const warnings: string[] = [];
+    const warn = (label: string, result: PromiseSettledResult<unknown>) => {
+      if (result.status === "rejected") warnings.push(`${label}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
+    };
+    warn("Final output unavailable", outputResult);
+    warn("Conversation summary unavailable", outlineResult);
+    warn("Context snapshot unavailable", contextResult);
+    warn("Timeline snapshot unavailable", timelineResult);
+    warn("Storage file list unavailable", storageResult);
+    warn("Environment diff unavailable", diffResult);
+
+    const context = contextResult.status === "fulfilled" && contextResult.value.usage !== null
+      ? { usedTokens: contextResult.value.usage.usedTokens, modelContextWindow: contextResult.value.usage.modelContextWindow, estimated: contextResult.value.usage.estimated }
+      : null;
+    const timeline = timelineResult.status === "fulfilled" ? {
+      maxSeq: timelineResult.value.maxSeq,
+      rowCount: timelineResult.value.rows.length,
+      pendingTodos: (timelineResult.value.pendingTodos?.items ?? []).slice(0, 50),
+    } : null;
+    const storage = storageResult.status === "fulfilled" ? {
+      rootPath: storageResult.value.storageRootPath,
+      files: storageResult.value.files.slice(0, 25),
+      truncated: storageResult.value.truncated || storageResult.value.files.length > 25,
+    } : null;
+    let environmentDiff: z.output<typeof completionEvidence>["environmentDiff"] = null;
+    if (environmentId !== null && diffResult.status === "fulfilled" && diffResult.value !== null) {
+      const diff = diffResult.value;
+      if (diff.outcome === "available") {
+        environmentDiff = {
+          environmentId, outcome: diff.outcome, shortstat: diff.shortstat, mergeBaseRef: diff.mergeBaseRef,
+          truncated: diff.truncated || diff.files.length > 100,
+          files: diff.files.slice(0, 100).map(({ path, changeKind, additions, deletions, binary }) => ({ path, changeKind, additions, deletions, binary })),
+          message: null,
+        };
+      } else {
+        environmentDiff = {
+          environmentId, outcome: diff.outcome, shortstat: null, mergeBaseRef: null, truncated: false, files: [],
+          message: diff.outcome === "not_applicable" ? diff.message : diff.failure.message,
+        };
+      }
+    }
+    return {
+      capturedAt: Date.now(),
+      output: outputResult.status === "fulfilled" ? clip(outputResult.value.output, 12_000) : null,
+      conversation: outlineResult.status === "fulfilled"
+        ? outlineResult.value.items.slice(-8).map(({ id, role, preview }) => ({ id, role, preview: clip(preview, 1_000) ?? "" }))
+        : [],
+      context,
+      timeline,
+      storage,
+      environmentDiff,
+      warnings: warnings.slice(0, 10),
+    };
+  };
+
+  const liveWorkerSnapshotFor = async (item: WorkstreamRecord): Promise<z.output<typeof liveWorkerSnapshot> | null> => {
+    if (item.threadId === null || !["running", "reviewing"].includes(item.state)) return null;
+    const threadId = item.threadId;
+    const [threadResult, outputResult, contextResult, timelineResult, tokenResult] = await Promise.allSettled([
+      bb.sdk.threads.get({ threadId }),
+      bb.sdk.threads.output({ threadId }),
+      bb.sdk.threads.context({ threadId }),
+      bb.sdk.threads.timeline({ threadId, summaryOnly: "true", segmentLimit: "8" }),
+      bb.sdk.threads.events.list({ threadId, order: "desc", limit: "12", types: ["thread/tokenUsage/updated"] }),
+    ]);
+    const thread = threadResult.status === "fulfilled" ? threadResult.value : null;
+    const context = contextResult.status === "fulfilled" && contextResult.value.usage !== null
+      ? { usedTokens: contextResult.value.usage.usedTokens, modelContextWindow: contextResult.value.usage.modelContextWindow, estimated: contextResult.value.usage.estimated }
+      : null;
+    const tokenHistory = tokenResult.status === "fulfilled" ? tokenResult.value.flatMap((row) => row.type === "thread/tokenUsage/updated"
+      ? [{ at: row.createdAt, tokens: row.data.tokenUsage.total.totalTokens }]
+      : []).reverse() : [];
+    return {
+      status: thread?.status ?? null,
+      displayStatus: thread?.runtime.displayStatus ?? null,
+      queuedMessageCount: thread?.queuedMessageCount ?? 0,
+      outputPreview: outputResult.status === "fulfilled" ? clip(outputResult.value.output, 1_200) : null,
+      context,
+      pendingTodos: timelineResult.status === "fulfilled" ? (timelineResult.value.pendingTodos?.items ?? []).slice(0, 20) : [],
+      tokenHistory,
+    };
+  };
+
   bb.rpc.register(rpcContract, {
     start: async ({ label, task, projectIds: ids, attachments, ...execution }) => {
       const [{ all, selected }, policy] = await Promise.all([resolveProjects(ids), readPolicy()]);
@@ -588,6 +725,60 @@ export default async function plugin(bb: BbPluginApi) {
     },
     enable,
     thread_orchestration_get: async ({ threadId }) => threadOrchestrationStateFor(threadId),
+    run_dashboard_get: async ({ threadId }) => {
+      const value = await metadata(threadId);
+      const coordinatorThreadId = value?.role === "worker" ? value.coordinatorThreadId : value?.role === "coordinator" ? threadId : null;
+      const run = coordinatorThreadId === null ? null : store.getRun(coordinatorThreadId);
+      if (coordinatorThreadId === null || run === null) {
+        return {
+          available: false, coordinatorThreadId: null, run: null,
+          counts: { total: 0, active: 0, queued: 0, completed: 0, failed: 0, reviewing: 0 },
+          workstreams: [], artifacts: [],
+        };
+      }
+      const plan = store.getPlan(coordinatorThreadId);
+      const dependencies = new Map((plan?.steps ?? []).map((step) => [step.key, step.dependsOn]));
+      const durable = store.listWorkstreams(coordinatorThreadId);
+      const live = await Promise.all(durable.map(liveWorkerSnapshotFor));
+      const workstreams = durable.map((item, index) => {
+        const parsedEvidence = typeof item.result === "object" && item.result !== null && "evidence" in item.result
+          ? completionEvidence.safeParse(item.result.evidence)
+          : null;
+        const itemDependencies = dependencies.get(item.key) ?? [];
+        const unmet = itemDependencies.filter((key) => store.getWorkstream(coordinatorThreadId, key)?.state !== "completed");
+        const nextAction = item.state === "queued"
+          ? unmet.length > 0 ? `Waiting for ${unmet.join(", ")}` : "Waiting for a project lane or worker slot"
+          : item.state === "reviewing" ? "Waiting for coordinator review"
+          : item.state === "running" && live[index]?.pendingTodos[0] !== undefined ? live[index]!.pendingTodos[0]!.text
+          : item.error;
+        return {
+          key: item.key, title: item.title, projectId: item.projectId, parentKey: item.parentKey, depth: item.depth,
+          accessMode: item.accessMode, profile: item.profile, providerId: item.providerId, model: item.model,
+          state: item.state, threadId: item.threadId, attemptCount: item.attemptCount, totalTokens: item.totalTokens,
+          createdAt: item.createdAt, updatedAt: item.updatedAt, startedAt: item.startedAt, completedAt: item.completedAt,
+          error: item.error, result: item.result, evidence: parsedEvidence?.success ? parsedEvidence.data : null,
+          live: live[index] ?? null, dependencies: itemDependencies, nextAction,
+        };
+      });
+      return {
+        available: true,
+        coordinatorThreadId,
+        run: {
+          label: run.label, state: run.state, createdAt: run.createdAt, updatedAt: run.updatedAt, lastActivityAt: run.lastActivityAt,
+          totalTokens: run.totalTokens, tokenBudget: run.policy.tokenBudget, error: run.error,
+        },
+        counts: {
+          total: workstreams.length,
+          active: workstreams.filter((item) => item.state === "running").length,
+          queued: workstreams.filter((item) => item.state === "queued").length,
+          completed: workstreams.filter((item) => item.state === "completed").length,
+          failed: workstreams.filter((item) => item.state === "failed" || item.state === "cancelled").length,
+          reviewing: workstreams.filter((item) => item.state === "reviewing").length,
+        },
+        workstreams,
+        artifacts: store.listArtifacts(coordinatorThreadId).map(({ id, workstreamKey, kind, name, version, summary, path, createdAt }) => ({ id, workstreamKey, kind, name, version, summary, path, createdAt })),
+      };
+    },
     thread_orchestration_disable: async ({ threadId }) => {
       const state = await threadOrchestrationStateFor(threadId);
       if (!state.eligible) throw new Error("Only an eligible root thread can change orchestration.");
@@ -1060,9 +1251,11 @@ export default async function plugin(bb: BbPluginApi) {
         const commits = new Set(result.commits);
         if (result.pushedCommits.some((sha) => !commits.has(sha))) throw new Error("Pushed commit SHAs must be included in this workstream's ordered commits.");
       }
+      const evidence = await captureCompletionEvidence(item, threadId);
+      const resultWithEvidence = { ...result, evidence };
       const review = result.status === "success" && (run.policy.evaluator === "always" || (run.policy.evaluator === "critical" && item.profile === "critical"));
       const state = result.status === "success" ? (review ? "reviewing" : "completed") : "failed";
-      const next = store.setWorkstreamState(meta.coordinatorThreadId, meta.key, state, { result, error: result.status === "success" ? null : result.summary })!;
+      const next = store.setWorkstreamState(meta.coordinatorThreadId, meta.key, state, { result: resultWithEvidence, error: result.status === "success" ? null : result.summary })!;
       if (!review || result.status !== "success") {
         store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: result.status === "success", durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
       }
@@ -1073,6 +1266,7 @@ export default async function plugin(bb: BbPluginApi) {
           await notify(parent.threadId, `Child workstream ${meta.key} ${review ? "is ready for review" : state}: ${result.summary}`, threadId);
         }
       }
+      bb.realtime.publish("run-changed", { threadId: meta.coordinatorThreadId });
       return JSON.stringify({ key: meta.key, state: next.state, reviewRequired: review });
     },
   });
