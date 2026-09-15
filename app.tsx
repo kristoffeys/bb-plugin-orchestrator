@@ -12,20 +12,27 @@ import {
 import type { rpcContract } from "./server.ts";
 
 const PROFILES = ["quick", "standard", "complex", "critical"] as const;
+const REASONING_CHOICES: ReasoningChoice[] = ["model-default", "none", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"];
 type Profile = (typeof PROFILES)[number];
 type Routes = Record<Profile, string>;
 type RouteTarget = { providerId: string; modelId: string } | null;
-type RoutingPolicy = { strategy: "coordinator" | "profile"; profileRoutes: Record<Profile, RouteTarget> };
+type ReasoningChoice = "model-default" | "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "ultracode";
+type RoutingPolicy = { strategy: "coordinator" | "profile"; profileRoutes: Record<Profile, RouteTarget>; profileReasoning: Record<Profile, ReasoningChoice> };
 type OrchestrationPolicy = {
   maxParallelWorkers: number;
   maxWorkersPerRun: number;
   maxAttemptsPerWorkstream: number;
+  maxDelegationDepth: number;
+  maxChildrenPerWorker: number;
   workerTimeoutMinutes: number;
   runTimeoutMinutes: number;
   inactiveCleanupMinutes: number;
   tokenBudget: number;
   approval: "never" | "first-dispatch" | "critical" | "every-dispatch";
   evaluator: "never" | "critical" | "always";
+  commitMode: "disabled" | "owned-only" | "owned-or-approved-existing";
+  pushMode: "disabled" | "explicit-approval";
+  protectedBranches: string[];
 };
 type Catalog = Awaited<
   ReturnType<ReturnType<typeof useRpc<typeof rpcContract>>["call"]>
@@ -357,10 +364,12 @@ function ComposerOrchestrationAction() {
   );
 }
 
-const NUMBER_POLICY_FIELDS: Array<{ key: keyof Pick<OrchestrationPolicy, "maxParallelWorkers" | "maxWorkersPerRun" | "maxAttemptsPerWorkstream" | "workerTimeoutMinutes" | "runTimeoutMinutes" | "inactiveCleanupMinutes" | "tokenBudget">; label: string; description: string; min: number; max: number }> = [
+const NUMBER_POLICY_FIELDS: Array<{ key: keyof Pick<OrchestrationPolicy, "maxParallelWorkers" | "maxWorkersPerRun" | "maxAttemptsPerWorkstream" | "maxDelegationDepth" | "maxChildrenPerWorker" | "workerTimeoutMinutes" | "runTimeoutMinutes" | "inactiveCleanupMinutes" | "tokenBudget">; label: string; description: string; min: number; max: number }> = [
   { key: "maxParallelWorkers", label: "Parallel workers", description: "Extra workstreams wait in a durable queue.", min: 1, max: 20 },
   { key: "maxWorkersPerRun", label: "Workstreams per run", description: "Reject plans larger than this limit.", min: 1, max: 50 },
   { key: "maxAttemptsPerWorkstream", label: "Attempts per workstream", description: "Includes the first attempt and automatic retries.", min: 1, max: 5 },
+  { key: "maxDelegationDepth", label: "Delegation depth", description: "Maximum managed descendant levels; 0 disables delegation.", min: 0, max: 5 },
+  { key: "maxChildrenPerWorker", label: "Children per worker", description: "Maximum direct read-only children per worker.", min: 1, max: 20 },
   { key: "workerTimeoutMinutes", label: "Worker timeout", description: "Minutes before a running worker is considered stale.", min: 5, max: 1440 },
   { key: "runTimeoutMinutes", label: "Run timeout", description: "Maximum wall-clock lifetime in minutes.", min: 10, max: 10080 },
   { key: "inactiveCleanupMinutes", label: "Inactive cleanup", description: "Minutes without run activity before cleanup.", min: 10, max: 43200 },
@@ -405,6 +414,9 @@ function PolicySettings() {
       <div className="grid gap-4 border-t border-border pt-4 sm:grid-cols-2">
         <label><span className="block text-sm font-medium text-foreground">Dispatch approval</span><span className="mb-1.5 block text-xs text-muted-foreground">Pause before workers are created.</span><select value={draft.approval} onChange={(event) => setDraft({ ...draft, approval: event.target.value as OrchestrationPolicy["approval"] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option value="never">Never</option><option value="first-dispatch">First dispatch</option><option value="critical">Critical work only</option><option value="every-dispatch">Every dispatch</option></select></label>
         <label><span className="block text-sm font-medium text-foreground">Evaluator gate</span><span className="mb-1.5 block text-xs text-muted-foreground">Require coordinator review before completion.</span><select value={draft.evaluator} onChange={(event) => setDraft({ ...draft, evaluator: event.target.value as OrchestrationPolicy["evaluator"] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option value="never">Never</option><option value="critical">Critical work only</option><option value="always">Every successful result</option></select></label>
+        <label><span className="block text-sm font-medium text-foreground">Commit mode</span><span className="mb-1.5 block text-xs text-muted-foreground">Existing branches always need explicit user approval.</span><select value={draft.commitMode} onChange={(event) => setDraft({ ...draft, commitMode: event.target.value as OrchestrationPolicy["commitMode"] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option value="disabled">Disabled</option><option value="owned-only">Orchestrator-owned only</option><option value="owned-or-approved-existing">Owned or approved existing</option></select></label>
+        <label><span className="block text-sm font-medium text-foreground">Push mode</span><span className="mb-1.5 block text-xs text-muted-foreground">Every permitted push still needs explicit user approval.</span><select value={draft.pushMode} onChange={(event) => setDraft({ ...draft, pushMode: event.target.value as OrchestrationPolicy["pushMode"] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option value="disabled">Disabled</option><option value="explicit-approval">Explicit approval</option></select></label>
+        <label className="sm:col-span-2"><span className="block text-sm font-medium text-foreground">Protected branches</span><span className="mb-1.5 block text-xs text-muted-foreground">Comma-separated branch names that workers may never commit to or push.</span><input value={draft.protectedBranches.join(", ")} onChange={(event) => setDraft({ ...draft, protectedBranches: [...new Set(event.target.value.split(",").map((value) => value.trim()).filter(Boolean))] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm" /></label>
       </div>
     </div>
   );
@@ -417,8 +429,9 @@ function RoutingSettings() {
   >([] as never);
   const [storedRoutes, setStoredRoutes] = useState<Record<string, Routes>>({});
   const [drafts, setDrafts] = useState<Record<string, Routes>>({});
-  const [routePolicy, setRoutePolicy] = useState<RoutingPolicy>({ strategy: "coordinator", profileRoutes: { quick: null, standard: null, complex: null, critical: null } });
-  const [savedRoutePolicy, setSavedRoutePolicy] = useState<RoutingPolicy>({ strategy: "coordinator", profileRoutes: { quick: null, standard: null, complex: null, critical: null } });
+  const initialRoutingPolicy: RoutingPolicy = { strategy: "coordinator", profileRoutes: { quick: null, standard: null, complex: null, critical: null }, profileReasoning: { quick: "low", standard: "medium", complex: "high", critical: "xhigh" } };
+  const [routePolicy, setRoutePolicy] = useState<RoutingPolicy>(initialRoutingPolicy);
+  const [savedRoutePolicy, setSavedRoutePolicy] = useState<RoutingPolicy>(initialRoutingPolicy);
   const [metrics, setMetrics] = useState<Array<{ providerId: string; model: string; profile: Profile; samples: number; successes: number; failures: number; averageDurationMs: number; averageTokens: number }>>([]);
   const [recommendations, setRecommendations] = useState<Array<{ profile: Profile; providerId: string; model: string; samples: number; successRate: number; reason: string }>>([]);
   const [saving, setSaving] = useState<string | null>(null);
@@ -504,8 +517,8 @@ function RoutingSettings() {
           Choose the model each provider uses as work becomes more demanding.
         </p>
         <p className="text-xs leading-relaxed text-muted-foreground">
-          Quick is the default assignment. Reasoning automatically uses the requested
-          tier when the selected model supports it, otherwise that model’s default.
+          Quick is the default assignment. Exact reasoning levels must be supported by
+          the selected model; choose model-default to use the model’s declared default.
         </p>
       </div>
 
@@ -528,6 +541,7 @@ function RoutingSettings() {
           const fallback = providers[0];
           setRoutePolicy({
             strategy,
+            profileReasoning: routePolicy.profileReasoning,
             profileRoutes: strategy === "profile" && fallback !== undefined
               ? Object.fromEntries(PROFILES.map((profile) => [profile, routePolicy.profileRoutes[profile] ?? { providerId: fallback.id, modelId: fallback.recommendedRoutes?.[profile] ?? fallback.models[0]?.id ?? "" }])) as Record<Profile, RouteTarget>
               : routePolicy.profileRoutes,
@@ -541,9 +555,10 @@ function RoutingSettings() {
               return (
                 <div key={profile} className="grid gap-1.5">
                   <span className="text-sm font-medium text-foreground">{PROFILE_COPY[profile].label}</span>
-                  <div className="grid grid-cols-2 gap-2">
+                  <div className="grid grid-cols-3 gap-2">
                     <select aria-label={`${PROFILE_COPY[profile].label} provider`} value={provider?.id ?? ""} onChange={(event) => { const nextProvider = providers.find((item) => item.id === event.target.value); const nextModel = nextProvider?.recommendedRoutes?.[profile] ?? nextProvider?.models[0]?.id ?? ""; setRoutePolicy({ ...routePolicy, profileRoutes: { ...routePolicy.profileRoutes, [profile]: nextProvider === undefined ? null : { providerId: nextProvider.id, modelId: nextModel } } }); }} className="h-9 rounded-md border border-input bg-background px-2 text-sm">{providers.map((item) => <option key={item.id} value={item.id}>{item.displayName}</option>)}</select>
                     <select aria-label={`${PROFILE_COPY[profile].label} model`} value={target?.modelId ?? provider?.recommendedRoutes?.[profile] ?? provider?.models[0]?.id ?? ""} onChange={(event) => { if (provider !== undefined) setRoutePolicy({ ...routePolicy, profileRoutes: { ...routePolicy.profileRoutes, [profile]: { providerId: provider.id, modelId: event.target.value } } }); }} className="h-9 min-w-0 rounded-md border border-input bg-background px-2 text-sm">{provider?.models.map((item) => <option key={item.id} value={item.id}>{item.displayName}</option>)}</select>
+                    <select aria-label={`${PROFILE_COPY[profile].label} reasoning`} value={routePolicy.profileReasoning[profile]} onChange={(event) => setRoutePolicy({ ...routePolicy, profileReasoning: { ...routePolicy.profileReasoning, [profile]: event.target.value as ReasoningChoice } })} className="h-9 min-w-0 rounded-md border border-input bg-background px-2 text-sm">{REASONING_CHOICES.map((choice) => <option key={choice} value={choice}>{choice}</option>)}</select>
                   </div>
                 </div>
               );
@@ -551,6 +566,14 @@ function RoutingSettings() {
           </div>
         ) : null}
       </section>
+
+      {routePolicy.strategy === "coordinator" ? (
+        <section className="rounded-lg border border-border bg-card px-4 py-4 sm:px-5">
+          <h3 className="text-sm font-semibold text-foreground">Profile reasoning</h3>
+          <p className="mt-0.5 text-xs text-muted-foreground">Exact levels are checked against the selected model at dispatch. Model-default uses that model’s declared default.</p>
+          <div className="mt-3 grid gap-3 sm:grid-cols-4">{PROFILES.map((profile) => <label key={profile}><span className="mb-1 block text-xs font-medium text-foreground">{PROFILE_COPY[profile].label}</span><select value={routePolicy.profileReasoning[profile]} onChange={(event) => setRoutePolicy({ ...routePolicy, profileReasoning: { ...routePolicy.profileReasoning, [profile]: event.target.value as ReasoningChoice } })} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">{REASONING_CHOICES.map((choice) => <option key={choice} value={choice}>{choice}</option>)}</select></label>)}</div>
+        </section>
+      ) : null}
 
       {recommendations.length === 0 ? (
         <p className="text-xs text-muted-foreground">Measured recommendations appear after three completed samples for a profile and model. Routes never change automatically.</p>
@@ -661,13 +684,13 @@ export default definePluginApp((app) => {
   app.slots.settingsSection({
     id: "orchestration-policy",
     title: "Orchestration policy",
-    description: "Set lifecycle limits, budgets, approvals, and evaluator gates.",
+    description: "Set lifecycle, delegation, commit, push, approval, and evaluator limits.",
     component: PolicySettings,
   });
   app.slots.settingsSection({
     id: "model-routing",
     title: "Worker model routing",
-    description: "Map each available provider to cost-aware worker profiles.",
+    description: "Map providers, models, and exact reasoning to cost-aware worker profiles.",
     component: RoutingSettings,
   });
 });
