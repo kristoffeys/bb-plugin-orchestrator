@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import Database from "better-sqlite3";
 import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadResponse, makeTurnFailedEvent } from "@get-bb/plugin-sdk/testing";
-import plugin, { waitForEnvironmentAttachment } from "../server.ts";
+import plugin, { ORCHESTRATOR_MIGRATIONS, waitForEnvironmentAttachment } from "../server.ts";
 import { DEFAULT_POLICY, effectiveProtectedBranches, parseOrchestrationPolicy } from "../lib/policy.ts";
 
 const projects = [
@@ -27,6 +28,19 @@ const providerModels: Record<string, ReturnType<typeof model>[]> = {
   "claude-code": [model("claude-haiku-4-5-20251001", "low"), model("claude-sonnet-5"), model("claude-fable-5-1", "high"), model("claude-opus-5[1m]", "xhigh")],
   opencode: [model("budget-code", "low"), model("balanced-code"), model("deep-code", "high")],
 };
+
+test("upgrades the prior released migration ledger without changing its statements", () => {
+  const db = new Database(":memory:");
+  for (const statement of ORCHESTRATOR_MIGRATIONS.slice(0, 12)) db.exec(statement);
+  assert.equal(ORCHESTRATOR_MIGRATIONS[11], "CREATE INDEX IF NOT EXISTS workstreams_parent_idx ON workstreams(coordinator_thread_id, parent_key)");
+  db.exec(ORCHESTRATOR_MIGRATIONS[12]);
+  assert.deepEqual(
+    (db.prepare("PRAGMA table_info(workstreams)").all() as Array<{ name: string }>).map((column) => column.name).slice(-2),
+    ["requested_reasoning_level", "configured_reasoning_level"],
+  );
+  assert.ok((db.prepare("PRAGMA table_info(workstreams)").all() as Array<{ name: string }>).some((column) => column.name === "configured_reasoning_level"));
+  db.close();
+});
 
 async function load(providerId = "codex", options: { delayedAttachmentGets?: number; provisioningStatus?: "error"; failFirstReuseProvisioning?: boolean } = {}) {
   const metadata = new Map<string, Record<string, unknown>>();

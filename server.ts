@@ -69,6 +69,22 @@ export const rpcContract = defineRpcContract({
   policy_set: { input: orchestrationPolicy, output: orchestrationPolicy },
 });
 
+export const ORCHESTRATOR_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS runs (coordinator_thread_id TEXT PRIMARY KEY, label TEXT NOT NULL, allowed_project_ids_json TEXT NOT NULL, state TEXT NOT NULL, policy_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_activity_at INTEGER NOT NULL, total_tokens INTEGER NOT NULL DEFAULT 0, first_dispatch_approved INTEGER NOT NULL DEFAULT 0, error TEXT)`,
+  `CREATE TABLE IF NOT EXISTS workstreams (coordinator_thread_id TEXT NOT NULL, key TEXT NOT NULL, project_id TEXT NOT NULL, title TEXT, assignment TEXT NOT NULL, profile TEXT NOT NULL, complexity_reason TEXT, provider_id TEXT NOT NULL, model TEXT NOT NULL, reasoning_level TEXT NOT NULL, state TEXT NOT NULL, thread_id TEXT UNIQUE, attempt_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, started_at INTEGER, completed_at INTEGER, last_event_seq INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0, result_json TEXT, error TEXT, PRIMARY KEY (coordinator_thread_id, key))`,
+  `CREATE TABLE IF NOT EXISTS artifacts (id INTEGER PRIMARY KEY AUTOINCREMENT, coordinator_thread_id TEXT NOT NULL, workstream_key TEXT NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL, version TEXT, summary TEXT NOT NULL, content TEXT, path TEXT, consumers_json TEXT NOT NULL, created_at INTEGER NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS route_metrics (provider_id TEXT NOT NULL, model TEXT NOT NULL, profile TEXT NOT NULL, samples INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (provider_id, model, profile))`,
+  `CREATE INDEX IF NOT EXISTS workstreams_thread_id_idx ON workstreams(thread_id)`,
+  `CREATE TABLE IF NOT EXISTS run_project_environments (coordinator_thread_id TEXT NOT NULL, project_id TEXT NOT NULL, environment_id TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (coordinator_thread_id, project_id))`,
+  `ALTER TABLE workstreams ADD COLUMN lane_released_at INTEGER`,
+  `ALTER TABLE workstreams ADD COLUMN parent_key TEXT`,
+  `ALTER TABLE workstreams ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE workstreams ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'mutating'`,
+  `ALTER TABLE workstreams ADD COLUMN requested_reasoning_level TEXT NOT NULL DEFAULT 'model-default'`,
+  `CREATE INDEX IF NOT EXISTS workstreams_parent_idx ON workstreams(coordinator_thread_id, parent_key)`,
+  `ALTER TABLE workstreams ADD COLUMN configured_reasoning_level TEXT NOT NULL DEFAULT 'model-default'`,
+] as const;
+
 const workerAssignment = z.object({
   key: z.string().trim().min(1).max(100).regex(/^[^/]+$/, "Keys cannot contain '/'."),
   projectId: z.string().min(1),
@@ -165,21 +181,7 @@ export async function waitForEnvironmentAttachment<T extends ProvisioningThread>
 
 export default async function plugin(bb: BbPluginApi) {
   const db = bb.storage.database();
-  bb.storage.migrate(db, [
-    `CREATE TABLE IF NOT EXISTS runs (coordinator_thread_id TEXT PRIMARY KEY, label TEXT NOT NULL, allowed_project_ids_json TEXT NOT NULL, state TEXT NOT NULL, policy_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_activity_at INTEGER NOT NULL, total_tokens INTEGER NOT NULL DEFAULT 0, first_dispatch_approved INTEGER NOT NULL DEFAULT 0, error TEXT)`,
-    `CREATE TABLE IF NOT EXISTS workstreams (coordinator_thread_id TEXT NOT NULL, key TEXT NOT NULL, project_id TEXT NOT NULL, title TEXT, assignment TEXT NOT NULL, profile TEXT NOT NULL, complexity_reason TEXT, provider_id TEXT NOT NULL, model TEXT NOT NULL, reasoning_level TEXT NOT NULL, state TEXT NOT NULL, thread_id TEXT UNIQUE, attempt_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, started_at INTEGER, completed_at INTEGER, last_event_seq INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0, result_json TEXT, error TEXT, PRIMARY KEY (coordinator_thread_id, key))`,
-    `CREATE TABLE IF NOT EXISTS artifacts (id INTEGER PRIMARY KEY AUTOINCREMENT, coordinator_thread_id TEXT NOT NULL, workstream_key TEXT NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL, version TEXT, summary TEXT NOT NULL, content TEXT, path TEXT, consumers_json TEXT NOT NULL, created_at INTEGER NOT NULL)`,
-    `CREATE TABLE IF NOT EXISTS route_metrics (provider_id TEXT NOT NULL, model TEXT NOT NULL, profile TEXT NOT NULL, samples INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (provider_id, model, profile))`,
-    `CREATE INDEX IF NOT EXISTS workstreams_thread_id_idx ON workstreams(thread_id)`,
-    `CREATE TABLE IF NOT EXISTS run_project_environments (coordinator_thread_id TEXT NOT NULL, project_id TEXT NOT NULL, environment_id TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (coordinator_thread_id, project_id))`,
-    `ALTER TABLE workstreams ADD COLUMN lane_released_at INTEGER`,
-    `ALTER TABLE workstreams ADD COLUMN parent_key TEXT`,
-    `ALTER TABLE workstreams ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`,
-    `ALTER TABLE workstreams ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'mutating'`,
-    `ALTER TABLE workstreams ADD COLUMN requested_reasoning_level TEXT NOT NULL DEFAULT 'model-default'`,
-    `ALTER TABLE workstreams ADD COLUMN configured_reasoning_level TEXT NOT NULL DEFAULT 'model-default'`,
-    `CREATE INDEX IF NOT EXISTS workstreams_parent_idx ON workstreams(coordinator_thread_id, parent_key)`,
-  ]);
+  bb.storage.migrate(db, [...ORCHESTRATOR_MIGRATIONS]);
   const store = new OrchestratorStore(db);
   const ROUTING_KEY = "provider-routes";
   const ROUTING_POLICY_KEY = "routing-policy";
