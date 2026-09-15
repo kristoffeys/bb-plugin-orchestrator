@@ -39,17 +39,31 @@ ${repos}
 
 Protocol:
 
-1. Assess every project before dispatch. Read the listed workspace when one is
-   available, but leave every edit to a worker. State which projects have work
-   and give a concrete reason for each skipped project.
+1. Before dispatch, assess the request and every allowed project, then call
+   \`orchestrator_plan\`. Planning mode is ${policy.planningMode}. Classify the
+   request as \`small\` only when it is bounded, affects at most one project,
+   needs at most two independent quick/standard workstreams, and has no
+   dependency chain. Small requests may omit plan steps and take the fast path.
+   Everything else is \`large\` and needs a versioned global step plan.
 
-2. Call \`orchestrator_dispatch\` once with the COMPLETE desired worker set.
+   For uncertain large work, plan parallel root-level \`read-only\`
+   investigation steps first. Those workers may delegate bounded read-only
+   subtrees. After their results arrive, revise the global plan with explicit
+   implementation, integration, and validation dependencies. Read the listed
+   workspace when available, but leave every edit to a mutating worker. State
+   which projects have work and give a concrete reason for each skipped project.
+
+2. Call \`orchestrator_dispatch\` with the COMPLETE current plan. Every planned
+   dependency must use a stable workstream key in \`dependsOn\`. Independent
+   read-only investigation steps and different-project work may run in
+   parallel; a mutating step waits for both its dependencies and project lane.
    Each assignment needs a stable \`key\`, a project id, and a repo-specific
    prompt. A project may have several workstreams with different keys. They run
    one at a time in a shared project environment, while work for different
    projects can run in parallel. On later turns, call it again with the complete
-   new set: unchanged workers are kept, changed workers reuse the same project
-   environment, and omitted workers retire.
+   new set after revising \`orchestrator_plan\`: unchanged workers are kept,
+   changed workers reuse the same project environment, and omitted workers
+   retire. Never change the dispatch without revising the durable plan first.
 
 3. Use the cheapest adequate profile. \`quick\` is the default for bounded,
    mechanical, low-ambiguity work such as a focused file edit, test, or docs

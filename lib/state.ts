@@ -70,6 +70,30 @@ export interface ProjectEnvironmentRecord {
   updatedAt: number;
 }
 
+export interface PlanStepRecord {
+  key: string;
+  projectId: string;
+  prompt: string;
+  title?: string;
+  profile: WorkerProfile;
+  complexityReason?: string;
+  reasoningLevel?: string;
+  accessMode: "mutating" | "read-only";
+  dependsOn: string[];
+  phase?: string;
+  successCriteria?: string[];
+}
+
+export interface PlanRecord {
+  coordinatorThreadId: string;
+  version: number;
+  scale: "small" | "large";
+  rationale: string;
+  steps: PlanStepRecord[];
+  createdAt: number;
+  updatedAt: number;
+}
+
 type RunRow = Omit<RunRecord, "allowedProjectIds" | "policy" | "firstDispatchApproved"> & {
   allowedProjectIdsJson: string;
   policyJson: string;
@@ -107,6 +131,7 @@ export class OrchestratorStore {
   resetRun(coordinatorThreadId: string) {
     const reset = this.db.transaction(() => {
       this.db.prepare("DELETE FROM artifacts WHERE coordinator_thread_id = ?").run(coordinatorThreadId);
+      this.db.prepare("DELETE FROM plans WHERE coordinator_thread_id = ?").run(coordinatorThreadId);
       this.db.prepare("DELETE FROM workstreams WHERE coordinator_thread_id = ?").run(coordinatorThreadId);
       this.db.prepare("DELETE FROM run_project_environments WHERE coordinator_thread_id = ?").run(coordinatorThreadId);
       this.db.prepare("DELETE FROM runs WHERE coordinator_thread_id = ?").run(coordinatorThreadId);
@@ -126,7 +151,7 @@ export class OrchestratorStore {
     return row === undefined ? null : {
       ...row,
       allowedProjectIds: parseJson<string[]>(row.allowedProjectIdsJson),
-      policy: parseOrchestrationPolicy(parseJson(row.policyJson)),
+      policy: parseOrchestrationPolicy({ planningMode: "off", ...parseJson<Record<string, unknown>>(row.policyJson) }),
       firstDispatchApproved: row.firstDispatchApproved === 1,
     };
   }
@@ -145,6 +170,31 @@ export class OrchestratorStore {
   approveFirstDispatch(coordinatorThreadId: string) {
     this.db.prepare("UPDATE runs SET first_dispatch_approved = 1, updated_at = ? WHERE coordinator_thread_id = ?")
       .run(Date.now(), coordinatorThreadId);
+  }
+
+  setPlan(input: Omit<PlanRecord, "version" | "createdAt" | "updatedAt">) {
+    const now = Date.now();
+    this.db.prepare(`
+      INSERT INTO plans (coordinator_thread_id, version, scale, rationale, steps_json, created_at, updated_at)
+      VALUES (?, 1, ?, ?, ?, ?, ?)
+      ON CONFLICT(coordinator_thread_id) DO UPDATE SET
+        version = plans.version + 1,
+        scale = excluded.scale,
+        rationale = excluded.rationale,
+        steps_json = excluded.steps_json,
+        updated_at = excluded.updated_at
+    `).run(input.coordinatorThreadId, input.scale, input.rationale, JSON.stringify(input.steps), now, now);
+    this.touchRun(input.coordinatorThreadId);
+    return this.getPlan(input.coordinatorThreadId)!;
+  }
+
+  getPlan(coordinatorThreadId: string): PlanRecord | null {
+    const row = this.db.prepare(`
+      SELECT coordinator_thread_id AS coordinatorThreadId, version, scale, rationale,
+        steps_json AS stepsJson, created_at AS createdAt, updated_at AS updatedAt
+      FROM plans WHERE coordinator_thread_id = ?
+    `).get(coordinatorThreadId) as (Omit<PlanRecord, "steps"> & { stepsJson: string }) | undefined;
+    return row === undefined ? null : { ...row, steps: parseJson<PlanStepRecord[]>(row.stepsJson) };
   }
 
   listExpiredRuns(now: number) {

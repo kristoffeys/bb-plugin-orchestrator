@@ -25,6 +25,24 @@ As an alternative, asking the agent to enable orchestration exposes the
 `orchestrator_enable` tool. Opt-in keeps routine threads from acquiring
 worker-management tools by default.
 
+Before workers start, the coordinator records a durable size decision through
+`orchestrator_plan`. The default `auto` mode keeps bounded work fast: a request
+is small only when it touches at most one project, needs at most two independent
+quick/standard workstreams, and has no dependency chain. Small requests may
+record that decision without enumerating steps and dispatch immediately.
+Larger work records a versioned global plan whose steps include project,
+read-only or mutating access, phase, dependencies, routing profile, and success
+criteria. `always` requires explicit steps even for small work; `off` preserves
+legacy direct dispatch.
+
+Large uncertain requests can begin with root-level read-only investigations.
+Those may run concurrently in one project and delegate bounded read-only
+subtrees. After joining their findings, the coordinator revises the global plan
+before implementation. Mutating steps start only after every `dependsOn` step
+succeeds and the project's single-writer lane opens. A failed prerequisite
+cancels its blocked dependents with a durable reason. Dispatch must match the
+current plan version, so scope or dependency changes require a plan revision.
+
 Each run provisions one project-default environment for every project it
 touches and records the environment id durably. Later workstreams,
 replacements, and retries for that project reuse it, so they see the same
@@ -81,6 +99,8 @@ inactivity timeouts, an optional observed token budget, dispatch approvals,
 evaluator gates, delegation limits, and version-control policy. Each run
 snapshots this policy when orchestration is enabled, so changing global defaults
 never changes a run already in progress.
+
+Planning mode is configurable as `off`, `auto` (default), or `always`.
 
 Commit policy is declarative and persisted in the run snapshot:
 

@@ -83,6 +83,7 @@ export const ORCHESTRATOR_MIGRATIONS = [
   `ALTER TABLE workstreams ADD COLUMN requested_reasoning_level TEXT NOT NULL DEFAULT 'model-default'`,
   `CREATE INDEX IF NOT EXISTS workstreams_parent_idx ON workstreams(coordinator_thread_id, parent_key)`,
   `ALTER TABLE workstreams ADD COLUMN configured_reasoning_level TEXT NOT NULL DEFAULT 'model-default'`,
+  `CREATE TABLE IF NOT EXISTS plans (coordinator_thread_id TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 1, scale TEXT NOT NULL, rationale TEXT NOT NULL, steps_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
 ] as const;
 
 const workerAssignment = z.object({
@@ -93,10 +94,73 @@ const workerAssignment = z.object({
   profile: workerProfile.default("quick"),
   complexityReason: z.string().trim().min(1).max(500).optional(),
   reasoningLevel: reasoningChoice.optional(),
+  accessMode: z.enum(["mutating", "read-only"]).default("mutating"),
+  dependsOn: z.array(z.string().trim().min(1).max(100).regex(/^[^/]+$/, "Dependency keys cannot contain '/'.")).max(50).default([]),
+  phase: z.string().trim().min(1).max(100).optional(),
+  successCriteria: z.array(z.string().trim().min(1).max(1_000)).max(30).optional(),
 }).superRefine((assignment, ctx) => {
   if (assignment.profile !== "quick" && assignment.complexityReason === undefined) {
     ctx.addIssue({ code: "custom", path: ["complexityReason"], message: `The ${assignment.profile} profile needs a complexity reason.` });
   }
+  if (assignment.dependsOn.includes(assignment.key)) {
+    ctx.addIssue({ code: "custom", path: ["dependsOn"], message: "A workstream cannot depend on itself." });
+  }
+  if (new Set(assignment.dependsOn).size !== assignment.dependsOn.length) {
+    ctx.addIssue({ code: "custom", path: ["dependsOn"], message: "Dependency keys must be unique." });
+  }
+});
+const planInput = z.object({
+  scale: z.enum(["small", "large"]),
+  rationale: z.string().trim().min(1).max(2_000),
+  steps: z.array(workerAssignment).max(50).default([]),
+}).superRefine((plan, ctx) => {
+  const keys = new Set(plan.steps.map((step) => step.key));
+  if (keys.size !== plan.steps.length) ctx.addIssue({ code: "custom", path: ["steps"], message: "Plan step keys must be unique." });
+  if (plan.scale === "large" && plan.steps.length === 0) ctx.addIssue({ code: "custom", path: ["steps"], message: "A large request needs at least one planned step." });
+  for (const [index, step] of plan.steps.entries()) {
+    for (const dependency of step.dependsOn) if (!keys.has(dependency)) {
+      ctx.addIssue({ code: "custom", path: ["steps", index, "dependsOn"], message: `Unknown dependency ${dependency}.` });
+    }
+  }
+});
+type WorkerAssignment = z.infer<typeof workerAssignment>;
+
+const dependencyCycle = (steps: readonly WorkerAssignment[]): string[] | null => {
+  const byKey = new Map(steps.map((step) => [step.key, step]));
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const path: string[] = [];
+  const visit = (key: string): string[] | null => {
+    if (visiting.has(key)) return [...path.slice(path.indexOf(key)), key];
+    if (visited.has(key)) return null;
+    visiting.add(key); path.push(key);
+    for (const dependency of byKey.get(key)?.dependsOn ?? []) {
+      const cycle = visit(dependency);
+      if (cycle !== null) return cycle;
+    }
+    path.pop(); visiting.delete(key); visited.add(key);
+    return null;
+  };
+  for (const key of byKey.keys()) {
+    const cycle = visit(key);
+    if (cycle !== null) return cycle;
+  }
+  return null;
+};
+
+const isSmallRequest = (assignments: readonly WorkerAssignment[]) =>
+  assignments.length <= 2
+  && new Set(assignments.map((item) => item.projectId)).size <= 1
+  && assignments.every((item) => item.profile === "quick" || item.profile === "standard")
+  && assignments.every((item) => item.dependsOn.length === 0);
+
+const plannedShape = (assignment: WorkerAssignment) => JSON.stringify({
+  key: assignment.key, projectId: assignment.projectId, prompt: assignment.prompt,
+  title: assignment.title ?? null, profile: assignment.profile,
+  complexityReason: assignment.complexityReason ?? null,
+  reasoningLevel: assignment.reasoningLevel ?? null, accessMode: assignment.accessMode,
+  dependsOn: assignment.dependsOn, phase: assignment.phase ?? null,
+  successCriteria: assignment.successCriteria ?? [],
 });
 const completionResult = z.object({
   status: z.enum(["success", "blocked", "failed"]),
@@ -367,17 +431,21 @@ export default async function plugin(bb: BbPluginApi) {
 
   const workerPrompt = (item: WorkstreamRecord) => {
     const run = store.getRun(item.coordinatorThreadId)!;
+    const plannedStep = store.getPlan(item.coordinatorThreadId)?.steps.find((step) => step.key === item.key);
     const protectedBranches = effectiveProtectedBranches(run.policy);
     const access = item.accessMode === "read-only"
       ? "This delegated workstream is read-only. Do not edit files, create commits, or push. Report findings through messages/artifacts and worker_done."
       : "This is the sole mutating workstream in its project lane. Nested delegation is read-only only, so descendants cannot race this writer.";
-    return `${item.assignment}\n\nManaged workstream contract:\n- This workstream shares one durable project environment with this run's other ${item.projectId} workstreams. Preserve unrelated changes and do not switch environments.\n- ${access}\n- You may delegate bounded read-only subtasks only with orchestrator_delegate; never spawn threads directly.\n- Commit mode is ${run.policy.commitMode}; push mode is ${run.policy.pushMode}; protected branches are ${JSON.stringify(protectedBranches)}. Protected branches cannot be committed to or pushed. Existing branches require separate explicit user approval for commits and pushes. Orchestrator-owned branches need no commit approval. Never push without explicit user approval.\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers.\n- Before ending, call orchestrator_worker_done exactly once with ordered commit SHAs, changed files, validation, and blockers. Parent completion is rejected while descendants are live. An idle turn without that record is treated as a failed workstream.`;
+    const planning = plannedStep === undefined ? "" : `\nPlan context:\n- Phase: ${plannedStep.phase ?? "unspecified"}.\n- Dependencies: ${plannedStep.dependsOn.length === 0 ? "none" : plannedStep.dependsOn.join(", ")}.\n- Success criteria: ${plannedStep.successCriteria?.length ? plannedStep.successCriteria.join("; ") : "use the assignment and completion contract"}.`;
+    return `${item.assignment}${planning}\n\nManaged workstream contract:\n- This workstream shares one durable project environment with this run's other ${item.projectId} workstreams. Preserve unrelated changes and do not switch environments.\n- ${access}\n- You may delegate bounded read-only subtasks only with orchestrator_delegate; never spawn threads directly.\n- Commit mode is ${run.policy.commitMode}; push mode is ${run.policy.pushMode}; protected branches are ${JSON.stringify(protectedBranches)}. Protected branches cannot be committed to or pushed. Existing branches require separate explicit user approval for commits and pushes. Orchestrator-owned branches need no commit approval. Never push without explicit user approval.\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers.\n- Before ending, call orchestrator_worker_done exactly once with ordered commit SHAs, changed files, validation, and blockers. Parent completion is rejected while descendants are live. An idle turn without that record is treated as a failed workstream.`;
   };
 
   const launchQueuedUnlocked = async (coordinatorThreadId: string, signal?: AbortSignal) => {
     const run = store.getRun(coordinatorThreadId);
     if (run === null || ["completed", "failed", "cancelled", "awaiting_approval"].includes(run.state)) return [];
     const all = store.listWorkstreams(coordinatorThreadId);
+    const planSteps = new Map((store.getPlan(coordinatorThreadId)?.steps ?? []).map((step) => [step.key, step]));
+    const workstreamsByKey = new Map(all.map((item) => [item.key, item]));
     let available = Math.max(0, run.policy.maxParallelWorkers - all.filter((item) => item.state === "running").length);
     const activeProjects = new Set(all.filter((item) => item.accessMode === "mutating" && (
       item.state === "running"
@@ -388,6 +456,14 @@ export default async function plugin(bb: BbPluginApi) {
     for (const item of all.filter((candidate) => candidate.state === "queued" && candidate.attemptCount < run.policy.maxAttemptsPerWorkstream)) {
       if (signal?.aborted) throw abortError();
       if (available <= 0) break;
+      const dependencies = item.parentKey === null ? planSteps.get(item.key)?.dependsOn ?? [] : [];
+      const failedDependency = dependencies.find((key) => ["failed", "cancelled"].includes(workstreamsByKey.get(key)?.state ?? "cancelled"));
+      if (failedDependency !== undefined) {
+        store.setWorkstreamState(coordinatorThreadId, item.key, "cancelled", { error: `Dependency ${failedDependency} did not complete successfully.` });
+        store.releaseProjectLane(coordinatorThreadId, item.key);
+        continue;
+      }
+      if (dependencies.some((key) => workstreamsByKey.get(key)?.state !== "completed")) continue;
       if (item.accessMode === "mutating" && activeProjects.has(item.projectId)) continue;
       const parent = item.parentKey === null ? null : store.getWorkstream(coordinatorThreadId, item.parentKey);
       if (item.parentKey !== null && (parent?.threadId == null || parent.state !== "running")) {
@@ -576,6 +652,35 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.registerTool({
+    name: "orchestrator_plan",
+    description: "Classify the request as small or large and persist a versioned global execution plan before dispatch.",
+    instructions: "Call before orchestrator_dispatch when planning is enabled. Small requests may omit steps and take the fast path. Large requests need a complete dependency-aware step set; use read-only roots for parallel investigation and revise the plan after their findings when needed.",
+    presentation: { label: { pending: "Assessing orchestration plan", completed: "Orchestration plan ready" } },
+    parameters: planInput,
+    async execute({ scale, rationale, steps }, { threadId }) {
+      const coordinatorMetadata = await requireCoordinator(threadId);
+      const run = store.getRun(threadId) ?? store.upsertRun({
+        coordinatorThreadId: threadId, label: coordinatorMetadata.label,
+        allowedProjectIds: coordinatorMetadata.allowedProjectIds, policy: await readPolicy(),
+      });
+      const { selected } = await resolveProjects(coordinatorMetadata.allowedProjectIds);
+      const allowed = new Set(selected.map((project) => project.id));
+      for (const step of steps) if (!allowed.has(step.projectId)) throw new Error(`Project ${step.projectId} is not allowed in this run.`);
+      if (steps.length > run.policy.maxWorkersPerRun) throw new Error(`This run allows at most ${run.policy.maxWorkersPerRun} planned workstreams including descendants.`);
+      const cycle = dependencyCycle(steps);
+      if (cycle !== null) throw new Error(`Worker plan contains a dependency cycle: ${cycle.join(" -> ")}.`);
+      if (scale === "small" && steps.length > 0 && !isSmallRequest(steps)) {
+        throw new Error("The proposed steps exceed the small-request fast path. Classify this request as large.");
+      }
+      if (run.policy.planningMode === "always" && steps.length === 0) {
+        throw new Error("Planning mode is always, so even a small request needs explicit plan steps.");
+      }
+      const plan = store.setPlan({ coordinatorThreadId: threadId, scale, rationale, steps });
+      return JSON.stringify({ plan, fastPath: scale === "small" && steps.length === 0, planningMode: run.policy.planningMode });
+    },
+  });
+
+  bb.agents.registerTool({
     name: "orchestrator_dispatch",
     description: "Reconcile a coordinator's complete desired managed-workstream set.",
     instructions: "Use stable keys and send the complete desired set. Quick is the cheap default; stronger profiles require a concrete reason.",
@@ -595,6 +700,28 @@ export default async function plugin(bb: BbPluginApi) {
       for (const assignment of assignments) {
         if (!projectsById.has(assignment.projectId)) throw new Error(`Project ${assignment.projectId} is not allowed in this run.`);
       }
+      const keys = new Set(assignments.map((assignment) => assignment.key));
+      for (const assignment of assignments) for (const dependency of assignment.dependsOn) {
+        if (!keys.has(dependency)) throw new Error(`Workstream ${assignment.key} has unknown dependency ${dependency}.`);
+      }
+      const cycle = dependencyCycle(assignments);
+      if (cycle !== null) throw new Error(`Worker plan contains a dependency cycle: ${cycle.join(" -> ")}.`);
+      const plan = store.getPlan(threadId);
+      const needsPlanContract = run.policy.planningMode !== "off" || assignments.some((assignment) => assignment.dependsOn.length > 0);
+      if (needsPlanContract && plan === null) {
+        throw new Error("Assess the request with orchestrator_plan before dispatching workers.");
+      }
+      if (plan !== null && needsPlanContract) {
+        if (plan.scale === "small" && !isSmallRequest(assignments)) {
+          throw new Error("This dispatch is larger than the recorded small-request decision. Revise it with orchestrator_plan as a large request.");
+        }
+        if (plan.steps.length > 0) {
+          const expected = new Map(z.array(workerAssignment).parse(plan.steps).map((step) => [step.key, plannedShape(step)]));
+          if (expected.size !== assignments.length || assignments.some((assignment) => expected.get(assignment.key) !== plannedShape(assignment))) {
+            throw new Error(`Dispatch must match version ${plan.version} of the durable worker plan. Revise the plan first when scope or dependencies change.`);
+          }
+        }
+      }
 
       const needsApproval = run.policy.approval === "every-dispatch"
         || (run.policy.approval === "first-dispatch" && !run.firstDispatchApproved)
@@ -607,8 +734,8 @@ export default async function plugin(bb: BbPluginApi) {
           title: "Approve worker plan",
           payload: {
             label: run.label,
-            assignments: assignments.map(({ key, projectId, title, profile, complexityReason }) => ({
-              key, projectId, title: title ?? null, profile, complexityReason: complexityReason ?? null,
+            assignments: assignments.map(({ key, projectId, title, profile, complexityReason, accessMode, dependsOn, phase }) => ({
+              key, projectId, title: title ?? null, profile, complexityReason: complexityReason ?? null, accessMode, dependsOn, phase: phase ?? null,
             })),
           },
           timeoutMs: 60 * 60_000,
@@ -643,6 +770,7 @@ export default async function plugin(bb: BbPluginApi) {
         const unchanged = existing !== null
           && existing.projectId === assignment.projectId
           && existing.assignment === assignment.prompt
+          && existing.accessMode === assignment.accessMode
           && existing.profile === assignment.profile
           && existing.providerId === execution.providerId
           && existing.model === execution.model
@@ -664,6 +792,7 @@ export default async function plugin(bb: BbPluginApi) {
         const unchanged = existing !== null
           && existing.projectId === assignment.projectId
           && existing.assignment === assignment.prompt
+          && existing.accessMode === assignment.accessMode
           && existing.profile === assignment.profile
           && existing.providerId === execution.providerId
           && existing.model === execution.model
@@ -680,7 +809,7 @@ export default async function plugin(bb: BbPluginApi) {
           continue;
         }
         store.upsertWorkstream({
-          coordinatorThreadId: threadId, key: assignment.key, parentKey: null, depth: 0, accessMode: "mutating", projectId: assignment.projectId,
+          coordinatorThreadId: threadId, key: assignment.key, parentKey: null, depth: 0, accessMode: assignment.accessMode, projectId: assignment.projectId,
           title: assignment.title ?? `${coordinatorMetadata.label}: ${projectsById.get(assignment.projectId)!.name} · ${assignment.key}`,
           assignment: assignment.prompt, profile: assignment.profile, complexityReason: assignment.complexityReason ?? null,
           ...execution, state: "queued", threadId: null, attemptCount: 0,
@@ -731,6 +860,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (parent === null || run === null || parent.state !== "running") throw new Error("This workstream is no longer live.");
       if (parent.depth >= run.policy.maxDelegationDepth) throw new Error(`Delegation depth limit ${run.policy.maxDelegationDepth} was reached.`);
       if (assignments.length > run.policy.maxChildrenPerWorker) throw new Error(`A worker may have at most ${run.policy.maxChildrenPerWorker} direct children.`);
+      if (assignments.some((assignment) => assignment.dependsOn.length > 0)) throw new Error("Nested delegated children are parallel investigations; dependency chains belong in the coordinator's global plan.");
       const { selected } = await resolveProjects(run.allowedProjectIds);
       const projectsById = new Map(selected.map((project) => [project.id, project]));
       for (const assignment of assignments) {
@@ -816,6 +946,7 @@ export default async function plugin(bb: BbPluginApi) {
       }));
       return JSON.stringify({
         run: store.getRun(coordinatorThreadId),
+        plan: store.getPlan(coordinatorThreadId),
         routing: { policy: routingPolicyValue, configuredRoutes },
         environments,
         workstreams,
@@ -1132,9 +1263,9 @@ export default async function plugin(bb: BbPluginApi) {
         };
       }
       return {
-        tools: ["orchestrator_dispatch", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_review", "orchestrator_finish"],
+        tools: ["orchestrator_plan", "orchestrator_dispatch", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_review", "orchestrator_finish"],
         skills: [],
-        instructions: "You are a managed Orchestrator coordinator. The plugin is the single lifecycle writer. Dispatch a complete stable-key workstream set and use the cheapest adequate profile: quick for bounded mechanical work and standard for ordinary implementation. Reserve complex for identified cross-cutting uncertainty and critical for concrete high-cost failure risk. Use durable status and artifacts instead of polling output, evaluate gated results, and finish only when every workstream is terminal.",
+        instructions: "You are a managed Orchestrator coordinator. The plugin is the single lifecycle writer. First classify the request with orchestrator_plan: small requests take the fast path, while large requests need a dependency-aware global plan and may begin with parallel read-only investigation. Dispatch the complete current plan with stable keys. Use the cheapest adequate profile, durable status, and artifacts; finish only when every workstream is terminal.",
       };
     }
     if (parsed.success && parsed.data.role === "worker") {

@@ -34,11 +34,13 @@ test("upgrades the prior released migration ledger without changing its statemen
   for (const statement of ORCHESTRATOR_MIGRATIONS.slice(0, 12)) db.exec(statement);
   assert.equal(ORCHESTRATOR_MIGRATIONS[11], "CREATE INDEX IF NOT EXISTS workstreams_parent_idx ON workstreams(coordinator_thread_id, parent_key)");
   db.exec(ORCHESTRATOR_MIGRATIONS[12]);
+  db.exec(ORCHESTRATOR_MIGRATIONS[13]);
   assert.deepEqual(
     (db.prepare("PRAGMA table_info(workstreams)").all() as Array<{ name: string }>).map((column) => column.name).slice(-2),
     ["requested_reasoning_level", "configured_reasoning_level"],
   );
   assert.ok((db.prepare("PRAGMA table_info(workstreams)").all() as Array<{ name: string }>).some((column) => column.name === "configured_reasoning_level"));
+  assert.ok((db.prepare("PRAGMA table_info(plans)").all() as Array<{ name: string }>).some((column) => column.name === "steps_json"));
   db.close();
 });
 
@@ -155,6 +157,7 @@ async function load(providerId = "codex", options: { delayedAttachmentGets?: num
     },
   });
   await plugin(bb);
+  await harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off" });
   return { bb, harness, metadata, threads, spawned, sent, archived, stopped, retries, eventRows };
 }
 
@@ -178,6 +181,82 @@ test("start creates a personal coordinator with generic Orchestrator identity", 
   assert.match(text, /one at a time in a shared project environment/);
   assert.match(text, /read-only descendants/);
   assert.match(text, /protected branches \["main","develop"\]/);
+});
+
+test("auto planning classifies small requests before taking the fast path", async () => {
+  const state = await load();
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "small", projectId: "api", prompt: "Make a focused fix." }],
+  }, { threadId: "coord", projectId: "personal" }), /orchestrator_plan/);
+  const planned = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_plan", {
+    scale: "small", rationale: "One bounded change in one project.", steps: [],
+  }, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(planned.fastPath, true);
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "small", projectId: "api", prompt: "Make a focused fix." }],
+  }, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(dispatched.workers[0].state, "running");
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.plan.scale, "small");
+  assert.equal(status.plan.version, 1);
+});
+
+test("large plans run independent investigations in parallel and gate dependent mutation", async () => {
+  const state = await load();
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  const steps = [
+    { key: "inspect-api", projectId: "api", prompt: "Inspect the API contract.", accessMode: "read-only", phase: "investigate", successCriteria: ["Publish findings"] },
+    { key: "inspect-tests", projectId: "api", prompt: "Inspect test coverage.", accessMode: "read-only", phase: "investigate", successCriteria: ["Identify gaps"] },
+    { key: "implement", projectId: "api", prompt: "Implement from both findings.", dependsOn: ["inspect-api", "inspect-tests"], phase: "execute", successCriteria: ["Tests pass"] },
+  ];
+  await state.harness.behavior.callAgentTool("orchestrator_plan", {
+    scale: "large", rationale: "The implementation depends on two independent investigations.", steps,
+  }, { threadId: "coord", projectId: "personal" });
+  await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: steps.map((step) => step.key === "implement" ? { ...step, prompt: "Changed without revising the plan." } : step),
+  }, { threadId: "coord", projectId: "personal" }), /must match version 1/);
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: steps }, { threadId: "coord", projectId: "personal" }) as string);
+  assert.deepEqual(dispatched.workers.map((item: { state: string }) => item.state), ["running", "running", "queued"]);
+  assert.deepEqual(state.spawned.slice(0, 2).map((item) => (item.pluginMetadata as { accessMode: string }).accessMode), ["read-only", "read-only"]);
+  for (const worker of dispatched.workers.slice(0, 2)) {
+    await state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+      status: "success", summary: "Investigation complete.", changedFiles: [], validation: [], blockers: [],
+    }, { threadId: worker.threadId, projectId: "api" });
+    await state.harness.behavior.emitThreadEvent("thread.idle", { thread: state.threads.get(worker.threadId)!, lastAssistantText: "Done." });
+  }
+  assert.equal(state.spawned.length, 3);
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.workstreams.find((item: { key: string }) => item.key === "implement").state, "running");
+  assert.match(String(state.spawned[2]?.prompt), /inspect-api, inspect-tests/);
+});
+
+test("planning rejects dependency cycles and cancels work blocked by a failed prerequisite", async () => {
+  const state = await load();
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_plan", {
+    scale: "large", rationale: "Invalid cycle.", steps: [
+      { key: "a", projectId: "api", prompt: "A", dependsOn: ["b"] },
+      { key: "b", projectId: "api", prompt: "B", dependsOn: ["a"] },
+    ],
+  }, { threadId: "coord", projectId: "personal" }), /dependency cycle/);
+  const steps = [
+    { key: "inspect", projectId: "api", prompt: "Inspect.", accessMode: "read-only" },
+    { key: "implement", projectId: "api", prompt: "Implement.", dependsOn: ["inspect"] },
+  ];
+  await state.harness.behavior.callAgentTool("orchestrator_plan", {
+    scale: "large", rationale: "Implementation depends on investigation.", steps,
+  }, { threadId: "coord", projectId: "personal" });
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: steps }, { threadId: "coord", projectId: "personal" }) as string);
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "failed", summary: "The contract could not be established.", changedFiles: [], validation: [], blockers: ["Missing upstream schema"],
+  }, { threadId: dispatched.workers[0].threadId, projectId: "api" });
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread: state.threads.get(dispatched.workers[0].threadId)!, lastAssistantText: "Blocked." });
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  const dependent = status.workstreams.find((item: { key: string }) => item.key === "implement");
+  assert.equal(dependent.state, "cancelled");
+  assert.match(dependent.error, /Dependency inspect/);
+  assert.equal(state.spawned.length, 1);
 });
 
 test("same-project workstreams serialize and share the captured project environment", async () => {
@@ -396,7 +475,7 @@ test("durable concurrency queues work and completion launches the next worker", 
   await state.harness.behavior.callRpc("policy_set", {
     maxParallelWorkers: 1, maxWorkersPerRun: 4, maxAttemptsPerWorkstream: 2,
     workerTimeoutMinutes: 30, runTimeoutMinutes: 120, inactiveCleanupMinutes: 60,
-    tokenBudget: 0, approval: "never", evaluator: "never",
+    tokenBudget: 0, planningMode: "off", approval: "never", evaluator: "never",
   });
   const dispatched = JSON.parse(await state.harness.behavior.callAgentTool(
     "orchestrator_dispatch",
@@ -503,7 +582,7 @@ test("observed token usage enforces the run budget", async () => {
   await state.harness.behavior.callRpc("policy_set", {
     maxParallelWorkers: 2, maxWorkersPerRun: 4, maxAttemptsPerWorkstream: 2,
     workerTimeoutMinutes: 30, runTimeoutMinutes: 120, inactiveCleanupMinutes: 60,
-    tokenBudget: 100, approval: "never", evaluator: "never",
+    tokenBudget: 100, planningMode: "off", approval: "never", evaluator: "never",
   });
   const dispatched = JSON.parse(await state.harness.behavior.callAgentTool(
     "orchestrator_dispatch",
@@ -721,7 +800,7 @@ test("parent completion joins deterministically after descendants finish", async
 
 test("delegation enforces project, fan-out, depth, and total-run limits", async () => {
   const state = await load();
-  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, maxChildrenPerWorker: 1, maxDelegationDepth: 1, maxWorkersPerRun: 2 });
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off", maxChildrenPerWorker: 1, maxDelegationDepth: 1, maxWorkersPerRun: 2 });
   const root = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
     assignments: [{ key: "root", projectId: "api", prompt: "Coordinate." }],
   }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
@@ -739,7 +818,7 @@ test("delegation enforces project, fan-out, depth, and total-run limits", async 
   }, { threadId: child.threadId, projectId: "api" }), /depth limit 1/);
 
   const capped = await load();
-  await capped.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, maxChildrenPerWorker: 2, maxDelegationDepth: 2, maxWorkersPerRun: 2 });
+  await capped.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off", maxChildrenPerWorker: 2, maxDelegationDepth: 2, maxWorkersPerRun: 2 });
   const cappedRoot = JSON.parse(await capped.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "root", projectId: "api", prompt: "Root." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
   await assert.rejects(capped.harness.behavior.callAgentTool("orchestrator_delegate", {
     assignments: [{ key: "a", projectId: "api", prompt: "A" }, { key: "b", projectId: "web", prompt: "B" }],
@@ -779,6 +858,7 @@ test("read-only descendants cannot report writes or commits", async () => {
 test("commit policy defaults and protected branch normalization are durable and replaceable", async () => {
   assert.equal(DEFAULT_POLICY.commitMode, "owned-or-approved-existing");
   assert.equal(DEFAULT_POLICY.pushMode, "explicit-approval");
+  assert.equal(DEFAULT_POLICY.planningMode, "auto");
   assert.deepEqual(effectiveProtectedBranches(DEFAULT_POLICY), ["main", "develop"]);
   const parsed = parseOrchestrationPolicy({ ...DEFAULT_POLICY, protectedBranches: [" release ", "release", "master"] });
   assert.deepEqual(parsed.protectedBranches, ["release", "master"]);
@@ -786,13 +866,13 @@ test("commit policy defaults and protected branch normalization are durable and 
   assert.deepEqual(removed.protectedBranches, []);
   assert.throws(() => parseOrchestrationPolicy({ ...DEFAULT_POLICY, protectedBranches: ["  "] }), /too_small|Too small/i);
   const state = await load();
-  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, protectedBranches: [" release ", "release"] });
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off", protectedBranches: [" release ", "release"] });
   assert.deepEqual((await state.harness.behavior.callRpc("policy_get", null) as typeof DEFAULT_POLICY).protectedBranches, ["release"]);
 });
 
 async function commitPolicyWorker(policy: Partial<typeof DEFAULT_POLICY> = {}) {
   const state = await load();
-  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, evaluator: "never", ...policy });
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off", evaluator: "never", ...policy });
   const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
     assignments: [{ key: "commit", projectId: "api", prompt: "Commit atomically." }],
   }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
@@ -991,7 +1071,7 @@ test("disable, worker timeout, and run expiry recursively clean nested threads",
   const originalNow = Date.now;
   try {
     const timed = await load();
-    await timed.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, workerTimeoutMinutes: 5 });
+    await timed.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off", workerTimeoutMinutes: 5 });
     const timedRoot = JSON.parse(await timed.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "root", projectId: "api", prompt: "Root." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
     const timedChild = JSON.parse(await timed.harness.behavior.callAgentTool("orchestrator_delegate", { assignments: [{ key: "child", projectId: "api", prompt: "Read." }] }, { threadId: timedRoot.threadId, projectId: "api" }) as string).workers[0];
     timed.threads.get(timedRoot.threadId)!.status = "active";
@@ -1004,7 +1084,7 @@ test("disable, worker timeout, and run expiry recursively clean nested threads",
 
     Date.now = originalNow;
     const expired = await load();
-    await expired.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, runTimeoutMinutes: 10 });
+    await expired.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off", runTimeoutMinutes: 10 });
     const expiredRoot = JSON.parse(await expired.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "root", projectId: "api", prompt: "Root." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
     const expiredChild = JSON.parse(await expired.harness.behavior.callAgentTool("orchestrator_delegate", { assignments: [{ key: "child", projectId: "api", prompt: "Read." }] }, { threadId: expiredRoot.threadId, projectId: "api" }) as string).workers[0];
     expired.threads.get(expiredRoot.threadId)!.status = "active";

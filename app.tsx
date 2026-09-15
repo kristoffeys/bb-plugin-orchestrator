@@ -27,6 +27,7 @@ type OrchestrationPolicy = {
   runTimeoutMinutes: number;
   inactiveCleanupMinutes: number;
   tokenBudget: number;
+  planningMode: "off" | "auto" | "always";
   approval: "never" | "first-dispatch" | "critical" | "every-dispatch";
   evaluator: "never" | "critical" | "always";
   commitMode: "disabled" | "owned-only" | "owned-or-approved-existing";
@@ -73,7 +74,8 @@ function DispatchApproval({ interaction, submit, cancel }: PluginPendingInteract
             <Icon name="Workflow" className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
             <div className="min-w-0 flex-1">
               <p className="truncate text-sm text-foreground">{String(assignment.title ?? assignment.key ?? "Workstream")}</p>
-              <p className="text-xs text-muted-foreground">{String(assignment.projectId ?? "Project")} · {String(assignment.profile ?? "quick")}</p>
+              <p className="text-xs text-muted-foreground">{String(assignment.projectId ?? "Project")} · {String(assignment.profile ?? "quick")} · {String(assignment.accessMode ?? "mutating")}</p>
+              {Array.isArray(assignment.dependsOn) && assignment.dependsOn.length > 0 ? <p className="truncate text-[11px] text-muted-foreground">After {assignment.dependsOn.map(String).join(", ")}</p> : null}
             </div>
           </div>
         ))}
@@ -411,6 +413,7 @@ function PolicySettings() {
         ))}
       </div>
       <div className="grid gap-4 border-t border-border pt-4 sm:grid-cols-2">
+        <label><span className="block text-sm font-medium text-foreground">Planning mode</span><span className="mb-1.5 block text-xs text-muted-foreground">Auto keeps small requests fast and requires durable plans for larger work.</span><select value={draft.planningMode} onChange={(event) => setDraft({ ...draft, planningMode: event.target.value as OrchestrationPolicy["planningMode"] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option value="off">Off</option><option value="auto">Auto</option><option value="always">Always plan</option></select></label>
         <label><span className="block text-sm font-medium text-foreground">Dispatch approval</span><span className="mb-1.5 block text-xs text-muted-foreground">Pause before workers are created.</span><select value={draft.approval} onChange={(event) => setDraft({ ...draft, approval: event.target.value as OrchestrationPolicy["approval"] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option value="never">Never</option><option value="first-dispatch">First dispatch</option><option value="critical">Critical work only</option><option value="every-dispatch">Every dispatch</option></select></label>
         <label><span className="block text-sm font-medium text-foreground">Evaluator gate</span><span className="mb-1.5 block text-xs text-muted-foreground">Require coordinator review before completion.</span><select value={draft.evaluator} onChange={(event) => setDraft({ ...draft, evaluator: event.target.value as OrchestrationPolicy["evaluator"] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option value="never">Never</option><option value="critical">Critical work only</option><option value="always">Every successful result</option></select></label>
         <label><span className="block text-sm font-medium text-foreground">Commit mode</span><span className="mb-1.5 block text-xs text-muted-foreground">Existing branches always need explicit user approval.</span><select value={draft.commitMode} onChange={(event) => setDraft({ ...draft, commitMode: event.target.value as OrchestrationPolicy["commitMode"] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option value="disabled">Disabled</option><option value="owned-only">Orchestrator-owned only</option><option value="owned-or-approved-existing">Owned or approved existing</option></select></label>

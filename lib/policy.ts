@@ -9,6 +9,7 @@ export const providerStrategy = z.enum(["coordinator", "profile"]);
 export const reasoningChoice = z.enum(["model-default", "none", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"]);
 export const commitMode = z.enum(["disabled", "owned-only", "owned-or-approved-existing"]);
 export const pushMode = z.enum(["disabled", "explicit-approval"]);
+export const planningMode = z.enum(["off", "auto", "always"]);
 
 export const orchestrationPolicy = z.object({
   maxParallelWorkers: z.number().int().min(1).max(20),
@@ -20,6 +21,7 @@ export const orchestrationPolicy = z.object({
   runTimeoutMinutes: z.number().int().min(10).max(7 * 24 * 60),
   inactiveCleanupMinutes: z.number().int().min(10).max(30 * 24 * 60),
   tokenBudget: z.number().int().min(0).max(100_000_000),
+  planningMode: planningMode.default("auto"),
   approval: approvalPolicy,
   evaluator: evaluatorPolicy,
   commitMode: commitMode.default("owned-or-approved-existing"),
@@ -39,6 +41,7 @@ export const DEFAULT_POLICY: OrchestrationPolicy = {
   runTimeoutMinutes: 180,
   inactiveCleanupMinutes: 120,
   tokenBudget: 0,
+  planningMode: "auto",
   approval: "critical",
   evaluator: "critical",
   commitMode: "owned-or-approved-existing",
