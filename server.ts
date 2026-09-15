@@ -112,6 +112,8 @@ export default async function plugin(bb: BbPluginApi) {
     `CREATE TABLE IF NOT EXISTS artifacts (id INTEGER PRIMARY KEY AUTOINCREMENT, coordinator_thread_id TEXT NOT NULL, workstream_key TEXT NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL, version TEXT, summary TEXT NOT NULL, content TEXT, path TEXT, consumers_json TEXT NOT NULL, created_at INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS route_metrics (provider_id TEXT NOT NULL, model TEXT NOT NULL, profile TEXT NOT NULL, samples INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (provider_id, model, profile))`,
     `CREATE INDEX IF NOT EXISTS workstreams_thread_id_idx ON workstreams(thread_id)`,
+    `CREATE TABLE IF NOT EXISTS run_project_environments (coordinator_thread_id TEXT NOT NULL, project_id TEXT NOT NULL, environment_id TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (coordinator_thread_id, project_id))`,
+    `ALTER TABLE workstreams ADD COLUMN lane_released_at INTEGER`,
   ]);
   const store = new OrchestratorStore(db);
   const ROUTING_KEY = "provider-routes";
@@ -163,11 +165,38 @@ export default async function plugin(bb: BbPluginApi) {
     if (value?.role !== "coordinator") throw new Error("This tool is only available to an Orchestrator coordinator.");
     return value;
   };
+  const retiredWorkerIds = new Set<string>();
+  const intentionallyStoppingWorkerIds = new Set<string>();
   const retireWorker = async (threadId: string) => {
+    if (retiredWorkerIds.has(threadId)) return;
+    intentionallyStoppingWorkerIds.add(threadId);
     let archiveError: unknown;
     try { await bb.sdk.threads.archive({ threadId }); } catch (error) { archiveError = error; }
-    await bb.sdk.threads.stop({ threadId });
+    try {
+      await bb.sdk.threads.stop({ threadId });
+    } catch (error) {
+      intentionallyStoppingWorkerIds.delete(threadId);
+      throw error;
+    }
     if (archiveError !== undefined) throw archiveError;
+    retiredWorkerIds.add(threadId);
+  };
+  const stopWorkers = async (threadIds: readonly string[]) => {
+    await Promise.all(threadIds.map(async (threadId) => {
+      intentionallyStoppingWorkerIds.add(threadId);
+      try {
+        await bb.sdk.threads.stop({ threadId });
+      } catch (error) {
+        intentionallyStoppingWorkerIds.delete(threadId);
+        throw error;
+      }
+    }));
+  };
+  const archiveWorkers = async (threadIds: readonly string[]) => {
+    await Promise.all(threadIds.map(async (threadId) => {
+      await bb.sdk.threads.archive({ threadId });
+      retiredWorkerIds.add(threadId);
+    }));
   };
   const notify = async (threadId: string, text: string, senderThreadId?: string) => {
     try {
@@ -178,9 +207,11 @@ export default async function plugin(bb: BbPluginApi) {
   };
   const cleanupRun = async (coordinatorThreadId: string, state: "completed" | "failed" | "cancelled", reason: string) => {
     store.setRunState(coordinatorThreadId, state, state === "completed" ? null : reason);
-    const live = store.listWorkstreams(coordinatorThreadId).filter((item) => item.threadId !== null && !["completed", "failed", "cancelled"].includes(item.state));
-    await Promise.allSettled(live.map((item) => retireWorker(item.threadId!)));
+    const all = store.listWorkstreams(coordinatorThreadId);
+    const live = all.filter((item) => !["completed", "failed", "cancelled"].includes(item.state));
+    await Promise.allSettled(all.flatMap((item) => item.threadId === null ? [] : [retireWorker(item.threadId)]));
     for (const item of live) store.setWorkstreamState(coordinatorThreadId, item.key, state === "completed" ? "completed" : "cancelled", { error: reason });
+    for (const item of all) store.releaseProjectLane(coordinatorThreadId, item.key);
     bb.realtime.publish("run-changed", { threadId: coordinatorThreadId });
   };
 
@@ -228,37 +259,82 @@ export default async function plugin(bb: BbPluginApi) {
     return { providerId: selected.routeProviderId ?? providerId, model: selected.model, reasoningLevel: selectedReasoning };
   };
 
-  const workerPrompt = (item: WorkstreamRecord) => `${item.assignment}\n\nManaged workstream contract:\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers.\n- Before ending, call orchestrator_worker_done exactly once with changed files, validation, and blockers. An idle turn without that record is treated as a failed workstream.`;
+  const workerPrompt = (item: WorkstreamRecord) => `${item.assignment}\n\nManaged workstream contract:\n- This workstream shares one durable project environment with this run's other ${item.projectId} workstreams. Preserve unrelated changes and do not switch environments.\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers.\n- Before ending, call orchestrator_worker_done exactly once with changed files, validation, and blockers. An idle turn without that record is treated as a failed workstream.`;
 
-  const launchQueued = async (coordinatorThreadId: string) => {
+  const launchQueuedUnlocked = async (coordinatorThreadId: string) => {
     const run = store.getRun(coordinatorThreadId);
     if (run === null || ["completed", "failed", "cancelled", "awaiting_approval"].includes(run.state)) return [];
     const all = store.listWorkstreams(coordinatorThreadId);
     let available = Math.max(0, run.policy.maxParallelWorkers - all.filter((item) => item.state === "running").length);
+    const activeProjects = new Set(all.filter((item) =>
+      item.state === "running"
+      || item.state === "reviewing"
+      || (item.threadId !== null && item.laneReleasedAt === null && ["completed", "failed", "cancelled"].includes(item.state)),
+    ).map((item) => item.projectId));
     const launched: WorkstreamRecord[] = [];
     for (const item of all.filter((candidate) => candidate.state === "queued" && candidate.attemptCount < run.policy.maxAttemptsPerWorkstream)) {
       if (available <= 0) break;
-      const spawned = await bb.sdk.threads.spawn({
-        projectId: item.projectId,
-        environment: { type: "project-default" },
-        parentThreadId: coordinatorThreadId,
-        visibility: "visible",
-        title: item.title ?? `${run.label}: ${item.key}`,
-        prompt: workerPrompt(item),
-        providerId: item.providerId,
-        model: item.model,
-        reasoningLevel: item.reasoningLevel as z.output<typeof reasoningLevel>,
-        pluginMetadata: {
-          role: "worker", coordinatorThreadId, key: item.key, projectId: item.projectId, assignment: item.assignment,
-          profile: item.profile, ...(item.complexityReason === null ? {} : { complexityReason: item.complexityReason }),
-          providerId: item.providerId, model: item.model, reasoningLevel: item.reasoningLevel,
-        },
-      });
-      launched.push(store.setWorkstreamState(coordinatorThreadId, item.key, "running", { threadId: spawned.id, incrementAttempt: true })!);
-      available -= 1;
+      if (activeProjects.has(item.projectId)) continue;
+      const spawn = async (environment: { type: "project-default" } | { type: "reuse"; environmentId: string }) => bb.sdk.threads.spawn({
+          projectId: item.projectId,
+          environment,
+          parentThreadId: coordinatorThreadId,
+          visibility: "visible",
+          title: item.title ?? `${run.label}: ${item.key}`,
+          prompt: workerPrompt(item),
+          providerId: item.providerId,
+          model: item.model,
+          reasoningLevel: item.reasoningLevel as z.output<typeof reasoningLevel>,
+          pluginMetadata: {
+            role: "worker", coordinatorThreadId, key: item.key, projectId: item.projectId, assignment: item.assignment,
+            profile: item.profile, ...(item.complexityReason === null ? {} : { complexityReason: item.complexityReason }),
+            providerId: item.providerId, model: item.model, reasoningLevel: item.reasoningLevel,
+          },
+        });
+      try {
+        let lease = store.getProjectEnvironment(coordinatorThreadId, item.projectId);
+        let spawned;
+        try {
+          spawned = await spawn(lease === null ? { type: "project-default" } : { type: "reuse", environmentId: lease.environmentId });
+        } catch (error) {
+          if (lease === null) throw error;
+          store.clearProjectEnvironment(coordinatorThreadId, item.projectId);
+          lease = null;
+          spawned = await spawn({ type: "project-default" });
+        }
+        if (spawned.environmentId === null) {
+          await retireWorker(spawned.id);
+          throw new Error(`Worker ${spawned.id} did not receive a project environment.`);
+        }
+        store.setProjectEnvironment(coordinatorThreadId, item.projectId, spawned.environmentId);
+        launched.push(store.setWorkstreamState(coordinatorThreadId, item.key, "running", { threadId: spawned.id, incrementAttempt: true })!);
+        activeProjects.add(item.projectId);
+        available -= 1;
+      } catch (error) {
+        store.setWorkstreamState(coordinatorThreadId, item.key, "failed", {
+          error: `Could not launch worker: ${error instanceof Error ? error.message : String(error)}`,
+        });
+        store.releaseProjectLane(coordinatorThreadId, item.key);
+      }
     }
     if (launched.length > 0) store.setRunState(coordinatorThreadId, "running");
     return launched;
+  };
+
+  const launchLocks = new Map<string, Promise<void>>();
+  const launchQueued = async (coordinatorThreadId: string) => {
+    const previous = launchLocks.get(coordinatorThreadId) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const tail = previous.catch(() => undefined).then(() => gate);
+    launchLocks.set(coordinatorThreadId, tail);
+    await previous.catch(() => undefined);
+    try {
+      return await launchQueuedUnlocked(coordinatorThreadId);
+    } finally {
+      release();
+      if (launchLocks.get(coordinatorThreadId) === tail) launchLocks.delete(coordinatorThreadId);
+    }
   };
 
   bb.rpc.register(rpcContract, {
@@ -401,12 +477,11 @@ export default async function plugin(bb: BbPluginApi) {
       }
 
       const stale = store.removeWorkstreamsNotIn(threadId, assignments.map((item) => item.key));
-      const retired = (await Promise.all(stale.map(async (item) => {
-        if (item.threadId !== null) await retireWorker(item.threadId);
-        return item.threadId;
-      }))).filter((id): id is string => id !== null);
+      const retired = stale.flatMap((item) => item.threadId === null ? [] : [item.threadId]);
+      await stopWorkers(retired);
       for (const item of stale) {
         store.setWorkstreamState(threadId, item.key, "cancelled", { error: "Removed from desired workstream set." });
+        store.releaseProjectLane(threadId, item.key);
       }
 
       const kept: Array<Record<string, unknown>> = [];
@@ -424,7 +499,7 @@ export default async function plugin(bb: BbPluginApi) {
           && existing.model === execution.model;
         return unchanged || existing?.threadId === null || existing?.threadId === undefined ? [] : [existing.threadId];
       });
-      await Promise.all(changedThreadIds.map(retireWorker));
+      await stopWorkers(changedThreadIds);
       retired.push(...changedThreadIds);
       for (const { assignment, execution } of plans) {
         const existing = store.getWorkstream(threadId, assignment.key);
@@ -435,7 +510,12 @@ export default async function plugin(bb: BbPluginApi) {
           && existing.providerId === execution.providerId
           && existing.model === execution.model;
         if (unchanged && existing.threadId !== null && !["failed", "cancelled"].includes(existing.state)) {
-          kept.push({ key: assignment.key, projectId: assignment.projectId, threadId: existing.threadId, action: "kept", state: existing.state, profile: assignment.profile, ...execution });
+          kept.push({
+            key: assignment.key, projectId: assignment.projectId, threadId: existing.threadId,
+            action: "kept", state: existing.state, profile: assignment.profile,
+            environmentId: store.getProjectEnvironment(threadId, assignment.projectId)?.environmentId ?? null,
+            ...execution,
+          });
           continue;
         }
         store.upsertWorkstream({
@@ -447,15 +527,18 @@ export default async function plugin(bb: BbPluginApi) {
       }
       store.setRunState(threadId, "running");
       const launched = await launchQueued(threadId);
+      await archiveWorkers(retired);
       const launchedByKey = new Map(launched.map((item) => [item.key, item]));
       const byKey = new Map(kept.map((item) => [String(item.key), item]));
       for (const assignment of assignments) {
         if (byKey.has(assignment.key)) continue;
         const item = launchedByKey.get(assignment.key) ?? store.getWorkstream(threadId, assignment.key)!;
+        const environmentId = store.getProjectEnvironment(threadId, item.projectId)?.environmentId ?? null;
         byKey.set(assignment.key, {
           key: item.key, projectId: item.projectId, threadId: item.threadId,
-          action: item.threadId === null ? "queued" : "spawned", state: item.state, profile: item.profile,
-          providerId: item.providerId, model: item.model, reasoningLevel: item.reasoningLevel,
+          action: item.state === "queued" ? "queued" : item.state === "running" ? "spawned" : item.state,
+          state: item.state, profile: item.profile,
+          providerId: item.providerId, model: item.model, reasoningLevel: item.reasoningLevel, environmentId,
         });
       }
       const workers = assignments.map((assignment) => byKey.get(assignment.key)!);
@@ -475,7 +558,20 @@ export default async function plugin(bb: BbPluginApi) {
       const meta = await metadata(threadId);
       if (meta === null) throw new Error("This thread is not in a managed run.");
       const coordinatorThreadId = meta.role === "coordinator" ? threadId : meta.coordinatorThreadId;
-      return JSON.stringify({ run: store.getRun(coordinatorThreadId), workstreams: store.listWorkstreams(coordinatorThreadId), artifacts: store.listArtifacts(coordinatorThreadId) });
+      const [routingPolicyValue, configuredRoutes] = await Promise.all([readRoutingPolicy(), readRoutes()]);
+      const environments = store.listProjectEnvironments(coordinatorThreadId);
+      const environmentByProject = new Map(environments.map((item) => [item.projectId, item.environmentId]));
+      const workstreams = store.listWorkstreams(coordinatorThreadId).map((item) => ({
+        ...item,
+        environmentId: environmentByProject.get(item.projectId) ?? null,
+      }));
+      return JSON.stringify({
+        run: store.getRun(coordinatorThreadId),
+        routing: { policy: routingPolicyValue, configuredRoutes },
+        environments,
+        workstreams,
+        artifacts: store.listArtifacts(coordinatorThreadId),
+      });
     },
   });
 
@@ -545,7 +641,6 @@ export default async function plugin(bb: BbPluginApi) {
         store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: result.status === "success", durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
       }
       await notify(meta.coordinatorThreadId, `Workstream ${meta.key} ${review ? "is ready for review" : state}: ${result.summary}`, threadId);
-      await launchQueued(meta.coordinatorThreadId);
       return JSON.stringify({ key: meta.key, state: next.state, reviewRequired: review });
     },
   });
@@ -566,15 +661,18 @@ export default async function plugin(bb: BbPluginApi) {
       if (run === null || item?.state !== "reviewing") throw new Error(`Workstream ${key} is not awaiting review.`);
       if (decision === "accept") {
         store.setWorkstreamState(threadId, key, "completed");
+        store.releaseProjectLane(threadId, key);
         store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: true, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
-        if (item.threadId !== null) await retireWorker(item.threadId);
         await launchQueued(threadId);
+        if (item.threadId !== null) await retireWorker(item.threadId);
         return JSON.stringify({ key, state: "completed" });
       }
       if (item.attemptCount >= run.policy.maxAttemptsPerWorkstream || item.threadId === null) {
         store.setWorkstreamState(threadId, key, "failed", { error: feedback });
+        store.releaseProjectLane(threadId, key);
         store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
         await launchQueued(threadId);
+        if (item.threadId !== null) await retireWorker(item.threadId);
         return JSON.stringify({ key, state: "failed", retry: false });
       }
       store.setWorkstreamState(threadId, key, "running", { incrementAttempt: true, error: feedback });
@@ -601,6 +699,7 @@ export default async function plugin(bb: BbPluginApi) {
       const unsettled = all.filter((item) => !["completed", "failed", "cancelled"].includes(item.state));
       if (unsettled.length > 0) throw new Error(`Cannot finish while workstreams are unsettled: ${unsettled.map((item) => item.key).join(", ")}.`);
       await Promise.allSettled([...managed].map(retireWorker));
+      for (const item of all) store.releaseProjectLane(threadId, item.key);
       store.setRunState(threadId, all.some((item) => item.state === "failed") ? "failed" : "completed");
       return JSON.stringify({ retired: [...managed], state: store.getRun(threadId)?.state });
     },
@@ -611,9 +710,12 @@ export default async function plugin(bb: BbPluginApi) {
     if (item !== null && item.state === "queued") store.setWorkstreamState(item.coordinatorThreadId, item.key, "running");
   });
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
+    if (intentionallyStoppingWorkerIds.has(thread.id)) return;
     const item = store.getWorkstreamByThread(thread.id);
     if (item === null) return;
     if (item.state === "completed" || item.state === "failed" || item.state === "cancelled") {
+      store.releaseProjectLane(item.coordinatorThreadId, item.key);
+      await launchQueued(item.coordinatorThreadId);
       await retireWorker(thread.id);
       return;
     }
@@ -622,9 +724,11 @@ export default async function plugin(bb: BbPluginApi) {
       error: "Worker became idle without a structured completion record.",
       result: { status: "failed", summary: lastAssistantText ?? "No worker output was recorded.", changedFiles: [], validation: [], blockers: ["Missing orchestrator_worker_done call."] },
     });
+    store.releaseProjectLane(item.coordinatorThreadId, item.key);
     store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
     await notify(item.coordinatorThreadId, `Workstream ${item.key} failed its completion contract: the worker became idle without orchestrator_worker_done.`, thread.id);
     await launchQueued(item.coordinatorThreadId);
+    await retireWorker(thread.id);
   });
   bb.events.on("turn.failed", async (event) => {
     const item = store.getWorkstreamByThread(event.threadId);
@@ -637,10 +741,11 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", { error: event.errorInfo === null ? "Provider turn failed and retry limit was reached." : `${event.errorInfo.category}${event.errorInfo.providerCode === null ? "" : ` (${event.errorInfo.providerCode})`}` });
+    store.releaseProjectLane(item.coordinatorThreadId, item.key);
     store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
     await notify(item.coordinatorThreadId, `Workstream ${item.key} failed after ${item.attemptCount} attempt(s).`, event.threadId);
-    await retireWorker(event.threadId);
     await launchQueued(item.coordinatorThreadId);
+    await retireWorker(event.threadId);
   });
   bb.events.on("experimental_thread.events", async ({ thread }) => {
     const item = store.getWorkstreamByThread(thread.id);
@@ -667,22 +772,40 @@ export default async function plugin(bb: BbPluginApi) {
         return;
       }
       const item = store.getWorkstreamByThread(thread.id);
+      if (intentionallyStoppingWorkerIds.has(thread.id)) return;
       if (item !== null && !["completed", "failed", "cancelled"].includes(item.state)) {
         store.setWorkstreamState(item.coordinatorThreadId, item.key, "cancelled", { error: `Worker was ${eventName === "thread.archived" ? "archived" : "deleted"}.` });
+        store.releaseProjectLane(item.coordinatorThreadId, item.key);
         await notify(item.coordinatorThreadId, `Workstream ${item.key} was ${eventName === "thread.archived" ? "archived" : "deleted"} before completion.`);
         await launchQueued(item.coordinatorThreadId);
       }
     });
   }
   bb.background.schedule("cleanup-expired-runs", "*/5 * * * *", async () => {
+    const terminal = store.listTerminalWorkstreams().filter((item) => item.threadId !== null && !retiredWorkerIds.has(item.threadId));
+    for (const item of terminal) {
+      try {
+        const thread = await bb.sdk.threads.get({ threadId: item.threadId! });
+        if (thread.status === "idle" || thread.status === "error") {
+          store.releaseProjectLane(item.coordinatorThreadId, item.key);
+          await launchQueued(item.coordinatorThreadId);
+          await retireWorker(item.threadId!);
+        }
+      } catch (error) {
+        bb.log.warn(`Could not reconcile terminal worker ${item.threadId}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     const timedOut = store.listTimedOutWorkstreams(Date.now());
-    await Promise.all(timedOut.flatMap((item) => item.threadId === null ? [] : [retireWorker(item.threadId)]));
+    const timedOutThreadIds = timedOut.flatMap((item) => item.threadId === null ? [] : [item.threadId]);
+    await stopWorkers(timedOutThreadIds);
     for (const item of timedOut) {
       store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", { error: "Worker timeout was reached." });
+      store.releaseProjectLane(item.coordinatorThreadId, item.key);
       store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
     }
     await Promise.all(timedOut.map((item) => notify(item.coordinatorThreadId, `Workstream ${item.key} was stopped after reaching its worker timeout.`)));
     await Promise.all([...new Set(timedOut.map((item) => item.coordinatorThreadId))].map(launchQueued));
+    await archiveWorkers(timedOutThreadIds);
     await Promise.all(store.listExpiredRuns(Date.now()).map((run) => cleanupRun(run.coordinatorThreadId, "cancelled", "Run expired due to its runtime or inactivity limit.")));
   });
 
@@ -692,7 +815,7 @@ export default async function plugin(bb: BbPluginApi) {
       return {
         tools: ["orchestrator_dispatch", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_review", "orchestrator_finish"],
         skills: [],
-        instructions: "You are a managed Orchestrator coordinator. The plugin is the single lifecycle writer. Dispatch a complete stable-key workstream set, use durable status and artifacts instead of polling output, evaluate gated results, and finish only when every workstream is terminal.",
+        instructions: "You are a managed Orchestrator coordinator. The plugin is the single lifecycle writer. Dispatch a complete stable-key workstream set and use the cheapest adequate profile: quick for bounded mechanical work and standard for ordinary implementation. Reserve complex for identified cross-cutting uncertainty and critical for concrete high-cost failure risk. Use durable status and artifacts instead of polling output, evaluate gated results, and finish only when every workstream is terminal.",
       };
     }
     if (parsed.success && parsed.data.role === "worker") {

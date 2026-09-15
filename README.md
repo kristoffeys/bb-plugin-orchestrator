@@ -24,6 +24,24 @@ As an alternative, asking the agent to enable orchestration exposes the
 `orchestrator_enable` tool. Opt-in keeps routine threads from acquiring
 worker-management tools by default.
 
+Each run provisions one project-default environment for every project it
+touches and records the environment id durably. Later workstreams,
+replacements, and retries for that project reuse it, so they see the same
+branch and working tree. Only one workstream per project runs at a time;
+different projects can use the configured parallel capacity concurrently.
+Queued and running states remain distinct in dispatch results and durable
+status, including after a plugin reload. Status also reports the snapshotted
+run policy, configured routing policy, and each workstream's actual provider
+and model. Worker cleanup archives and stops threads without deleting a shared
+project environment. The cleanup schedule reconciles terminal worker records
+after reloads so a missed idle event cannot leave their agent sessions loaded.
+
+Coordinators created by the older Sidebar group orchestrator are outside this
+plugin's lifecycle ownership. Their direct children must be finished or
+archived through that coordinator, or the work should be restarted as a
+standalone Orchestrator run; this plugin does not adopt or delete those
+unmanaged threads.
+
 Assignments default to the `quick` profile. Higher profiles require a concrete
 complexity reason. The default routing is:
 

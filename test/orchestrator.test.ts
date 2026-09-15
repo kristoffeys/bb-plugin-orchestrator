@@ -73,9 +73,14 @@ async function load(providerId = "codex") {
         spawn: async (input: Record<string, unknown>) => {
           spawned.push(input);
           const id = `spawned-${nextId++}`;
+          const environment = input.environment as { type?: string; environmentId?: string } | undefined;
+          const environmentId = environment?.type === "reuse"
+            ? environment.environmentId ?? null
+            : `env-${String(input.projectId)}`;
           const thread = makeThreadResponse({
             id,
             projectId: String(input.projectId),
+            environmentId,
             parentThreadId: typeof input.parentThreadId === "string" ? input.parentThreadId : null,
             visibility: input.visibility === "hidden" ? "hidden" : "visible",
             providerId: typeof input.providerId === "string" ? input.providerId : providerId,
@@ -135,10 +140,10 @@ test("start creates a personal coordinator with generic Orchestrator identity", 
   });
   const text = ((state.spawned[0]?.input as Array<{ text?: string }>)[0]?.text) ?? "";
   assert.match(text, /stable `key`/);
-  assert.match(text, /A project may have several independent workstreams/);
+  assert.match(text, /one at a time in a shared project environment/);
 });
 
-test("dispatch supports several keyed workers in one project and reconciles stale work", async () => {
+test("same-project workstreams serialize and share the captured project environment", async () => {
   const state = await load();
   const dispatch = (assignments: unknown[]) => state.harness.behavior.callAgentTool(
     "orchestrator_dispatch",
@@ -150,9 +155,14 @@ test("dispatch supports several keyed workers in one project and reconciles stal
     { key: "api-tests", projectId: "api", prompt: "Add contract tests." },
     { key: "web-client", projectId: "web", prompt: "Consume the contract.", profile: "standard", complexityReason: "Requires integration judgment." },
   ]) as string);
-  assert.deepEqual(first.workers.map((worker: { action: string }) => worker.action), ["spawned", "spawned", "spawned"]);
+  assert.deepEqual(first.workers.map((worker: { action: string }) => worker.action), ["spawned", "queued", "spawned"]);
+  assert.deepEqual(first.workers.map((worker: { state: string }) => worker.state), ["running", "queued", "running"]);
+  assert.deepEqual(state.spawned.map((input) => input.environment), [
+    { type: "project-default" },
+    { type: "project-default" },
+  ]);
   assert.equal(state.spawned[0]?.model, "gpt-5.6-luna");
-  assert.equal(state.spawned[2]?.model, "gpt-5.6-terra");
+  assert.equal(state.spawned[1]?.model, "gpt-5.6-terra");
 
   const manual = makeThreadResponse({ id: "manual", projectId: "api", parentThreadId: "coord", updatedAt: 99 });
   state.threads.set("manual", manual);
@@ -161,9 +171,88 @@ test("dispatch supports several keyed workers in one project and reconciles stal
     { key: "web-client", projectId: "web", prompt: "Consume the contract.", profile: "standard", complexityReason: "Requires integration judgment." },
   ]) as string);
   assert.deepEqual(second.workers.map((worker: { action: string }) => worker.action), ["spawned", "kept"]);
-  assert.deepEqual(second.retired, ["spawned-2", "spawned-1"]);
+  assert.deepEqual(second.retired, ["spawned-1"]);
+  assert.deepEqual(state.spawned[2]?.environment, { type: "reuse", environmentId: "env-api" });
   assert.equal(state.archived.includes("manual"), false, "manual children are never managed");
   assert.deepEqual(state.sent, []);
+});
+
+test("different projects run in parallel while each project keeps a single active lane", async () => {
+  const state = await load();
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool(
+    "orchestrator_dispatch",
+    { assignments: [
+      { key: "api-one", projectId: "api", prompt: "First API task." },
+      { key: "api-two", projectId: "api", prompt: "Second API task." },
+      { key: "web-one", projectId: "web", prompt: "Web task." },
+    ] },
+    { threadId: "coord", projectId: "personal" },
+  ) as string);
+  assert.deepEqual(dispatched.workers.map((item: { state: string }) => item.state), ["running", "queued", "running"]);
+  assert.deepEqual(state.spawned.map((item) => item.projectId), ["api", "web"]);
+});
+
+test("the next same-project workstream reuses the first worker environment", async () => {
+  const state = await load();
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool(
+    "orchestrator_dispatch",
+    { assignments: [
+      { key: "first", projectId: "api", prompt: "First task." },
+      { key: "second", projectId: "api", prompt: "Second task." },
+    ] },
+    { threadId: "coord", projectId: "personal" },
+  ) as string);
+  assert.equal(state.spawned.length, 1);
+  await state.harness.behavior.callAgentTool(
+    "orchestrator_worker_done",
+    { status: "success", summary: "First complete.", changedFiles: [], validation: [], blockers: [] },
+    { threadId: dispatched.workers[0].threadId, projectId: "api" },
+  );
+  assert.equal(state.spawned.length, 1, "the project lane stays reserved until the worker is idle");
+  await state.harness.behavior.emitThreadEvent("thread.idle", {
+    thread: state.threads.get(dispatched.workers[0].threadId)!,
+    lastAssistantText: "First complete.",
+  });
+  assert.equal(state.spawned.length, 2);
+  assert.deepEqual(state.spawned[1]?.environment, { type: "reuse", environmentId: "env-api" });
+});
+
+test("another project's idle event cannot release a finishing project's lane", async () => {
+  const state = await load();
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool(
+    "orchestrator_dispatch",
+    { assignments: [
+      { key: "a-api-running", projectId: "api", prompt: "First API task." },
+      { key: "b-api-queued", projectId: "api", prompt: "Second API task." },
+      { key: "c-web-running", projectId: "web", prompt: "First web task." },
+      { key: "d-web-queued", projectId: "web", prompt: "Second web task." },
+    ] },
+    { threadId: "coord", projectId: "personal" },
+  ) as string);
+  const apiWorkerId = dispatched.workers[0].threadId as string;
+  const webWorkerId = dispatched.workers[2].threadId as string;
+  const done = { status: "success" as const, summary: "Complete.", changedFiles: [], validation: [], blockers: [] };
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", done, { threadId: apiWorkerId, projectId: "api" });
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", done, { threadId: webWorkerId, projectId: "web" });
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread: state.threads.get(webWorkerId)!, lastAssistantText: "Complete." });
+  assert.equal(state.spawned[2]?.projectId, "web");
+  assert.equal(state.spawned.some((input, index) => index > 1 && input.projectId === "api"), false);
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread: state.threads.get(apiWorkerId)!, lastAssistantText: "Complete." });
+  assert.equal(state.spawned[3]?.projectId, "api");
+});
+
+test("a changed workstream stops its old worker and reuses the project environment", async () => {
+  const state = await load();
+  const dispatch = (prompt: string) => state.harness.behavior.callAgentTool(
+    "orchestrator_dispatch",
+    { assignments: [{ key: "replace-me", projectId: "api", prompt }] },
+    { threadId: "coord", projectId: "personal" },
+  );
+  const first = JSON.parse(await dispatch("Original task.") as string);
+  const replacement = JSON.parse(await dispatch("Replacement task.") as string);
+  assert.deepEqual(replacement.retired, [first.workers[0].threadId]);
+  assert.ok(state.stopped.includes(first.workers[0].threadId));
+  assert.deepEqual(state.spawned[1]?.environment, { type: "reuse", environmentId: "env-api" });
 });
 
 test("workers exchange handoffs and finish archives plus stops managed threads", async () => {
@@ -287,6 +376,10 @@ test("durable concurrency queues work and completion launches the next worker", 
     { status: "success", summary: "First complete.", changedFiles: [], validation: [], blockers: [] },
     { threadId: dispatched.workers[0].threadId, projectId: "api" },
   );
+  await state.harness.behavior.emitThreadEvent("thread.idle", {
+    thread: state.threads.get(dispatched.workers[0].threadId)!,
+    lastAssistantText: "First complete.",
+  });
   assert.equal(state.spawned.length, 2);
   const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
   assert.deepEqual(status.workstreams.map((item: { state: string }) => item.state), ["completed", "running"]);
@@ -304,6 +397,31 @@ test("run and workstream state survive a plugin reload", async () => {
   assert.equal(status.run.state, "running");
   assert.equal(status.workstreams[0].key, "durable");
   assert.equal(status.workstreams[0].attemptCount, 1);
+  assert.equal(status.workstreams[0].environmentId, "env-api");
+  assert.equal(status.routing.policy.strategy, "coordinator");
+  assert.deepEqual(status.routing.configuredRoutes, {});
+  assert.deepEqual(status.environments.map(({ projectId, environmentId }: { projectId: string; environmentId: string }) => ({ projectId, environmentId })), [
+    { projectId: "api", environmentId: "env-api" },
+  ]);
+});
+
+test("scheduled reconciliation retires a terminal worker whose idle event was missed across reload", async () => {
+  const state = await load();
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool(
+    "orchestrator_dispatch",
+    { assignments: [{ key: "missed-idle", projectId: "api", prompt: "Complete before reload." }] },
+    { threadId: "coord", projectId: "personal" },
+  ) as string);
+  const workerId = dispatched.workers[0].threadId as string;
+  await state.harness.behavior.callAgentTool(
+    "orchestrator_worker_done",
+    { status: "success", summary: "Completed before reload.", changedFiles: [], validation: [], blockers: [] },
+    { threadId: workerId, projectId: "api" },
+  );
+  const reloaded = await state.harness.lifecycle.reload(plugin);
+  await reloaded.harness.behavior.runSchedule("cleanup-expired-runs");
+  assert.ok(state.archived.includes(workerId));
+  assert.ok(state.stopped.includes(workerId));
 });
 
 test("disabling orchestration cleans up live managed workers", async () => {
@@ -319,11 +437,14 @@ test("disabling orchestration cleans up live managed workers", async () => {
   assert.equal(state.metadata.get("coord")?.role, undefined);
 });
 
-test("provider failures retry only up to the snapshotted attempt limit", async () => {
+test("provider failure exhausts retries and advances the same-project queue", async () => {
   const state = await load();
   const dispatched = JSON.parse(await state.harness.behavior.callAgentTool(
     "orchestrator_dispatch",
-    { assignments: [{ key: "flaky", projectId: "api", prompt: "Try it." }] },
+    { assignments: [
+      { key: "a-flaky", projectId: "api", prompt: "Try it." },
+      { key: "b-after-failure", projectId: "api", prompt: "Run after failure." },
+    ] },
     { threadId: "coord", projectId: "personal" },
   ) as string);
   const workerId = dispatched.workers[0].threadId as string;
@@ -331,8 +452,11 @@ test("provider failures retry only up to the snapshotted attempt limit", async (
   assert.equal(state.retries.length, 1);
   await state.harness.behavior.emitThreadEvent("turn.failed", makeTurnFailedEvent({ threadId: workerId, requestId: "req-1", attemptNumber: 2 }));
   assert.equal(state.retries.length, 1);
+  assert.equal(state.spawned.length, 2);
+  assert.deepEqual(state.spawned[1]?.environment, { type: "reuse", environmentId: "env-api" });
   const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(status.workstreams[0].state, "failed");
+  assert.equal(status.workstreams[1].state, "running");
 });
 
 test("observed token usage enforces the run budget", async () => {

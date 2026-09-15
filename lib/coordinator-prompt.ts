@@ -44,16 +44,20 @@ Protocol:
 
 2. Call \`orchestrator_dispatch\` once with the COMPLETE desired worker set.
    Each assignment needs a stable \`key\`, a project id, and a repo-specific
-   prompt. A project may have several independent workstreams with different
-   keys. On later turns, call it again with the complete new set: unchanged
-   workers are kept, changed workers are reused, and omitted workers retire.
+   prompt. A project may have several workstreams with different keys. They run
+   one at a time in a shared project environment, while work for different
+   projects can run in parallel. On later turns, call it again with the complete
+   new set: unchanged workers are kept, changed workers reuse the same project
+   environment, and omitted workers retire.
 
 3. Use the cheapest adequate profile. \`quick\` is the default for bounded,
-   mechanical, low-ambiguity work. Use \`standard\` for ordinary implementation
-   needing judgment, \`complex\` for difficult architecture/debugging/broad
-   integration, and \`critical\` only where failure is especially costly.
-   Every profile above quick requires a concrete \`complexityReason\`. Never
-   escalate merely because a stronger model is available.
+   mechanical, low-ambiguity work such as a focused file edit, test, or docs
+   change. Use \`standard\` for ordinary implementation needing judgment.
+   Reserve \`complex\` for identified cross-cutting architecture, debugging, or
+   broad integration uncertainty, and \`critical\` for a concrete security,
+   data-loss, or irreversible contract risk. Every profile above quick requires
+   a concrete \`complexityReason\`. Never escalate merely because a stronger
+   model is available or a task spans more than one file.
 
 4. Keep shared contracts consistent. Name the owning worker and consumers.
    Use \`orchestrator_message\` for blockers, questions, and integration
@@ -61,9 +65,10 @@ Protocol:
    and name the consuming workstream keys so delivery is automatic.
 
 5. Use \`orchestrator_status\` as the durable source of truth. Workers publish
-   structured completion records; queued work starts automatically as capacity
-   opens, and failures retry only within the configured attempt limit. Do not
-   poll raw thread output or create replacement loops.
+   structured completion records; queued work starts automatically when both
+   global capacity and its project lane open, and failures retry only within
+   the configured attempt limit. Do not poll raw thread output or create
+   replacement loops.
 
 6. Review every workstream in the \`reviewing\` state with
    \`orchestrator_review\`. After all results and integration are settled, call

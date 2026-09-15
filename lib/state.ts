@@ -36,6 +36,7 @@ export interface WorkstreamRecord {
   updatedAt: number;
   startedAt: number | null;
   completedAt: number | null;
+  laneReleasedAt: number | null;
   lastEventSeq: number;
   totalTokens: number;
   result: unknown | null;
@@ -54,6 +55,14 @@ export interface ArtifactRecord {
   path: string | null;
   consumers: string[];
   createdAt: number;
+}
+
+export interface ProjectEnvironmentRecord {
+  coordinatorThreadId: string;
+  projectId: string;
+  environmentId: string;
+  createdAt: number;
+  updatedAt: number;
 }
 
 type RunRow = Omit<RunRecord, "allowedProjectIds" | "policy" | "firstDispatchApproved"> & {
@@ -94,6 +103,7 @@ export class OrchestratorStore {
     const reset = this.db.transaction(() => {
       this.db.prepare("DELETE FROM artifacts WHERE coordinator_thread_id = ?").run(coordinatorThreadId);
       this.db.prepare("DELETE FROM workstreams WHERE coordinator_thread_id = ?").run(coordinatorThreadId);
+      this.db.prepare("DELETE FROM run_project_environments WHERE coordinator_thread_id = ?").run(coordinatorThreadId);
       this.db.prepare("DELETE FROM runs WHERE coordinator_thread_id = ?").run(coordinatorThreadId);
     });
     reset();
@@ -141,7 +151,7 @@ export class OrchestratorStore {
     });
   }
 
-  upsertWorkstream(input: Omit<WorkstreamRecord, "createdAt" | "updatedAt" | "startedAt" | "completedAt" | "lastEventSeq" | "totalTokens" | "result" | "error">) {
+  upsertWorkstream(input: Omit<WorkstreamRecord, "createdAt" | "updatedAt" | "startedAt" | "completedAt" | "laneReleasedAt" | "lastEventSeq" | "totalTokens" | "result" | "error">) {
     const now = Date.now();
     this.db.prepare(`
       INSERT INTO workstreams (
@@ -154,7 +164,9 @@ export class OrchestratorStore {
         provider_id = excluded.provider_id, model = excluded.model,
         reasoning_level = excluded.reasoning_level, state = excluded.state,
         thread_id = excluded.thread_id, attempt_count = excluded.attempt_count,
-        updated_at = excluded.updated_at, completed_at = NULL, result_json = NULL, error = NULL
+        updated_at = excluded.updated_at, started_at = NULL, completed_at = NULL,
+        lane_released_at = NULL, last_event_seq = 0, total_tokens = 0,
+        result_json = NULL, error = NULL
     `).run(
       input.coordinatorThreadId, input.key, input.projectId, input.title, input.assignment,
       input.profile, input.complexityReason, input.providerId, input.model, input.reasoningLevel,
@@ -169,7 +181,8 @@ export class OrchestratorStore {
         assignment, profile, complexity_reason AS complexityReason, provider_id AS providerId,
         model, reasoning_level AS reasoningLevel, state, thread_id AS threadId,
         attempt_count AS attemptCount, created_at AS createdAt, updated_at AS updatedAt,
-        started_at AS startedAt, completed_at AS completedAt, last_event_seq AS lastEventSeq,
+        started_at AS startedAt, completed_at AS completedAt, lane_released_at AS laneReleasedAt,
+        last_event_seq AS lastEventSeq,
         total_tokens AS totalTokens, result_json AS resultJson, error
       FROM workstreams WHERE coordinator_thread_id = ? AND key = ?
     `).get(coordinatorThreadId, key) as WorkstreamRow | undefined;
@@ -184,6 +197,16 @@ export class OrchestratorStore {
   listWorkstreams(coordinatorThreadId: string): WorkstreamRecord[] {
     const keys = this.db.prepare("SELECT key FROM workstreams WHERE coordinator_thread_id = ? ORDER BY created_at, key").all(coordinatorThreadId) as Array<{ key: string }>;
     return keys.map(({ key }) => this.getWorkstream(coordinatorThreadId, key)!);
+  }
+
+  listTerminalWorkstreams(): WorkstreamRecord[] {
+    const rows = this.db.prepare(`
+      SELECT coordinator_thread_id AS coordinatorThreadId, key
+      FROM workstreams
+      WHERE thread_id IS NOT NULL AND state IN ('completed', 'failed', 'cancelled')
+      ORDER BY updated_at, coordinator_thread_id, key
+    `).all() as Array<{ coordinatorThreadId: string; key: string }>;
+    return rows.map(({ coordinatorThreadId, key }) => this.getWorkstream(coordinatorThreadId, key)!);
   }
 
   listTimedOutWorkstreams(now: number) {
@@ -219,9 +242,54 @@ export class OrchestratorStore {
     return this.getWorkstream(coordinatorThreadId, key);
   }
 
+  releaseProjectLane(coordinatorThreadId: string, key: string) {
+    const now = Date.now();
+    this.db.prepare(`
+      UPDATE workstreams SET lane_released_at = ?, updated_at = ?
+      WHERE coordinator_thread_id = ? AND key = ?
+    `).run(now, now, coordinatorThreadId, key);
+    this.touchRun(coordinatorThreadId);
+    return this.getWorkstream(coordinatorThreadId, key);
+  }
+
   removeWorkstreamsNotIn(coordinatorThreadId: string, keys: readonly string[]) {
     const desired = new Set(keys);
     return this.listWorkstreams(coordinatorThreadId).filter((item) => !desired.has(item.key));
+  }
+
+  getProjectEnvironment(coordinatorThreadId: string, projectId: string): ProjectEnvironmentRecord | null {
+    return (this.db.prepare(`
+      SELECT coordinator_thread_id AS coordinatorThreadId, project_id AS projectId,
+        environment_id AS environmentId, created_at AS createdAt, updated_at AS updatedAt
+      FROM run_project_environments
+      WHERE coordinator_thread_id = ? AND project_id = ?
+    `).get(coordinatorThreadId, projectId) as ProjectEnvironmentRecord | undefined) ?? null;
+  }
+
+  setProjectEnvironment(coordinatorThreadId: string, projectId: string, environmentId: string) {
+    const now = Date.now();
+    this.db.prepare(`
+      INSERT INTO run_project_environments (
+        coordinator_thread_id, project_id, environment_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(coordinator_thread_id, project_id) DO UPDATE SET
+        environment_id = excluded.environment_id, updated_at = excluded.updated_at
+    `).run(coordinatorThreadId, projectId, environmentId, now, now);
+    return this.getProjectEnvironment(coordinatorThreadId, projectId)!;
+  }
+
+  clearProjectEnvironment(coordinatorThreadId: string, projectId: string) {
+    this.db.prepare("DELETE FROM run_project_environments WHERE coordinator_thread_id = ? AND project_id = ?")
+      .run(coordinatorThreadId, projectId);
+  }
+
+  listProjectEnvironments(coordinatorThreadId: string): ProjectEnvironmentRecord[] {
+    return this.db.prepare(`
+      SELECT coordinator_thread_id AS coordinatorThreadId, project_id AS projectId,
+        environment_id AS environmentId, created_at AS createdAt, updated_at AS updatedAt
+      FROM run_project_environments
+      WHERE coordinator_thread_id = ? ORDER BY created_at, project_id
+    `).all(coordinatorThreadId) as ProjectEnvironmentRecord[];
   }
 
   setUsage(coordinatorThreadId: string, key: string, totalTokens: number, lastEventSeq: number) {
