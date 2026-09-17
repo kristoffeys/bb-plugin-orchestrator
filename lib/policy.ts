@@ -40,7 +40,7 @@ export const DEFAULT_POLICY: OrchestrationPolicy = {
   workerTimeoutMinutes: 45,
   runTimeoutMinutes: 180,
   inactiveCleanupMinutes: 120,
-  tokenBudget: 0,
+  tokenBudget: 40_000_000,
   planningMode: "auto",
   approval: "critical",
   evaluator: "critical",

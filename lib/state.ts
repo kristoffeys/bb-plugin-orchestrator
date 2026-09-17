@@ -16,6 +16,17 @@ export interface RunRecord {
   updatedAt: number;
   lastActivityAt: number;
   totalTokens: number;
+  coordinatorLastEventSeq: number;
+  coordinatorTotalTokens: number;
+  coordinatorInputTokens: number;
+  coordinatorCachedInputTokens: number;
+  coordinatorOutputTokens: number;
+  coordinatorReasoningOutputTokens: number;
+  coordinatorBaselineTotalTokens: number;
+  coordinatorBaselineInputTokens: number;
+  coordinatorBaselineCachedInputTokens: number;
+  coordinatorBaselineOutputTokens: number;
+  coordinatorBaselineReasoningOutputTokens: number;
   firstDispatchApproved: boolean;
   error: string | null;
 }
@@ -46,6 +57,10 @@ export interface WorkstreamRecord {
   laneReleasedAt: number | null;
   lastEventSeq: number;
   totalTokens: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
   result: unknown | null;
   error: string | null;
 }
@@ -135,14 +150,14 @@ export class OrchestratorStore {
     this.db = db;
   }
 
-  upsertRun(input: { coordinatorThreadId: string; label: string; allowedProjectIds: string[]; policy: OrchestrationPolicy }) {
+  upsertRun(input: { coordinatorThreadId: string; label: string; allowedProjectIds: string[]; policy: OrchestrationPolicy }, coordinatorBaseline?: { lastEventSeq: number; totalTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number }) {
     const now = Date.now();
     const current = this.getRun(input.coordinatorThreadId);
     const sessionId = current?.sessionId ?? `${input.coordinatorThreadId}:${now.toString(36)}`;
     const featureBranch = current?.featureBranch ?? `orchestrator/${branchSlug(input.label)}-${now.toString(36).slice(-7)}`;
     this.db.prepare(`
-      INSERT INTO runs (coordinator_thread_id, session_id, feature_branch, label, allowed_project_ids_json, state, policy_json, created_at, updated_at, last_activity_at)
-      VALUES (?, ?, ?, ?, ?, 'configured', ?, ?, ?, ?)
+      INSERT INTO runs (coordinator_thread_id, session_id, feature_branch, label, allowed_project_ids_json, state, policy_json, created_at, updated_at, last_activity_at, coordinator_last_event_seq, coordinator_baseline_total_tokens, coordinator_baseline_input_tokens, coordinator_baseline_cached_input_tokens, coordinator_baseline_output_tokens, coordinator_baseline_reasoning_output_tokens)
+      VALUES (?, ?, ?, ?, ?, 'configured', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(coordinator_thread_id) DO UPDATE SET
         label = excluded.label,
         allowed_project_ids_json = excluded.allowed_project_ids_json,
@@ -151,7 +166,7 @@ export class OrchestratorStore {
         last_activity_at = excluded.last_activity_at,
         state = CASE WHEN runs.state IN ('completed', 'failed', 'cancelled') THEN 'configured' ELSE runs.state END,
         error = NULL
-    `).run(input.coordinatorThreadId, sessionId, featureBranch, input.label, JSON.stringify(input.allowedProjectIds), JSON.stringify(input.policy), now, now, now);
+    `).run(input.coordinatorThreadId, sessionId, featureBranch, input.label, JSON.stringify(input.allowedProjectIds), JSON.stringify(input.policy), now, now, now, coordinatorBaseline?.lastEventSeq ?? 0, coordinatorBaseline?.totalTokens ?? 0, coordinatorBaseline?.inputTokens ?? 0, coordinatorBaseline?.cachedInputTokens ?? 0, coordinatorBaseline?.outputTokens ?? 0, coordinatorBaseline?.reasoningOutputTokens ?? 0);
     this.db.prepare(`INSERT OR IGNORE INTO orchestration_sessions (session_id, coordinator_thread_id, label, feature_branch, allowed_project_ids_json, state, policy_json, started_at, updated_at) VALUES (?, ?, ?, ?, ?, 'configured', ?, ?, ?)`)
       .run(sessionId, input.coordinatorThreadId, input.label, featureBranch, JSON.stringify(input.allowedProjectIds), JSON.stringify(input.policy), now, now);
     this.recordEvent({ coordinatorThreadId: input.coordinatorThreadId, type: current === null ? "session.started" : "session.configured", details: { featureBranch, projectCount: input.allowedProjectIds.length } });
@@ -159,6 +174,15 @@ export class OrchestratorStore {
   }
 
   resetRun(coordinatorThreadId: string) {
+    const current = this.getRun(coordinatorThreadId);
+    const coordinatorBaseline = current === null ? undefined : {
+      lastEventSeq: current.coordinatorLastEventSeq,
+      totalTokens: current.coordinatorBaselineTotalTokens + current.coordinatorTotalTokens,
+      inputTokens: current.coordinatorBaselineInputTokens + current.coordinatorInputTokens,
+      cachedInputTokens: current.coordinatorBaselineCachedInputTokens + current.coordinatorCachedInputTokens,
+      outputTokens: current.coordinatorBaselineOutputTokens + current.coordinatorOutputTokens,
+      reasoningOutputTokens: current.coordinatorBaselineReasoningOutputTokens + current.coordinatorReasoningOutputTokens,
+    };
     const reset = this.db.transaction(() => {
       this.db.prepare("DELETE FROM artifacts WHERE coordinator_thread_id = ?").run(coordinatorThreadId);
       this.db.prepare("DELETE FROM plans WHERE coordinator_thread_id = ?").run(coordinatorThreadId);
@@ -167,6 +191,7 @@ export class OrchestratorStore {
       this.db.prepare("DELETE FROM runs WHERE coordinator_thread_id = ?").run(coordinatorThreadId);
     });
     reset();
+    return coordinatorBaseline;
   }
 
   getRun(coordinatorThreadId: string): RunRecord | null {
@@ -176,6 +201,12 @@ export class OrchestratorStore {
         allowed_project_ids_json AS allowedProjectIdsJson, state,
         policy_json AS policyJson, created_at AS createdAt, updated_at AS updatedAt,
         last_activity_at AS lastActivityAt, total_tokens AS totalTokens,
+        coordinator_last_event_seq AS coordinatorLastEventSeq, coordinator_total_tokens AS coordinatorTotalTokens,
+        coordinator_input_tokens AS coordinatorInputTokens, coordinator_cached_input_tokens AS coordinatorCachedInputTokens,
+        coordinator_output_tokens AS coordinatorOutputTokens, coordinator_reasoning_output_tokens AS coordinatorReasoningOutputTokens,
+        coordinator_baseline_total_tokens AS coordinatorBaselineTotalTokens, coordinator_baseline_input_tokens AS coordinatorBaselineInputTokens,
+        coordinator_baseline_cached_input_tokens AS coordinatorBaselineCachedInputTokens, coordinator_baseline_output_tokens AS coordinatorBaselineOutputTokens,
+        coordinator_baseline_reasoning_output_tokens AS coordinatorBaselineReasoningOutputTokens,
         first_dispatch_approved AS firstDispatchApproved, error
       FROM runs WHERE coordinator_thread_id = ?
     `).get(coordinatorThreadId) as RunRow | undefined;
@@ -243,7 +274,12 @@ export class OrchestratorStore {
     });
   }
 
-  upsertWorkstream(input: Omit<WorkstreamRecord, "createdAt" | "updatedAt" | "startedAt" | "completedAt" | "laneReleasedAt" | "lastEventSeq" | "totalTokens" | "result" | "error">) {
+  listRuns(): RunRecord[] {
+    const rows = this.db.prepare("SELECT coordinator_thread_id AS coordinatorThreadId FROM runs ORDER BY created_at DESC").all() as Array<{ coordinatorThreadId: string }>;
+    return rows.map(({ coordinatorThreadId }) => this.getRun(coordinatorThreadId)!);
+  }
+
+  upsertWorkstream(input: Omit<WorkstreamRecord, "createdAt" | "updatedAt" | "startedAt" | "completedAt" | "laneReleasedAt" | "lastEventSeq" | "totalTokens" | "inputTokens" | "cachedInputTokens" | "outputTokens" | "reasoningOutputTokens" | "result" | "error">) {
     const now = Date.now();
     this.db.prepare(`
       INSERT INTO workstreams (
@@ -260,6 +296,7 @@ export class OrchestratorStore {
         thread_id = excluded.thread_id, attempt_count = excluded.attempt_count,
         updated_at = excluded.updated_at, started_at = NULL, completed_at = NULL,
         lane_released_at = NULL, last_event_seq = 0, total_tokens = 0,
+        input_tokens = 0, cached_input_tokens = 0, output_tokens = 0, reasoning_output_tokens = 0,
         result_json = NULL, error = NULL
     `).run(
       input.coordinatorThreadId, input.key, input.parentKey, input.depth, input.accessMode, input.projectId, input.title, input.assignment,
@@ -279,7 +316,9 @@ export class OrchestratorStore {
         attempt_count AS attemptCount, created_at AS createdAt, updated_at AS updatedAt,
         started_at AS startedAt, completed_at AS completedAt, lane_released_at AS laneReleasedAt,
         last_event_seq AS lastEventSeq,
-        total_tokens AS totalTokens, result_json AS resultJson, error
+        total_tokens AS totalTokens, input_tokens AS inputTokens, cached_input_tokens AS cachedInputTokens,
+        output_tokens AS outputTokens, reasoning_output_tokens AS reasoningOutputTokens,
+        result_json AS resultJson, error
       FROM workstreams WHERE coordinator_thread_id = ? AND key = ?
     `).get(coordinatorThreadId, key) as WorkstreamRow | undefined;
     return row === undefined ? null : { ...row, result: row.resultJson === null ? null : parseJson(row.resultJson) };
@@ -419,15 +458,35 @@ export class OrchestratorStore {
     `).all(coordinatorThreadId) as ProjectEnvironmentRecord[];
   }
 
-  setUsage(coordinatorThreadId: string, key: string, totalTokens: number, lastEventSeq: number) {
-    this.db.prepare("UPDATE workstreams SET total_tokens = ?, last_event_seq = ?, updated_at = ? WHERE coordinator_thread_id = ? AND key = ?")
-      .run(totalTokens, lastEventSeq, Date.now(), coordinatorThreadId, key);
-    const aggregate = this.db.prepare("SELECT COALESCE(SUM(total_tokens), 0) AS total FROM workstreams WHERE coordinator_thread_id = ?")
-      .get(coordinatorThreadId) as { total: number };
+  setUsage(coordinatorThreadId: string, key: string, usage: { totalTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number }, lastEventSeq: number) {
+    this.db.prepare("UPDATE workstreams SET total_tokens = ?, input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, reasoning_output_tokens = ?, last_event_seq = ?, updated_at = ? WHERE coordinator_thread_id = ? AND key = ?")
+      .run(usage.totalTokens, usage.inputTokens, usage.cachedInputTokens, usage.outputTokens, usage.reasoningOutputTokens, lastEventSeq, Date.now(), coordinatorThreadId, key);
+    return this.updateAggregatedUsage(coordinatorThreadId);
+  }
+
+  setCoordinatorUsage(coordinatorThreadId: string, usage: { totalTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number }, lastEventSeq: number) {
+    const run = this.getRun(coordinatorThreadId);
+    if (run === null) return 0;
+    this.db.prepare("UPDATE runs SET coordinator_total_tokens = ?, coordinator_input_tokens = ?, coordinator_cached_input_tokens = ?, coordinator_output_tokens = ?, coordinator_reasoning_output_tokens = ?, coordinator_last_event_seq = ?, updated_at = ? WHERE coordinator_thread_id = ?")
+      .run(Math.max(0, usage.totalTokens - run.coordinatorBaselineTotalTokens), Math.max(0, usage.inputTokens - run.coordinatorBaselineInputTokens), Math.max(0, usage.cachedInputTokens - run.coordinatorBaselineCachedInputTokens), Math.max(0, usage.outputTokens - run.coordinatorBaselineOutputTokens), Math.max(0, usage.reasoningOutputTokens - run.coordinatorBaselineReasoningOutputTokens), lastEventSeq, Date.now(), coordinatorThreadId);
+    return this.updateAggregatedUsage(coordinatorThreadId);
+  }
+
+  private updateAggregatedUsage(coordinatorThreadId: string) {
+    const workers = this.db.prepare("SELECT COALESCE(SUM(total_tokens), 0) AS total, COALESCE(SUM(input_tokens), 0) AS input, COALESCE(SUM(cached_input_tokens), 0) AS cached, COALESCE(SUM(output_tokens), 0) AS output, COALESCE(SUM(reasoning_output_tokens), 0) AS reasoning FROM workstreams WHERE coordinator_thread_id = ?")
+      .get(coordinatorThreadId) as { total: number; input: number; cached: number; output: number; reasoning: number };
+    const coordinator = this.db.prepare("SELECT coordinator_total_tokens AS total, coordinator_input_tokens AS input, coordinator_cached_input_tokens AS cached, coordinator_output_tokens AS output, coordinator_reasoning_output_tokens AS reasoning FROM runs WHERE coordinator_thread_id = ?")
+      .get(coordinatorThreadId) as { total: number; input: number; cached: number; output: number; reasoning: number } | undefined;
+    const aggregate = {
+      total: workers.total + (coordinator?.total ?? 0), input: workers.input + (coordinator?.input ?? 0),
+      cached: workers.cached + (coordinator?.cached ?? 0), output: workers.output + (coordinator?.output ?? 0),
+      reasoning: workers.reasoning + (coordinator?.reasoning ?? 0),
+    };
     this.db.prepare("UPDATE runs SET total_tokens = ?, updated_at = ? WHERE coordinator_thread_id = ?")
       .run(aggregate.total, Date.now(), coordinatorThreadId);
     const run = this.getRun(coordinatorThreadId);
-    if (run !== null) this.db.prepare("UPDATE orchestration_sessions SET total_tokens = ?, updated_at = ? WHERE session_id = ?").run(aggregate.total, Date.now(), run.sessionId);
+    if (run !== null) this.db.prepare("UPDATE orchestration_sessions SET total_tokens = ?, input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, reasoning_output_tokens = ?, updated_at = ? WHERE session_id = ?")
+      .run(aggregate.total, aggregate.input, aggregate.cached, aggregate.output, aggregate.reasoning, Date.now(), run.sessionId);
     return aggregate.total;
   }
 
@@ -440,10 +499,10 @@ export class OrchestratorStore {
   }
 
   analytics() {
-    const sessions = this.db.prepare(`SELECT session_id AS sessionId, coordinator_thread_id AS coordinatorThreadId, label, feature_branch AS featureBranch, state, total_tokens AS totalTokens, started_at AS startedAt, updated_at AS updatedAt, completed_at AS completedAt, error FROM orchestration_sessions ORDER BY started_at DESC LIMIT 100`).all() as Array<{ sessionId: string; coordinatorThreadId: string; label: string; featureBranch: string; state: string; totalTokens: number; startedAt: number; updatedAt: number; completedAt: number | null; error: string | null }>;
+    const sessions = this.db.prepare(`SELECT session_id AS sessionId, coordinator_thread_id AS coordinatorThreadId, label, feature_branch AS featureBranch, state, total_tokens AS totalTokens, input_tokens AS inputTokens, cached_input_tokens AS cachedInputTokens, output_tokens AS outputTokens, reasoning_output_tokens AS reasoningOutputTokens, started_at AS startedAt, updated_at AS updatedAt, completed_at AS completedAt, error FROM orchestration_sessions ORDER BY started_at DESC LIMIT 100`).all() as Array<{ sessionId: string; coordinatorThreadId: string; label: string; featureBranch: string; state: string; totalTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number; startedAt: number; updatedAt: number; completedAt: number | null; error: string | null }>;
     const failures = this.db.prepare(`SELECT COALESCE(reason_code, 'uncategorized') AS reasonCode, COUNT(*) AS count FROM orchestration_events WHERE outcome = 'failed' OR reason_code IS NOT NULL GROUP BY COALESCE(reason_code, 'uncategorized') ORDER BY count DESC`).all() as Array<{ reasonCode: string; count: number }>;
-    const row = this.db.prepare(`SELECT COUNT(*) AS sessions, SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) AS completed, SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) AS failed, COALESCE(SUM(total_tokens), 0) AS totalTokens FROM orchestration_sessions`).get() as { sessions: number; completed: number | null; failed: number | null; totalTokens: number };
-    return { totals: { sessions: row.sessions, completed: row.completed ?? 0, failed: row.failed ?? 0, totalTokens: row.totalTokens }, failures, sessions };
+    const row = this.db.prepare(`SELECT COUNT(*) AS sessions, SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) AS completed, SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) AS failed, COALESCE(SUM(total_tokens), 0) AS totalTokens, COALESCE(SUM(input_tokens), 0) AS inputTokens, COALESCE(SUM(cached_input_tokens), 0) AS cachedInputTokens, COALESCE(SUM(output_tokens), 0) AS outputTokens, COALESCE(SUM(reasoning_output_tokens), 0) AS reasoningOutputTokens FROM orchestration_sessions`).get() as { sessions: number; completed: number | null; failed: number | null; totalTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number };
+    return { totals: { sessions: row.sessions, completed: row.completed ?? 0, failed: row.failed ?? 0, totalTokens: row.totalTokens, inputTokens: row.inputTokens, cachedInputTokens: row.cachedInputTokens, outputTokens: row.outputTokens, reasoningOutputTokens: row.reasoningOutputTokens }, failures, sessions };
   }
 
   addArtifact(input: Omit<ArtifactRecord, "id" | "createdAt">) {

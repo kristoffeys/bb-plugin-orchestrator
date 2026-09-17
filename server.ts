@@ -14,7 +14,7 @@ import {
   workerProfile,
   type WorkerProfile,
 } from "./lib/policy.ts";
-import { OrchestratorStore, type WorkstreamRecord } from "./lib/state.ts";
+import { OrchestratorStore, type RunRecord, type WorkstreamRecord } from "./lib/state.ts";
 import { parseNewThreadOrchestrationMarker } from "./lib/new-thread-marker.ts";
 import { worktreeHostContract } from "./lib/host-contract.ts";
 
@@ -121,9 +121,9 @@ export const rpcContract = defineRpcContract({
   policy_get: { input: z.null(), output: orchestrationPolicy },
   policy_set: { input: orchestrationPolicy, output: orchestrationPolicy },
   analytics_get: { input: z.null(), output: z.object({
-    totals: z.object({ sessions: z.number(), completed: z.number(), failed: z.number(), totalTokens: z.number() }),
+    totals: z.object({ sessions: z.number(), completed: z.number(), failed: z.number(), totalTokens: z.number(), inputTokens: z.number(), cachedInputTokens: z.number(), outputTokens: z.number(), reasoningOutputTokens: z.number() }),
     failures: z.array(z.object({ reasonCode: z.string(), count: z.number() })),
-    sessions: z.array(z.object({ sessionId: z.string(), coordinatorThreadId: z.string(), label: z.string(), featureBranch: z.string(), state: z.string(), totalTokens: z.number(), startedAt: z.number(), updatedAt: z.number(), completedAt: z.number().nullable(), error: z.string().nullable() })),
+    sessions: z.array(z.object({ sessionId: z.string(), coordinatorThreadId: z.string(), label: z.string(), featureBranch: z.string(), state: z.string(), totalTokens: z.number(), inputTokens: z.number(), cachedInputTokens: z.number(), outputTokens: z.number(), reasoningOutputTokens: z.number(), startedAt: z.number(), updatedAt: z.number(), completedAt: z.number().nullable(), error: z.string().nullable() })),
   }) },
 });
 
@@ -150,6 +150,25 @@ export const ORCHESTRATOR_MIGRATIONS = [
   `UPDATE runs SET session_id = coordinator_thread_id || ':' || created_at WHERE session_id IS NULL`,
   `UPDATE runs SET feature_branch = 'orchestrator/run-' || created_at WHERE feature_branch IS NULL`,
   `INSERT OR IGNORE INTO orchestration_sessions (session_id, coordinator_thread_id, label, feature_branch, allowed_project_ids_json, state, policy_json, total_tokens, started_at, updated_at, completed_at, error) SELECT session_id, coordinator_thread_id, label, feature_branch, allowed_project_ids_json, state, policy_json, total_tokens, created_at, updated_at, CASE WHEN state IN ('completed','failed','cancelled') THEN updated_at ELSE NULL END, error FROM runs`,
+  `ALTER TABLE workstreams ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE workstreams ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE workstreams ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE workstreams ADD COLUMN reasoning_output_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE orchestration_sessions ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE orchestration_sessions ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE orchestration_sessions ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE orchestration_sessions ADD COLUMN reasoning_output_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE runs ADD COLUMN coordinator_last_event_seq INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE runs ADD COLUMN coordinator_total_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE runs ADD COLUMN coordinator_input_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE runs ADD COLUMN coordinator_cached_input_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE runs ADD COLUMN coordinator_output_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE runs ADD COLUMN coordinator_reasoning_output_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE runs ADD COLUMN coordinator_baseline_total_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE runs ADD COLUMN coordinator_baseline_input_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE runs ADD COLUMN coordinator_baseline_cached_input_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE runs ADD COLUMN coordinator_baseline_output_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE runs ADD COLUMN coordinator_baseline_reasoning_output_tokens INTEGER NOT NULL DEFAULT 0`,
 ] as const;
 
 const workerAssignment = z.object({
@@ -198,6 +217,15 @@ const TERMINAL_WORKSTREAM_STATES = new Set(["completed", "failed", "cancelled"])
 const WORKER_IDLE_SETTLE_MS = 250;
 const COMPLETION_REMINDER = "Worker became idle without orchestrator_worker_done and was asked once to submit its structured completion record.";
 const ROUTE_RECOMMENDATION_MIN_SAMPLES = 5;
+const WORKSTREAM_ACTION_BUDGET: Record<WorkerProfile, number> = { quick: 20, standard: 40, complex: 60, critical: 80 };
+type TokenUsage = { totalTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number };
+
+const normalizeTokenUsage = (usage: TokenUsage): TokenUsage => {
+  const cachedIsIncludedInInput = usage.cachedInputTokens > 0
+    && usage.inputTokens >= usage.cachedInputTokens
+    && usage.inputTokens + usage.outputTokens <= usage.totalTokens;
+  return cachedIsIncludedInInput ? { ...usage, inputTokens: usage.inputTokens - usage.cachedInputTokens } : usage;
+};
 
 const wilsonLowerBound = (successes: number, samples: number) => {
   if (samples === 0) return 0;
@@ -398,6 +426,14 @@ export default async function plugin(bb: BbPluginApi) {
   const ROUTING_KEY = "provider-routes";
   const ROUTING_POLICY_KEY = "routing-policy";
   const POLICY_KEY = "orchestration-policy";
+  const TOKEN_BUDGET_MIGRATION_KEY = "token-budget-default-v1";
+  if (await bb.storage.kv.get(TOKEN_BUDGET_MIGRATION_KEY) !== true) {
+    const persistedPolicy = orchestrationPolicy.safeParse(await bb.storage.kv.get(POLICY_KEY));
+    if (persistedPolicy.success && persistedPolicy.data.tokenBudget === 0) {
+      await bb.storage.kv.set(POLICY_KEY, { ...persistedPolicy.data, tokenBudget: DEFAULT_POLICY.tokenBudget });
+    }
+    await bb.storage.kv.set(TOKEN_BUDGET_MIGRATION_KEY, true);
+  }
   const readRoutingSettings = async () => {
     const [rawRoutes, rawPolicy] = await Promise.all([bb.storage.kv.get(ROUTING_KEY), bb.storage.kv.get(ROUTING_POLICY_KEY)]);
     const hasLegacyPolicy = typeof rawPolicy === "object" && rawPolicy !== null && "profileReasoning" in rawPolicy;
@@ -599,7 +635,7 @@ export default async function plugin(bb: BbPluginApi) {
       ? "This delegated workstream is read-only. Do not edit files, create commits, or push. Report findings through messages/artifacts and worker_done."
       : "This is the sole mutating workstream in its project lane. Nested delegation is read-only only, so descendants cannot race this writer.";
     const planning = plannedStep === undefined ? "" : `\nPlan context:\n- Phase: ${plannedStep.phase ?? "unspecified"}.\n- Dependencies: ${plannedStep.dependsOn.length === 0 ? "none" : plannedStep.dependsOn.join(", ")}.\n- Success criteria: ${plannedStep.successCriteria?.length ? plannedStep.successCriteria.join("; ") : "use the assignment and completion contract"}.`;
-    return `${item.assignment}${planning}\n\nManaged workstream contract:\n- Work on the Orchestrator-owned feature branch ${JSON.stringify(run.featureBranch)}. This workstream shares one durable project worktree with this run's other ${item.projectId} workstreams. Preserve unrelated changes and do not switch branches or environments.\n- ${access}\n- You may delegate bounded read-only subtasks only with orchestrator_delegate; never spawn threads directly.\n- Commit mode is ${run.policy.commitMode}; push mode is ${run.policy.pushMode}; protected branches are ${JSON.stringify(protectedBranches)}. Protected branches cannot be committed to or pushed. Existing branches require separate explicit user approval for commits and pushes. Orchestrator-owned branches need no commit approval. Never push without explicit user approval.\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers.\n- Before ending, call orchestrator_worker_done exactly once with ordered commit SHAs, changed files, validation, and blockers. Parent completion is rejected while descendants are live. An idle turn without that record is treated as a failed workstream.`;
+    return `${item.assignment}${planning}\n\nManaged workstream contract:\n- Work on the Orchestrator-owned feature branch ${JSON.stringify(run.featureBranch)}. This workstream shares one durable project worktree with this run's other ${item.projectId} workstreams. Preserve unrelated changes and do not create, check out, or switch to another branch or environment.\n- ${access}\n- Keep the execution bounded to roughly ${WORKSTREAM_ACTION_BUDGET[item.profile]} tool actions. Read the smallest relevant surface, implement, and validate targeted behavior. If the scope cannot be completed within that budget, report a blocker or delegate a bounded read-only investigation instead of exhaustively exploring.\n- You may delegate bounded read-only subtasks only with orchestrator_delegate; never spawn threads directly.\n- Commit mode is ${run.policy.commitMode}; push mode is ${run.policy.pushMode}; protected branches are ${JSON.stringify(protectedBranches)}. Protected branches cannot be committed to or pushed. Existing branches require separate explicit user approval for commits and pushes. Orchestrator-owned branches need no commit approval. Never push without explicit user approval.\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers.\n- Before ending, call orchestrator_worker_done exactly once with ordered commit SHAs, changed files, validation, and blockers. Parent completion is rejected while descendants are live. An idle turn without that record is treated as a failed workstream.`;
   };
 
   const launchQueuedUnlocked = async (coordinatorThreadId: string, signal?: AbortSignal) => {
@@ -722,19 +758,35 @@ export default async function plugin(bb: BbPluginApi) {
   const refreshWorkstreamUsage = async (item: WorkstreamRecord) => {
     if (item.threadId === null) return item;
     try {
-      const rows = await bb.sdk.threads.events.list({ threadId: item.threadId, afterSeq: String(item.lastEventSeq), limit: "100", types: ["thread/tokenUsage/updated"] });
+      const missingBreakdown = item.totalTokens > 0 && item.inputTokens + item.cachedInputTokens + item.outputTokens + item.reasoningOutputTokens === 0;
+      const needsNormalization = item.inputTokens + item.cachedInputTokens + item.outputTokens > item.totalTokens;
+      const rows = await bb.sdk.threads.events.list({ threadId: item.threadId, order: "desc", limit: "1", types: ["thread/tokenUsage/updated"] });
       if (rows.length === 0) return item;
-      let tokens = item.totalTokens;
+      let usage = { totalTokens: item.totalTokens, inputTokens: item.inputTokens, cachedInputTokens: item.cachedInputTokens, outputTokens: item.outputTokens, reasoningOutputTokens: item.reasoningOutputTokens };
       let seq = item.lastEventSeq;
       for (const row of rows) {
         seq = Math.max(seq, row.seq);
-        if (row.type === "thread/tokenUsage/updated") tokens = row.data.tokenUsage.total.totalTokens;
+        if (row.type === "thread/tokenUsage/updated") usage = normalizeTokenUsage(row.data.tokenUsage.total);
       }
-      store.setUsage(item.coordinatorThreadId, item.key, tokens, seq);
+      if (!missingBreakdown && !needsNormalization && seq <= item.lastEventSeq) return item;
+      store.setUsage(item.coordinatorThreadId, item.key, usage, seq);
       return store.getWorkstream(item.coordinatorThreadId, item.key) ?? item;
     } catch (error) {
       bb.log.warn(`Could not refresh token usage for ${item.threadId}: ${error instanceof Error ? error.message : String(error)}`);
       return item;
+    }
+  };
+  const refreshCoordinatorUsage = async (run: RunRecord) => {
+    try {
+      const needsNormalization = run.coordinatorInputTokens + run.coordinatorCachedInputTokens + run.coordinatorOutputTokens > run.coordinatorTotalTokens;
+      const rows = await bb.sdk.threads.events.list({ threadId: run.coordinatorThreadId, order: "desc", limit: "1", types: ["thread/tokenUsage/updated"] });
+      const row = rows[0];
+      if (row === undefined || row.type !== "thread/tokenUsage/updated" || (!needsNormalization && row.seq <= run.coordinatorLastEventSeq)) return run;
+      store.setCoordinatorUsage(run.coordinatorThreadId, normalizeTokenUsage(row.data.tokenUsage.total), row.seq);
+      return store.getRun(run.coordinatorThreadId) ?? run;
+    } catch (error) {
+      bb.log.warn(`Could not refresh coordinator token usage for ${run.coordinatorThreadId}: ${error instanceof Error ? error.message : String(error)}`);
+      return run;
     }
   };
   const captureCompletionEvidence = async (item: WorkstreamRecord, threadId: string): Promise<z.output<typeof completionEvidence>> => {
@@ -1051,11 +1103,11 @@ export default async function plugin(bb: BbPluginApi) {
       if (policy.planningMode === "always" && steps.length === 0) {
         throw new Error("Planning mode is always, so even a small request needs explicit plan steps.");
       }
-      if (restart) store.resetRun(threadId);
+      const coordinatorBaseline = restart ? store.resetRun(threadId) : undefined;
       run = restart || run === null ? store.upsertRun({
         coordinatorThreadId: threadId, label: coordinatorMetadata.label,
         allowedProjectIds: coordinatorMetadata.allowedProjectIds, policy,
-      }) : run;
+      }, coordinatorBaseline) : run;
       const plan = store.setPlan({ coordinatorThreadId: threadId, scale, rationale, steps });
       store.recordEvent({ coordinatorThreadId: threadId, type: "plan.recorded", outcome: scale, details: { version: plan.version, stepCount: plan.steps.length, dependencyCount: plan.steps.reduce((sum, step) => sum + step.dependsOn.length, 0), restart } });
       return JSON.stringify({ plan, restarted: restart, fastPath: scale === "small" && steps.length === 0, planningMode: run.policy.planningMode });
@@ -1078,6 +1130,11 @@ export default async function plugin(bb: BbPluginApi) {
       });
       if (isTerminalRun(run.state)) throw new Error(`This Orchestrator run is ${run.state}. Start the next request with orchestrator_plan so it can reset the run and its timeout clock.`);
       if (assignments.length > run.policy.maxWorkersPerRun) throw new Error(`This run allows at most ${run.policy.maxWorkersPerRun} workstreams including descendants.`);
+      const existingKeys = new Set(store.listWorkstreams(threadId).map((item) => item.key));
+      const additionalKeys = assignments.filter((assignment) => !existingKeys.has(assignment.key)).length;
+      if (existingKeys.size + additionalKeys > run.policy.maxWorkersPerRun) {
+        throw new Error(`This session has already used ${existingKeys.size} distinct workstreams. Adding ${additionalKeys} would exceed the cumulative run cap of ${run.policy.maxWorkersPerRun}; finish this run and start a new feature session.`);
+      }
       const { selected } = await resolveProjects(coordinatorMetadata.allowedProjectIds);
       const projectsById = new Map(selected.map((project) => [project.id, project]));
       for (const assignment of assignments) {
@@ -1423,6 +1480,9 @@ export default async function plugin(bb: BbPluginApi) {
         const commits = new Set(result.commits);
         if (result.pushedCommits.some((sha) => !commits.has(sha))) throw new Error("Pushed commit SHAs must be included in this workstream's ordered commits.");
       }
+      if (result.branch?.ownership === "orchestrator" && result.branch.name !== run.featureBranch) {
+        throw new Error(`Orchestrator-owned commits must stay on the run branch ${run.featureBranch}; reported branch ${result.branch.name} is outside this run.`);
+      }
       const measuredItem = await refreshWorkstreamUsage(item);
       const evidence = await captureCompletionEvidence(measuredItem, threadId);
       const resultWithEvidence = { ...result, evidence };
@@ -1581,14 +1641,17 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.events.on("experimental_thread.events", async ({ thread }) => {
     const item = store.getWorkstreamByThread(thread.id);
-    if (item === null) return;
-    const refreshed = await refreshWorkstreamUsage(item);
-    if (refreshed.lastEventSeq === item.lastEventSeq) return;
-    const total = store.getRun(item.coordinatorThreadId)?.totalTokens ?? 0;
-    const run = store.getRun(item.coordinatorThreadId);
+    const coordinatorRun = store.getRun(thread.id);
+    const run = coordinatorRun === null ? (item === null ? null : store.getRun(item.coordinatorThreadId)) : await refreshCoordinatorUsage(coordinatorRun);
+    if (run === null) return;
+    if (item !== null) {
+      const refreshed = await refreshWorkstreamUsage(item);
+      if (refreshed.lastEventSeq === item.lastEventSeq) return;
+    }
+    const total = store.getRun(run.coordinatorThreadId)?.totalTokens ?? 0;
     if (run !== null && run.policy.tokenBudget > 0 && total > run.policy.tokenBudget) {
-      await notify(item.coordinatorThreadId, `Run token budget exceeded (${total}/${run.policy.tokenBudget}). Active workers were stopped.`);
-      await cleanupRun(item.coordinatorThreadId, "failed", `Token budget exceeded (${total}/${run.policy.tokenBudget}).`);
+      await notify(run.coordinatorThreadId, `Run token budget exceeded (${total}/${run.policy.tokenBudget}). Active workers were stopped.`);
+      await cleanupRun(run.coordinatorThreadId, "failed", `Token budget exceeded (${total}/${run.policy.tokenBudget}).`);
     }
   });
   for (const eventName of ["thread.archived", "thread.deleted"] as const) {
@@ -1609,9 +1672,13 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
   bb.background.schedule("cleanup-expired-runs", "*/5 * * * *", async () => {
+    await Promise.all(store.listRuns()
+      .filter((run) => !isTerminalRun(run.state) || run.coordinatorLastEventSeq === 0 || run.coordinatorInputTokens + run.coordinatorCachedInputTokens + run.coordinatorOutputTokens > run.coordinatorTotalTokens)
+      .map((run) => refreshCoordinatorUsage(run)));
     const terminal = store.listTerminalWorkstreams().filter((item) => item.threadId !== null && !retiredWorkerIds.has(item.threadId));
     for (const item of terminal) {
       try {
+        await refreshWorkstreamUsage(item);
         const thread = await bb.sdk.threads.get({ threadId: item.threadId! });
         if (thread.status === "idle" || thread.status === "error") {
           store.releaseProjectLane(item.coordinatorThreadId, item.key);
@@ -1693,7 +1760,7 @@ export default async function plugin(bb: BbPluginApi) {
       return {
         tools: ["orchestrator_delegate", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_worker_done"],
         skills: [],
-        instructions: `You are managed workstream ${JSON.stringify(parsed.data.key)} at depth ${parsed.data.depth} with ${parsed.data.accessMode} access. Delegate only bounded read-only children through orchestrator_delegate and never spawn threads directly. Commit mode: ${policy.commitMode}; push mode: ${policy.pushMode}; protected branches: ${JSON.stringify(effectiveProtectedBranches(policy))}. Existing branches require explicit user approval for commits and a separate explicit approval for pushes. Report ordered commit SHAs. Publish contracts early, communicate blockers, and call orchestrator_worker_done exactly once after every descendant is terminal.`,
+        instructions: `You are managed workstream ${JSON.stringify(parsed.data.key)} at depth ${parsed.data.depth} with ${parsed.data.accessMode} access. Stay on the run-owned branch ${JSON.stringify(run?.featureBranch ?? "unknown")}; do not create, check out, or switch branches. Keep work within roughly ${WORKSTREAM_ACTION_BUDGET[parsed.data.profile]} tool actions. Delegate only bounded read-only children through orchestrator_delegate and never spawn threads directly. Commit mode: ${policy.commitMode}; push mode: ${policy.pushMode}; protected branches: ${JSON.stringify(effectiveProtectedBranches(policy))}. Existing branches require explicit user approval for commits and a separate explicit approval for pushes. Report ordered commit SHAs. Publish contracts early, communicate blockers, and call orchestrator_worker_done exactly once after every descendant is terminal.`,
       };
     }
     if (context.thread.parentThreadId === null) {

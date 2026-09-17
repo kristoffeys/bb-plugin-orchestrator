@@ -512,6 +512,8 @@ test("a new plan resets a terminal run and direct dispatch cannot reuse its old 
     { assignments: [{ key: "old", projectId: "api", prompt: "Old task." }] },
     { threadId: "coord", projectId: "personal" },
   ) as string).workers[0];
+  state.eventRows.set("coord", [{ id: "old-session-usage", threadId: "coord", seq: 8, createdAt: Date.now(), scope: { kind: "thread" }, type: "thread/tokenUsage/updated", data: { providerThreadId: "provider-coordinator", tokenUsage: { last: { cachedInputTokens: 80, inputTokens: 90, outputTokens: 10, reasoningOutputTokens: 0, totalTokens: 100 }, total: { cachedInputTokens: 80, inputTokens: 90, outputTokens: 10, reasoningOutputTokens: 0, totalTokens: 100 }, modelContextWindow: 1000 } } }]);
+  await state.harness.behavior.emitThreadEvent("experimental_thread.events", { thread: state.threads.get("coord")!, sequence: 8 });
   await state.harness.behavior.callAgentTool("orchestrator_worker_done", {
     status: "failed", summary: "Old task failed.", changedFiles: [], validation: [], blockers: ["Old blocker"],
   }, { threadId: worker.threadId, projectId: "api" });
@@ -533,8 +535,13 @@ test("a new plan resets a terminal run and direct dispatch cannot reuse its old 
   assert.equal(planned.restarted, true);
   const after = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(after.run.state, "configured");
+  assert.equal(after.run.totalTokens, 0);
   assert.ok(after.run.createdAt > before.run.createdAt);
   assert.deepEqual(after.workstreams, []);
+  state.eventRows.set("coord", [{ id: "new-session-usage", threadId: "coord", seq: 10, createdAt: Date.now(), scope: { kind: "thread" }, type: "thread/tokenUsage/updated", data: { providerThreadId: "provider-coordinator", tokenUsage: { last: { cachedInputTokens: 40, inputTokens: 45, outputTokens: 5, reasoningOutputTokens: 0, totalTokens: 50 }, total: { cachedInputTokens: 120, inputTokens: 135, outputTokens: 15, reasoningOutputTokens: 0, totalTokens: 150 }, modelContextWindow: 1000 } } }]);
+  await state.harness.behavior.emitThreadEvent("experimental_thread.events", { thread: state.threads.get("coord")!, sequence: 10 });
+  const withNewUsage = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(withNewUsage.run.totalTokens, 50, "a restarted run counts only coordinator usage added after its baseline");
 });
 
 test("workers exchange handoffs and finish archives plus stops managed threads", async () => {
@@ -770,6 +777,29 @@ test("observed token usage enforces the run budget", async () => {
   assert.equal(status.run.state, "failed");
   assert.equal(status.run.totalTokens, 121);
   assert.ok(state.stopped.includes(workerId));
+  const analytics = await state.harness.behavior.callRpc("analytics_get", null) as { totals: Record<string, number> };
+  assert.deepEqual(analytics.totals, { sessions: 1, completed: 0, failed: 1, totalTokens: 121, inputTokens: 101, cachedInputTokens: 0, outputTokens: 20, reasoningOutputTokens: 0 });
+});
+
+test("coordinator token usage counts toward the run budget and learning data", async () => {
+  const state = await load();
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off", tokenBudget: 100 });
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "worker", projectId: "api", prompt: "Wait for coordination." }],
+  }, { threadId: "coord", projectId: "personal" }) as string);
+  state.eventRows.set("coord", [{
+    id: "coordinator-token-event", threadId: "coord", seq: 9, createdAt: Date.now(), scope: { kind: "thread" },
+    type: "thread/tokenUsage/updated",
+    data: { providerThreadId: "provider-coordinator", tokenUsage: { last: { cachedInputTokens: 80, inputTokens: 90, outputTokens: 11, reasoningOutputTokens: 2, totalTokens: 101 }, total: { cachedInputTokens: 80, inputTokens: 90, outputTokens: 11, reasoningOutputTokens: 2, totalTokens: 101 }, modelContextWindow: 1000 } },
+  }]);
+  await state.harness.behavior.emitThreadEvent("experimental_thread.events", { thread: state.threads.get("coord")!, sequence: 9 });
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.run.state, "failed");
+  assert.equal(status.run.totalTokens, 101);
+  assert.ok(state.stopped.includes(dispatched.workers[0].threadId));
+  const analytics = await state.harness.behavior.callRpc("analytics_get", null) as { totals: Record<string, number> };
+  assert.equal(analytics.totals.cachedInputTokens, 80);
+  assert.equal(analytics.totals.inputTokens, 10);
 });
 
 test("artifacts notify named consumers and remain in durable status", async () => {
@@ -995,6 +1025,20 @@ test("delegation enforces project, fan-out, depth, and total-run limits", async 
   }, { threadId: cappedRoot.threadId, projectId: "api" }), /run cap of 2/);
 });
 
+test("plan revisions cannot bypass the cumulative run workstream cap", async () => {
+  const state = await load();
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off", maxWorkersPerRun: 2 });
+  await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "first", projectId: "api", prompt: "First scope." }],
+  }, { threadId: "coord", projectId: "personal" });
+  await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "second", projectId: "api", prompt: "Revised scope." }],
+  }, { threadId: "coord", projectId: "personal" });
+  await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "third", projectId: "api", prompt: "Another revision." }],
+  }, { threadId: "coord", projectId: "personal" }), /already used 2 distinct workstreams.*cumulative run cap of 2/);
+});
+
 test("replacement and parent failure recursively clean up descendants", async () => {
   const state = await load();
   const root = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
@@ -1039,6 +1083,7 @@ test("commit policy defaults and protected branch normalization are durable and 
   assert.equal(DEFAULT_POLICY.commitMode, "owned-or-approved-existing");
   assert.equal(DEFAULT_POLICY.pushMode, "explicit-approval");
   assert.equal(DEFAULT_POLICY.planningMode, "auto");
+  assert.equal(DEFAULT_POLICY.tokenBudget, 40_000_000);
   assert.deepEqual(effectiveProtectedBranches(DEFAULT_POLICY), ["main", "develop"]);
   const parsed = parseOrchestrationPolicy({ ...DEFAULT_POLICY, protectedBranches: [" release ", "release", "master"] });
   assert.deepEqual(parsed.protectedBranches, ["release", "master"]);
@@ -1056,7 +1101,8 @@ async function commitPolicyWorker(policy: Partial<typeof DEFAULT_POLICY> = {}) {
   const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
     assignments: [{ key: "commit", projectId: "api", prompt: "Commit atomically." }],
   }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
-  return { state, worker };
+  const dashboard = await state.harness.behavior.callRpc("run_dashboard_get", { threadId: "coord" }) as { run: { featureBranch: string } };
+  return { state, worker, featureBranch: dashboard.run.featureBranch };
 }
 
 test("commit modes enforce owned, approved-existing, and disabled behavior", async () => {
@@ -1069,8 +1115,11 @@ test("commit modes enforce owned, approved-existing, and disabled behavior", asy
   await assert.rejects(ownedOnly.state.harness.behavior.callAgentTool("orchestrator_worker_done", {
     status: "success", summary: "Committed.", changedFiles: ["a.ts"], validation: [], blockers: [], commits: ["bbbbbbb"], branch: { name: "feature", ownership: "existing" }, commitApproval: { approvedByUser: true, evidence: "User approved commit." },
   }, { threadId: ownedOnly.worker.threadId, projectId: "api" }), /only on Orchestrator-owned/);
+  await assert.rejects(ownedOnly.state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "Wrong branch.", changedFiles: ["a.ts"], validation: [], blockers: [], commits: ["bbbbbbb"], branch: { name: "orchestrator/other", ownership: "orchestrator" },
+  }, { threadId: ownedOnly.worker.threadId, projectId: "api" }), /must stay on the run branch/);
   await ownedOnly.state.harness.behavior.callAgentTool("orchestrator_worker_done", {
-    status: "success", summary: "Two atomic commits.", changedFiles: ["a.ts"], validation: [], blockers: [], commits: ["bbbbbbb", "ccccccc"], branch: { name: "orchestrator/run", ownership: "orchestrator" },
+    status: "success", summary: "Two atomic commits.", changedFiles: ["a.ts"], validation: [], blockers: [], commits: ["bbbbbbb", "ccccccc"], branch: { name: ownedOnly.featureBranch, ownership: "orchestrator" },
   }, { threadId: ownedOnly.worker.threadId, projectId: "api" });
   const status = JSON.parse(await ownedOnly.state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
   assert.deepEqual(status.workstreams[0].result.commits, ["bbbbbbb", "ccccccc"]);
@@ -1103,7 +1152,7 @@ test("protected branches and push approval are enforced independently", async ()
   }, { threadId: pushDisabled.worker.threadId, projectId: "api" }), /Pushes are disabled/);
 
   const pushAllowed = await commitPolicyWorker({ protectedBranches: [] });
-  const pushed = { status: "success" as const, summary: "Push.", changedFiles: ["a.ts"], validation: [], blockers: [], commits: ["1234567"], pushedCommits: ["1234567"], branch: { name: "master", ownership: "orchestrator" as const } };
+  const pushed = { status: "success" as const, summary: "Push.", changedFiles: ["a.ts"], validation: [], blockers: [], commits: ["1234567"], pushedCommits: ["1234567"], branch: { name: pushAllowed.featureBranch, ownership: "orchestrator" as const } };
   await assert.rejects(pushAllowed.state.harness.behavior.callAgentTool("orchestrator_worker_done", pushed, { threadId: pushAllowed.worker.threadId, projectId: "api" }), /Every push requires separate explicit user approval/);
   await pushAllowed.state.harness.behavior.callAgentTool("orchestrator_worker_done", { ...pushed, pushApproval: { approvedByUser: true, evidence: "User explicitly approved this push." } }, { threadId: pushAllowed.worker.threadId, projectId: "api" });
 });
