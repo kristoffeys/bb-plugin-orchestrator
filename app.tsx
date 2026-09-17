@@ -6,12 +6,14 @@ import {
   useRealtime,
   useRpc,
   useBbNavigate,
+  useComposer,
   useComposerView,
   type PluginPendingInteractionProps,
   type PluginThreadHeaderActionProps,
   type PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server.ts";
+import { encodeNewThreadOrchestrationMarker } from "./lib/new-thread-marker.ts";
 
 const PROFILES = ["quick", "standard", "complex", "critical"] as const;
 type Profile = (typeof PROFILES)[number];
@@ -74,7 +76,7 @@ type DashboardWorkstream = {
 };
 type DashboardData = {
   available: boolean; coordinatorThreadId: string | null;
-  run: { label: string; state: string; createdAt: number; updatedAt: number; lastActivityAt: number; totalTokens: number; tokenBudget: number; error: string | null } | null;
+  run: { label: string; sessionId: string; featureBranch: string; state: string; createdAt: number; updatedAt: number; lastActivityAt: number; totalTokens: number; tokenBudget: number; error: string | null } | null;
   counts: { total: number; active: number; queued: number; completed: number; failed: number; reviewing: number };
   workstreams: DashboardWorkstream[];
   artifacts: Array<{ id: number; workstreamKey: string; kind: string; name: string; version: string | null; summary: string; path: string | null; createdAt: number }>;
@@ -700,7 +702,7 @@ function RunCommandCenter({ threadId }: PluginThreadPanelProps) {
       <header className="overflow-hidden rounded-lg border border-border bg-card">
         <div className="flex items-start justify-between gap-3 px-3 pb-3 pt-3"><div className="min-w-0"><div className="flex items-center gap-2"><span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${STATE_STYLE[data.run.state] ?? "bg-muted text-muted-foreground"}`}>{data.run.state.replaceAll("_", " ")}</span><span className="truncate text-[10px] text-muted-foreground">{new Date(data.run.updatedAt).toLocaleTimeString()}</span></div><h2 className="mt-1 truncate text-base font-semibold text-foreground">{data.run.label}</h2><p className={`mt-0.5 text-xs font-medium ${attention.length > 0 ? "text-destructive" : "text-muted-foreground"}`}>{pulse}</p></div><button type="button" onClick={() => void load()} disabled={refreshing} className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50" aria-label="Refresh run"><Icon name="RefreshCw" className={`size-3.5 ${refreshing ? "animate-spin" : ""}`} aria-hidden="true" /></button></div>
         <div className="grid grid-cols-4 border-t border-border bg-muted/15">{([['Moving', active.length], ['Waiting', waiting.length], ['Done', completed.length], ['Issues', attention.length]] as const).map(([label, value]) => <div key={label} className="border-r border-border px-2 py-2 text-center last:border-r-0"><p className={`text-sm font-semibold ${label === "Issues" && value > 0 ? "text-destructive" : "text-foreground"}`}>{value}</p><p className="text-[10px] text-muted-foreground">{label}</p></div>)}</div>
-        <div className="border-t border-border px-3 py-2"><div className="flex items-center justify-between text-[10px] text-muted-foreground"><span>{formatCount(data.run.totalTokens)} tokens</span><span>{budgetPercent === null ? "No budget" : `${budgetPercent}% of ${formatCount(data.run.tokenBudget)}`}</span></div>{budgetPercent === null ? null : <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-muted"><div className={`h-full rounded-full ${budgetPercent >= 90 ? "bg-destructive" : budgetPercent >= 70 ? "bg-amber-500" : "bg-primary"}`} style={{ width: `${budgetPercent}%` }} /></div>}</div>
+        <div className="border-t border-border px-3 py-2"><p className="mb-1.5 truncate font-mono text-[10px] text-muted-foreground" title={data.run.featureBranch}>{data.run.featureBranch}</p><div className="flex items-center justify-between text-[10px] text-muted-foreground"><span>{formatCount(data.run.totalTokens)} tokens</span><span>{budgetPercent === null ? "No budget" : `${budgetPercent}% of ${formatCount(data.run.tokenBudget)}`}</span></div>{budgetPercent === null ? null : <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-muted"><div className={`h-full rounded-full ${budgetPercent >= 90 ? "bg-destructive" : budgetPercent >= 70 ? "bg-amber-500" : "bg-primary"}`} style={{ width: `${budgetPercent}%` }} /></div>}</div>
         {data.run.error === null ? null : <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">{data.run.error}</p>}
       </header>
       {data.workstreams.length === 0 ? <p className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">No workstreams have been dispatched.</p> : <div className="space-y-4"><WorkstreamGroup title="Needs attention" items={attention} tone="attention" /><WorkstreamGroup title="In progress" items={active} /><WorkstreamGroup title="Waiting" items={waiting} /><WorkstreamGroup title="Completed" items={completed} /></div>}
@@ -718,6 +720,111 @@ function ComposerOrchestrationAction() {
       projectId=""
       isCompactViewport={view.layout === "compact"}
     />
+  );
+}
+
+function NewThreadOrchestrationAction() {
+  const view = useComposerView();
+  const composer = useComposer();
+  const rpc = useRpc<typeof rpcContract>();
+  const [open, setOpen] = useState(false);
+  const [projects, setProjects] = useState<ThreadOrchestrationState["projects"]>([]);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [label, setLabel] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [configured, setConfigured] = useState(false);
+  const [showAllProjects, setShowAllProjects] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  if (view.scope.kind !== "new-thread") return null;
+  const currentProjectId = view.scope.projectId;
+  const selectedProjects = new Set(selected);
+
+  const showConfiguration = async () => {
+    setOpen(true);
+    if (projects.length > 0 || loading) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await rpc.call("orchestration_projects", { currentProjectId });
+      setProjects(result.projects);
+      setSelected(result.selectedProjectIds);
+      setLabel(result.label);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not load projects.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggleProject = (projectId: string) => setSelected((current) => current.includes(projectId)
+    ? current.filter((id) => id !== projectId)
+    : [...current, projectId]);
+
+  const configure = () => {
+    if (view.draft.isEmpty) {
+      setError("Add the task to the composer before enabling orchestration.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      composer.insertMention({
+        provider: "orchestration",
+        id: encodeNewThreadOrchestrationMarker({ label: label.trim(), projectIds: selected }),
+        label: `Orchestrate · ${label.trim()}`,
+      });
+      setConfigured(true);
+      setOpen(false);
+      composer.focus();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not configure orchestration.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog.Root open={open} onOpenChange={setOpen}>
+      <Dialog.Trigger asChild>
+        <button
+          type="button"
+          aria-label={configured ? "Orchestration configured" : "Start with orchestration"}
+          title={configured ? "Orchestration configured" : "Start with orchestration"}
+          onClick={() => void showConfiguration()}
+          className={`relative grid size-9 place-items-center rounded-md outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring ${configured ? "bg-primary/12 text-primary" : "text-muted-foreground hover:bg-accent hover:text-foreground"}`}
+        >
+          <Icon name="Workflow" className="size-4" aria-hidden="true" />
+          {configured ? <span className="absolute right-1 top-1 size-1.5 rounded-full bg-primary ring-1 ring-background" /> : null}
+        </button>
+      </Dialog.Trigger>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-[2147483646] bg-background/70 backdrop-blur-[1px]" />
+        <Dialog.Content className="fixed left-1/2 top-1/2 z-[2147483647] max-h-[min(42rem,calc(100dvh-2rem))] w-[min(30rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-lg border border-border bg-popover p-5 text-popover-foreground shadow-xl outline-none">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <Dialog.Title className="text-base font-semibold text-foreground">Start with orchestration</Dialog.Title>
+              <Dialog.Description className="mt-1 text-xs leading-relaxed text-muted-foreground">The new thread starts as a coordinator and can create managed workers in the selected projects.</Dialog.Description>
+            </div>
+            <Dialog.Close asChild><button type="button" aria-label="Close orchestration settings" className="grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"><Icon name="X" className="size-4" aria-hidden="true" /></button></Dialog.Close>
+          </div>
+          {loading ? <p className="mt-5 text-sm text-muted-foreground">Loading projects…</p> : configured ? (
+            <div className="mt-5 rounded-md border border-primary/25 bg-primary/5 px-3 py-3 text-sm text-foreground">Orchestration is attached to this draft. Send it normally to create the coordinator.</div>
+          ) : (
+            <>
+              <label className="mt-5 block text-xs font-medium text-foreground" htmlFor="new-thread-orchestrator-label">Worker group label</label>
+              <input id="new-thread-orchestrator-label" value={label} maxLength={200} onChange={(event) => setLabel(event.target.value)} className="mt-1.5 h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring" />
+              <ProjectPicker projects={projects} selectedProjects={selectedProjects} expanded={showAllProjects} onExpandedChange={setShowAllProjects} onToggle={toggleProject} />
+              {error === null ? null : <p role="alert" className="mt-3 text-xs text-destructive">{error}</p>}
+              <div className="mt-5 flex justify-end border-t border-border pt-4">
+                <button type="button" disabled={busy || label.trim().length === 0 || selected.length === 0} onClick={configure} className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-45">{busy ? "Configuring…" : "Use orchestration"}</button>
+              </div>
+            </>
+          )}
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }
 
@@ -1021,6 +1128,42 @@ function RoutingSettings() {
   );
 }
 
+type AnalyticsData = {
+  totals: { sessions: number; completed: number; failed: number; totalTokens: number };
+  failures: Array<{ reasonCode: string; count: number }>;
+  sessions: Array<{ sessionId: string; coordinatorThreadId: string; label: string; featureBranch: string; state: string; totalTokens: number; startedAt: number; updatedAt: number; completedAt: number | null; error: string | null }>;
+};
+
+function LearningDataSettings() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [data, setData] = useState<AnalyticsData | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(async () => {
+    try { setData(await rpc.call("analytics_get", null) as AnalyticsData); setError(null); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "Could not load orchestration history."); }
+  }, [rpc]);
+  useEffect(() => { void load(); }, [load]);
+  if (error !== null) return <p role="alert" className="text-sm text-destructive">{error}</p>;
+  if (data === null) return <p className="text-sm text-muted-foreground">Loading orchestration history…</p>;
+  const completionRate = data.totals.sessions === 0 ? 0 : Math.round(data.totals.completed / data.totals.sessions * 100);
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        {([['Sessions', data.totals.sessions], ['Completed', `${completionRate}%`], ['Failed', data.totals.failed], ['Tokens', formatCount(data.totals.totalTokens)]] as const).map(([label, value]) => <div key={label} className="rounded-md border border-border bg-card p-3"><p className="text-lg font-semibold text-foreground">{value}</p><p className="text-xs text-muted-foreground">{label}</p></div>)}
+      </div>
+      <section>
+        <h3 className="mb-2 text-sm font-semibold text-foreground">Failure categories</h3>
+        {data.failures.length === 0 ? <p className="text-xs text-muted-foreground">No failures recorded.</p> : <div className="overflow-hidden rounded-md border border-border">{data.failures.map((item) => <div key={item.reasonCode} className="flex justify-between border-b border-border px-3 py-2 text-xs last:border-b-0"><span className="text-foreground">{item.reasonCode.replaceAll('_', ' ')}</span><span className="tabular-nums text-muted-foreground">{item.count}</span></div>)}</div>}
+      </section>
+      <section>
+        <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-semibold text-foreground">Recent sessions</h3><button type="button" onClick={() => void load()} className="text-xs font-medium text-primary">Refresh</button></div>
+        {data.sessions.length === 0 ? <p className="text-xs text-muted-foreground">No orchestration sessions recorded.</p> : <div className="overflow-hidden rounded-md border border-border">{data.sessions.slice(0, 25).map((session) => <div key={session.sessionId} className="border-b border-border px-3 py-2.5 last:border-b-0"><div className="flex items-center justify-between gap-2"><p className="truncate text-sm font-medium text-foreground">{session.label}</p><span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${STATE_STYLE[session.state] ?? 'bg-muted text-muted-foreground'}`}>{session.state.replaceAll('_', ' ')}</span></div><p className="mt-1 truncate font-mono text-[10px] text-muted-foreground" title={session.featureBranch}>{session.featureBranch}</p><p className="mt-1 text-[10px] text-muted-foreground">{new Date(session.startedAt).toLocaleString()} · {formatCount(session.totalTokens)} tokens{session.completedAt === null ? '' : ` · ${Math.max(0, Math.round((session.completedAt - session.startedAt) / 1000))}s`}</p>{session.error === null ? null : <p className="mt-1 line-clamp-2 text-xs text-destructive">{session.error}</p>}</div>)}</div>}
+      </section>
+      <p className="text-xs text-muted-foreground">History stores lifecycle metadata, routing, timing, token counts, validation summaries, changed-file evidence, and bounded failure details. Raw prompts and full conversations are excluded.</p>
+    </div>
+  );
+}
+
 export default definePluginApp((app) => {
   app.slots.pendingInteraction({ id: "dispatch-approval", component: DispatchApproval });
   app.slots.threadPanelAction({
@@ -1035,8 +1178,11 @@ export default definePluginApp((app) => {
   });
   app.composer.customize({
     id: "thread-orchestration",
-    scopes: ["thread"],
-    actions: [{ id: "configure", component: ComposerOrchestrationAction }],
+    scopes: ["thread", "new-thread"],
+    actions: [
+      { id: "configure", component: ComposerOrchestrationAction },
+      { id: "start-orchestrated", component: NewThreadOrchestrationAction },
+    ],
   });
   app.slots.experimental_threadHeaderAction({
     id: "thread-orchestration",
@@ -1054,5 +1200,11 @@ export default definePluginApp((app) => {
     title: "Worker model routing",
     description: "Map providers, models, and exact reasoning to cost-aware worker profiles.",
     component: RoutingSettings,
+  });
+  app.slots.settingsSection({
+    id: "learning-data",
+    title: "Orchestrator learning data",
+    description: "Inspect session outcomes, token usage, branches, and failure categories captured for improvement.",
+    component: LearningDataSettings,
   });
 });

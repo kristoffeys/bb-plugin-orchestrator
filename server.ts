@@ -15,11 +15,14 @@ import {
   type WorkerProfile,
 } from "./lib/policy.ts";
 import { OrchestratorStore, type WorkstreamRecord } from "./lib/state.ts";
+import { parseNewThreadOrchestrationMarker } from "./lib/new-thread-marker.ts";
+import { worktreeHostContract } from "./lib/host-contract.ts";
 
 const reasoningLevel = z.enum(["none", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"]);
 const permissionMode = z.enum(["auto", "accept-edits", "full"]);
 const serviceTier = z.enum(["default", "fast"]);
 const executionInputSource = z.enum(["explicit", "client-preference"]);
+const orchestratorWorktreeInputs = z.object({ branchName: z.string().min(1), baseRef: z.string().min(1).default("HEAD") }).strict();
 const attachment = z.discriminatedUnion("type", [
   z.object({ type: z.literal("image"), url: z.string().min(1) }),
   z.object({ type: z.literal("localImage"), path: z.string().min(1) }),
@@ -90,7 +93,7 @@ const dashboardWorkstream = z.object({
 const runDashboard = z.object({
   available: z.boolean(), coordinatorThreadId: z.string().nullable(),
   run: z.object({
-    label: z.string(), state: z.string(), createdAt: z.number(), updatedAt: z.number(), lastActivityAt: z.number(),
+    label: z.string(), sessionId: z.string(), featureBranch: z.string(), state: z.string(), createdAt: z.number(), updatedAt: z.number(), lastActivityAt: z.number(),
     totalTokens: z.number(), tokenBudget: z.number(), error: z.string().nullable(),
   }).nullable(),
   counts: z.object({ total: z.number(), active: z.number(), queued: z.number(), completed: z.number(), failed: z.number(), reviewing: z.number() }),
@@ -101,6 +104,13 @@ const runDashboard = z.object({
 export const rpcContract = defineRpcContract({
   start: { input: startInput, output: z.object({ threadId: z.string() }) },
   enable: { input: enableInput, output: z.object({ threadId: z.string() }) },
+  orchestration_projects: {
+    input: z.object({ currentProjectId: z.string().nullable() }),
+    output: z.object({
+      label: z.string(), selectedProjectIds: z.array(z.string()),
+      projects: z.array(z.object({ id: z.string(), name: z.string(), current: z.boolean() })),
+    }),
+  },
   thread_orchestration_get: { input: z.object({ threadId: z.string().min(1) }), output: threadOrchestrationState },
   run_dashboard_get: { input: z.object({ threadId: z.string().min(1) }), output: runDashboard },
   thread_orchestration_disable: { input: z.object({ threadId: z.string().min(1) }), output: z.null() },
@@ -110,6 +120,11 @@ export const rpcContract = defineRpcContract({
   routing_policy_set: { input: routingPolicy, output: routingPolicy },
   policy_get: { input: z.null(), output: orchestrationPolicy },
   policy_set: { input: orchestrationPolicy, output: orchestrationPolicy },
+  analytics_get: { input: z.null(), output: z.object({
+    totals: z.object({ sessions: z.number(), completed: z.number(), failed: z.number(), totalTokens: z.number() }),
+    failures: z.array(z.object({ reasonCode: z.string(), count: z.number() })),
+    sessions: z.array(z.object({ sessionId: z.string(), coordinatorThreadId: z.string(), label: z.string(), featureBranch: z.string(), state: z.string(), totalTokens: z.number(), startedAt: z.number(), updatedAt: z.number(), completedAt: z.number().nullable(), error: z.string().nullable() })),
+  }) },
 });
 
 export const ORCHESTRATOR_MIGRATIONS = [
@@ -127,6 +142,14 @@ export const ORCHESTRATOR_MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS workstreams_parent_idx ON workstreams(coordinator_thread_id, parent_key)`,
   `ALTER TABLE workstreams ADD COLUMN configured_reasoning_level TEXT NOT NULL DEFAULT 'model-default'`,
   `CREATE TABLE IF NOT EXISTS plans (coordinator_thread_id TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 1, scale TEXT NOT NULL, rationale TEXT NOT NULL, steps_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+  `ALTER TABLE runs ADD COLUMN session_id TEXT`,
+  `ALTER TABLE runs ADD COLUMN feature_branch TEXT`,
+  `CREATE TABLE IF NOT EXISTS orchestration_sessions (session_id TEXT PRIMARY KEY, coordinator_thread_id TEXT NOT NULL, label TEXT NOT NULL, feature_branch TEXT NOT NULL, allowed_project_ids_json TEXT NOT NULL, state TEXT NOT NULL, policy_json TEXT NOT NULL, total_tokens INTEGER NOT NULL DEFAULT 0, started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, completed_at INTEGER, error TEXT)`,
+  `CREATE TABLE IF NOT EXISTS orchestration_events (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, coordinator_thread_id TEXT NOT NULL, workstream_key TEXT, worker_thread_id TEXT, event_type TEXT NOT NULL, outcome TEXT, reason_code TEXT, duration_ms INTEGER, tokens INTEGER, details_json TEXT NOT NULL, created_at INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS orchestration_events_session_idx ON orchestration_events(session_id, created_at)`,
+  `UPDATE runs SET session_id = coordinator_thread_id || ':' || created_at WHERE session_id IS NULL`,
+  `UPDATE runs SET feature_branch = 'orchestrator/run-' || created_at WHERE feature_branch IS NULL`,
+  `INSERT OR IGNORE INTO orchestration_sessions (session_id, coordinator_thread_id, label, feature_branch, allowed_project_ids_json, state, policy_json, total_tokens, started_at, updated_at, completed_at, error) SELECT session_id, coordinator_thread_id, label, feature_branch, allowed_project_ids_json, state, policy_json, total_tokens, created_at, updated_at, CASE WHEN state IN ('completed','failed','cancelled') THEN updated_at ELSE NULL END, error FROM runs`,
 ] as const;
 
 const workerAssignment = z.object({
@@ -173,6 +196,18 @@ const GENERIC_PROMPT_HEADINGS = /^(?:task|request|goal|objective|instructions?|d
 const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled"]);
 const TERMINAL_WORKSTREAM_STATES = new Set(["completed", "failed", "cancelled"]);
 const WORKER_IDLE_SETTLE_MS = 250;
+const COMPLETION_REMINDER = "Worker became idle without orchestrator_worker_done and was asked once to submit its structured completion record.";
+const ROUTE_RECOMMENDATION_MIN_SAMPLES = 5;
+
+const wilsonLowerBound = (successes: number, samples: number) => {
+  if (samples === 0) return 0;
+  const z = 1.96;
+  const rate = successes / samples;
+  const denominator = 1 + z * z / samples;
+  const centre = rate + z * z / (2 * samples);
+  const margin = z * Math.sqrt((rate * (1 - rate) + z * z / (4 * samples)) / samples);
+  return (centre - margin) / denominator;
+};
 
 const isTerminalRun = (state: string) => TERMINAL_RUN_STATES.has(state);
 const isTerminalWorkstream = (state: string) => TERMINAL_WORKSTREAM_STATES.has(state);
@@ -247,6 +282,10 @@ const completionResult = z.object({
   commitApproval: z.object({ approvedByUser: z.literal(true), evidence: z.string().trim().min(1).max(2_000) }).optional(),
   pushedCommits: z.array(z.string().regex(/^[0-9a-f]{7,64}$/i, "Pushed commit SHAs must be hexadecimal.")).max(50).default([]),
   pushApproval: z.object({ approvedByUser: z.literal(true), evidence: z.string().trim().min(1).max(2_000) }).optional(),
+}).superRefine((result, ctx) => {
+  if (result.status === "success" && result.blockers.length > 0) {
+    ctx.addIssue({ code: "custom", path: ["blockers"], message: "Successful work cannot have blockers. Use status blocked, or move non-blocking limitations into the summary or validation notes." });
+  }
 });
 const artifactInput = z.object({
   kind: z.enum(["api-contract", "schema", "decision", "migration", "interface", "note"]),
@@ -318,6 +357,44 @@ export default async function plugin(bb: BbPluginApi) {
   const db = bb.storage.database();
   bb.storage.migrate(db, [...ORCHESTRATOR_MIGRATIONS]);
   const store = new OrchestratorStore(db);
+  const worktreeHost = bb.hosts.experimental_client({ contract: worktreeHostContract });
+  bb.experimental_environments.register({
+    id: "orchestrator-worktree",
+    displayName: "Orchestrator worktree",
+    description: "Create a run-owned worktree on a common cross-project feature branch.",
+    icon: "FolderGit",
+    requires: { projectCheckout: true },
+    inputs: orchestratorWorktreeInputs,
+    policy: { pathKeys: "per-attempt" },
+    async create(context) {
+      try {
+        const result = await worktreeHost.call("createWorktree", {
+          sourcePath: context.projectCheckout.path,
+          pathKey: context.pathKey,
+          branchName: context.inputs.branchName,
+          baseRef: context.inputs.baseRef,
+        }, { hostId: context.host.id, signal: context.signal });
+        const meta = metadataSchema.safeParse(await bb.sdk.threads.getPluginMetadata({ threadId: context.thread.id }));
+        if (meta.success && meta.data.role === "worker") store.recordEvent({
+          coordinatorThreadId: meta.data.coordinatorThreadId, type: "environment.created", workstreamKey: meta.data.key, workerThreadId: context.thread.id,
+          outcome: "created", details: { branchName: context.inputs.branchName, baseRef: context.inputs.baseRef, headSha: result.headSha, sourceBranch: result.sourceBranch, sourceDirty: result.sourceDirty },
+        });
+        return { status: "created" as const, path: result.path, ownsPath: true, mergeBaseBranch: result.headSha, resource: { sourcePath: context.projectCheckout.path } };
+      } catch (error) {
+        return { status: "failed" as const, message: error instanceof Error ? error.message : String(error) };
+      }
+    },
+    async remove(context) {
+      const sourcePath = typeof context.resource === "object" && context.resource !== null && !Array.isArray(context.resource) && typeof context.resource.sourcePath === "string" ? context.resource.sourcePath : null;
+      if (sourcePath === null || context.hostId === null || context.path === null) return { status: "failed" as const, message: "The Orchestrator worktree ownership record is incomplete." };
+      try {
+        await worktreeHost.call("removeWorktree", { sourcePath, path: context.path }, { hostId: context.hostId, signal: context.signal });
+        return { status: "removed" as const };
+      } catch (error) {
+        return { status: "failed" as const, message: error instanceof Error ? error.message : String(error) };
+      }
+    },
+  });
   const ROUTING_KEY = "provider-routes";
   const ROUTING_POLICY_KEY = "routing-policy";
   const POLICY_KEY = "orchestration-policy";
@@ -475,6 +552,19 @@ export default async function plugin(bb: BbPluginApi) {
     };
   };
 
+  const orchestrationProjectsFor = async (currentProjectId: string | null) => {
+    const allProjects = await bb.sdk.projects.list({ includePersonal: true });
+    const projects = allProjects
+      .filter((project) => project.kind !== "personal")
+      .map((project) => ({ id: project.id, name: project.name, current: project.id === currentProjectId }));
+    const current = projects.find((project) => project.current);
+    return {
+      label: current?.name ?? "Orchestrated work",
+      selectedProjectIds: current === undefined ? [] : [current.id],
+      projects,
+    };
+  };
+
   const workerExecution = async (coordinatorProviderId: string, profileId: WorkerProfile, assignmentReasoning?: z.output<typeof reasoningChoice>, inheritedRoute?: { providerId: string; model: string }) => {
     const routePolicy = await readRoutingPolicy();
     const target = inheritedRoute === undefined && routePolicy.strategy === "profile" ? routePolicy.profileRoutes[profileId] : null;
@@ -509,7 +599,7 @@ export default async function plugin(bb: BbPluginApi) {
       ? "This delegated workstream is read-only. Do not edit files, create commits, or push. Report findings through messages/artifacts and worker_done."
       : "This is the sole mutating workstream in its project lane. Nested delegation is read-only only, so descendants cannot race this writer.";
     const planning = plannedStep === undefined ? "" : `\nPlan context:\n- Phase: ${plannedStep.phase ?? "unspecified"}.\n- Dependencies: ${plannedStep.dependsOn.length === 0 ? "none" : plannedStep.dependsOn.join(", ")}.\n- Success criteria: ${plannedStep.successCriteria?.length ? plannedStep.successCriteria.join("; ") : "use the assignment and completion contract"}.`;
-    return `${item.assignment}${planning}\n\nManaged workstream contract:\n- This workstream shares one durable project environment with this run's other ${item.projectId} workstreams. Preserve unrelated changes and do not switch environments.\n- ${access}\n- You may delegate bounded read-only subtasks only with orchestrator_delegate; never spawn threads directly.\n- Commit mode is ${run.policy.commitMode}; push mode is ${run.policy.pushMode}; protected branches are ${JSON.stringify(protectedBranches)}. Protected branches cannot be committed to or pushed. Existing branches require separate explicit user approval for commits and pushes. Orchestrator-owned branches need no commit approval. Never push without explicit user approval.\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers.\n- Before ending, call orchestrator_worker_done exactly once with ordered commit SHAs, changed files, validation, and blockers. Parent completion is rejected while descendants are live. An idle turn without that record is treated as a failed workstream.`;
+    return `${item.assignment}${planning}\n\nManaged workstream contract:\n- Work on the Orchestrator-owned feature branch ${JSON.stringify(run.featureBranch)}. This workstream shares one durable project worktree with this run's other ${item.projectId} workstreams. Preserve unrelated changes and do not switch branches or environments.\n- ${access}\n- You may delegate bounded read-only subtasks only with orchestrator_delegate; never spawn threads directly.\n- Commit mode is ${run.policy.commitMode}; push mode is ${run.policy.pushMode}; protected branches are ${JSON.stringify(protectedBranches)}. Protected branches cannot be committed to or pushed. Existing branches require separate explicit user approval for commits and pushes. Orchestrator-owned branches need no commit approval. Never push without explicit user approval.\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers.\n- Before ending, call orchestrator_worker_done exactly once with ordered commit SHAs, changed files, validation, and blockers. Parent completion is rejected while descendants are live. An idle turn without that record is treated as a failed workstream.`;
   };
 
   const launchQueuedUnlocked = async (coordinatorThreadId: string, signal?: AbortSignal) => {
@@ -542,7 +632,14 @@ export default async function plugin(bb: BbPluginApi) {
         store.setWorkstreamState(coordinatorThreadId, item.key, "cancelled", { error: "Delegating parent is no longer live." });
         continue;
       }
-      const spawn = async (environment: { type: "project-default" } | { type: "reuse"; environmentId: string }) => bb.sdk.threads.spawn({
+      const project = (await bb.sdk.projects.list({ includePersonal: true })).find((candidate) => candidate.id === item.projectId);
+      const source = project?.sources.find((candidate) => candidate.isDefault) ?? project?.sources[0];
+      if (source === undefined) {
+        store.setWorkstreamState(coordinatorThreadId, item.key, "failed", { error: "No project checkout is configured for an Orchestrator worktree.", reasonCode: "checkout_missing" });
+        continue;
+      }
+      const freshEnvironment = { type: "provider" as const, environmentProviderId: "orchestrator-worktree", machine: { type: "existing" as const, hostId: source.hostId }, inputs: { branchName: run.featureBranch, baseRef: "HEAD" } };
+      const spawn = async (environment: typeof freshEnvironment | { type: "reuse"; environmentId: string }) => bb.sdk.threads.spawn({
           projectId: item.projectId,
           environment,
           parentThreadId: parent?.threadId ?? coordinatorThreadId,
@@ -561,7 +658,7 @@ export default async function plugin(bb: BbPluginApi) {
             reasoningLevel: item.reasoningLevel,
           },
         });
-      const spawnAttached = async (environment: { type: "project-default" } | { type: "reuse"; environmentId: string }) => {
+      const spawnAttached = async (environment: typeof freshEnvironment | { type: "reuse"; environmentId: string }) => {
         const provisional = await spawn(environment);
         try {
           const attached = await waitForEnvironmentAttachment({
@@ -580,12 +677,12 @@ export default async function plugin(bb: BbPluginApi) {
         let lease = store.getProjectEnvironment(coordinatorThreadId, item.projectId);
         let spawned: Awaited<ReturnType<typeof spawnAttached>>;
         try {
-          spawned = await spawnAttached(lease === null ? { type: "project-default" } : { type: "reuse", environmentId: lease.environmentId });
+          spawned = await spawnAttached(lease === null ? freshEnvironment : { type: "reuse", environmentId: lease.environmentId });
         } catch (error) {
           if (lease === null || (error instanceof Error && error.name === "AbortError")) throw error;
           store.clearProjectEnvironment(coordinatorThreadId, item.projectId);
           lease = null;
-          spawned = await spawnAttached({ type: "project-default" });
+          spawned = await spawnAttached(freshEnvironment);
         }
         store.setProjectEnvironment(coordinatorThreadId, item.projectId, spawned.environmentId);
         launched.push(store.setWorkstreamState(coordinatorThreadId, item.key, "running", { threadId: spawned.id, incrementAttempt: true })!);
@@ -595,6 +692,7 @@ export default async function plugin(bb: BbPluginApi) {
         const cancelled = error instanceof Error && error.name === "AbortError";
         store.setWorkstreamState(coordinatorThreadId, item.key, cancelled ? "cancelled" : "failed", {
           error: `Could not launch worker: ${error instanceof Error ? error.message : String(error)}`,
+          reasonCode: cancelled ? "provisioning_cancelled" : "provisioning_failed",
         });
         store.releaseProjectLane(coordinatorThreadId, item.key);
         if (cancelled) throw error;
@@ -621,6 +719,24 @@ export default async function plugin(bb: BbPluginApi) {
   };
 
   const clip = (value: string | null, limit: number) => value === null || value.length <= limit ? value : `${value.slice(0, limit)}\n…truncated`;
+  const refreshWorkstreamUsage = async (item: WorkstreamRecord) => {
+    if (item.threadId === null) return item;
+    try {
+      const rows = await bb.sdk.threads.events.list({ threadId: item.threadId, afterSeq: String(item.lastEventSeq), limit: "100", types: ["thread/tokenUsage/updated"] });
+      if (rows.length === 0) return item;
+      let tokens = item.totalTokens;
+      let seq = item.lastEventSeq;
+      for (const row of rows) {
+        seq = Math.max(seq, row.seq);
+        if (row.type === "thread/tokenUsage/updated") tokens = row.data.tokenUsage.total.totalTokens;
+      }
+      store.setUsage(item.coordinatorThreadId, item.key, tokens, seq);
+      return store.getWorkstream(item.coordinatorThreadId, item.key) ?? item;
+    } catch (error) {
+      bb.log.warn(`Could not refresh token usage for ${item.threadId}: ${error instanceof Error ? error.message : String(error)}`);
+      return item;
+    }
+  };
   const captureCompletionEvidence = async (item: WorkstreamRecord, threadId: string): Promise<z.output<typeof completionEvidence>> => {
     const environmentId = store.getProjectEnvironment(item.coordinatorThreadId, item.projectId)?.environmentId ?? null;
     const [outputResult, outlineResult, contextResult, timelineResult, storageResult, diffResult] = await Promise.allSettled([
@@ -629,7 +745,12 @@ export default async function plugin(bb: BbPluginApi) {
       bb.sdk.threads.context({ threadId }),
       bb.sdk.threads.timeline({ threadId, summaryOnly: "true", segmentLimit: "12" }),
       bb.sdk.threads.storageFiles({ threadId, limit: "25" }),
-      environmentId === null ? Promise.resolve(null) : bb.sdk.environments.diffFiles({ environmentId, target: "uncommitted" }),
+      environmentId === null ? Promise.resolve(null) : (async () => {
+        const environment = await bb.sdk.environments.get({ environmentId });
+        return environment.mergeBaseBranch === null
+          ? bb.sdk.environments.diffFiles({ environmentId, target: "uncommitted" })
+          : bb.sdk.environments.diffFiles({ environmentId, target: "all", mergeBaseBranch: environment.mergeBaseBranch });
+      })(),
     ]);
     const warnings: string[] = [];
     const warn = (label: string, result: PromiseSettledResult<unknown>) => {
@@ -731,6 +852,7 @@ export default async function plugin(bb: BbPluginApi) {
       return { threadId: thread.id };
     },
     enable,
+    orchestration_projects: async ({ currentProjectId }) => orchestrationProjectsFor(currentProjectId),
     thread_orchestration_get: async ({ threadId }) => threadOrchestrationStateFor(threadId),
     run_dashboard_get: async ({ threadId }) => {
       const value = await metadata(threadId);
@@ -771,7 +893,7 @@ export default async function plugin(bb: BbPluginApi) {
         available: true,
         coordinatorThreadId,
         run: {
-          label: run.label, state: run.state, createdAt: run.createdAt, updatedAt: run.updatedAt, lastActivityAt: run.lastActivityAt,
+          label: run.label, sessionId: run.sessionId, featureBranch: run.featureBranch, state: run.state, createdAt: run.createdAt, updatedAt: run.updatedAt, lastActivityAt: run.lastActivityAt,
           totalTokens: run.totalTokens, tokenBudget: run.policy.tokenBudget, error: run.error,
         },
         counts: {
@@ -804,9 +926,9 @@ export default async function plugin(bb: BbPluginApi) {
         averageTokens: item.samples === 0 ? 0 : Math.round(item.totalTokens / item.samples),
       }));
       const recommendations = workerProfile.options.flatMap((profileId) => {
-        const candidates = metrics.filter((item) => item.profile === profileId && item.samples >= 3).sort((left, right) => {
-          const leftRate = left.successes / left.samples; const rightRate = right.successes / right.samples;
-          if (leftRate !== rightRate) return rightRate - leftRate;
+        const candidates = metrics.filter((item) => item.profile === profileId && item.samples >= ROUTE_RECOMMENDATION_MIN_SAMPLES).sort((left, right) => {
+          const leftConfidence = wilsonLowerBound(left.successes, left.samples); const rightConfidence = wilsonLowerBound(right.successes, right.samples);
+          if (leftConfidence !== rightConfidence) return rightConfidence - leftConfidence;
           if (left.averageTokens !== right.averageTokens) return left.averageTokens - right.averageTokens;
           return left.averageDurationMs - right.averageDurationMs;
         });
@@ -814,7 +936,7 @@ export default async function plugin(bb: BbPluginApi) {
         return best === undefined ? [] : [{
           profile: profileId, providerId: best.providerId, model: best.model, samples: best.samples,
           successRate: best.successes / best.samples,
-          reason: `${best.successes}/${best.samples} successful; ${best.averageTokens.toLocaleString()} average tokens; ${Math.round(best.averageDurationMs / 1000)}s average runtime.`,
+          reason: `${best.successes}/${best.samples} successful; confidence-adjusted against routes with at least ${ROUTE_RECOMMENDATION_MIN_SAMPLES} samples; ${best.averageTokens.toLocaleString()} average tokens; ${Math.round(best.averageDurationMs / 1000)}s average runtime.`,
         }];
       });
       return { routes: await readRoutes(), policy: await readRoutingPolicy(), metrics, recommendations };
@@ -858,6 +980,41 @@ export default async function plugin(bb: BbPluginApi) {
       bb.realtime.publish("policy-changed", {});
       return input;
     },
+    analytics_get: async () => store.analytics(),
+  });
+
+  bb.ui.registerMentionProvider({
+    id: "orchestration",
+    label: "Orchestrator",
+    search: () => [],
+    resolve: async (itemId) => {
+      const marker = parseNewThreadOrchestrationMarker(itemId);
+      if (marker === null) throw new Error("This orchestration setup is invalid. Remove it and configure orchestration again.");
+      const [{ selected }, policy] = await Promise.all([resolveProjects(marker.projectIds), readPolicy()]);
+      return {
+        context: coordinatorPrompt(
+          marker.label,
+          selected,
+          "The user's message containing this Orchestrator marker is the verbatim task. Use the rest of that message as the request.",
+          policy,
+        ),
+      };
+    },
+  });
+
+  bb.experimental_hooks.on("message.dispatch", async (context) => {
+    if (context.attempt !== "start-turn" || context.thread.parentThreadId !== null) return { action: "proceed" };
+    const marker = context.input.blocks.flatMap((block) => block.type === "text" ? block.mentions : [])
+      .map((mention) => mention.resource)
+      .find((resource) => resource.kind === "plugin" && parseNewThreadOrchestrationMarker(resource.itemId) !== null);
+    if (marker === undefined || marker.kind !== "plugin") return { action: "proceed" };
+    const configuration = parseNewThreadOrchestrationMarker(marker.itemId);
+    if (configuration === null) return { action: "proceed" };
+    const existing = await metadata(context.thread.id);
+    if (existing?.role === "coordinator") return { action: "proceed" };
+    if (existing?.role === "worker") return { action: "reject", message: "A managed worker cannot become an Orchestrator coordinator." };
+    await enable({ threadId: context.thread.id, label: configuration.label, projectIds: configuration.projectIds });
+    return { action: "proceed" };
   });
 
   bb.agents.registerTool({
@@ -900,6 +1057,7 @@ export default async function plugin(bb: BbPluginApi) {
         allowedProjectIds: coordinatorMetadata.allowedProjectIds, policy,
       }) : run;
       const plan = store.setPlan({ coordinatorThreadId: threadId, scale, rationale, steps });
+      store.recordEvent({ coordinatorThreadId: threadId, type: "plan.recorded", outcome: scale, details: { version: plan.version, stepCount: plan.steps.length, dependencyCount: plan.steps.reduce((sum, step) => sum + step.dependsOn.length, 0), restart } });
       return JSON.stringify({ plan, restarted: restart, fastPath: scale === "small" && steps.length === 0, planningMode: run.policy.planningMode });
     },
   });
@@ -1265,13 +1423,14 @@ export default async function plugin(bb: BbPluginApi) {
         const commits = new Set(result.commits);
         if (result.pushedCommits.some((sha) => !commits.has(sha))) throw new Error("Pushed commit SHAs must be included in this workstream's ordered commits.");
       }
-      const evidence = await captureCompletionEvidence(item, threadId);
+      const measuredItem = await refreshWorkstreamUsage(item);
+      const evidence = await captureCompletionEvidence(measuredItem, threadId);
       const resultWithEvidence = { ...result, evidence };
       const review = result.status === "success" && (run.policy.evaluator === "always" || (run.policy.evaluator === "critical" && item.profile === "critical"));
       const state = result.status === "success" ? (review ? "reviewing" : "completed") : "failed";
-      const next = store.setWorkstreamState(meta.coordinatorThreadId, meta.key, state, { result: resultWithEvidence, error: result.status === "success" ? null : result.summary })!;
+      const next = store.setWorkstreamState(meta.coordinatorThreadId, meta.key, state, { result: resultWithEvidence, error: result.status === "success" ? null : result.summary, reasonCode: result.status === "success" ? null : result.status === "blocked" ? "worker_blocked" : "worker_reported_failure" })!;
       if (!review || result.status !== "success") {
-        store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: result.status === "success", durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
+        store.recordMetric({ providerId: measuredItem.providerId, model: measuredItem.model, profile: measuredItem.profile, succeeded: result.status === "success", durationMs: Math.max(0, Date.now() - (measuredItem.startedAt ?? measuredItem.createdAt)), totalTokens: measuredItem.totalTokens });
       }
       await notify(meta.coordinatorThreadId, `Workstream ${meta.key} ${review ? "is ready for review" : state}: ${result.summary}`, threadId);
       if (item.parentKey !== null) {
@@ -1308,7 +1467,7 @@ export default async function plugin(bb: BbPluginApi) {
         return JSON.stringify({ key, state: "completed" });
       }
       if (item.attemptCount >= run.policy.maxAttemptsPerWorkstream || item.threadId === null) {
-        store.setWorkstreamState(threadId, key, "failed", { error: feedback });
+        store.setWorkstreamState(threadId, key, "failed", { error: feedback, reasonCode: "evaluation_rejected" });
         store.releaseProjectLane(threadId, key);
         store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
         await launchQueued(threadId);
@@ -1380,8 +1539,15 @@ export default async function plugin(bb: BbPluginApi) {
     const settledLiveDescendants = store.listDescendants(item.coordinatorThreadId, item.key)
       .filter((child) => !isTerminalWorkstream(child.state));
     if (settledLiveDescendants.length > 0) return;
+    if (item.error !== COMPLETION_REMINDER) {
+      store.setWorkstreamState(item.coordinatorThreadId, item.key, "running", { error: COMPLETION_REMINDER, reasonCode: "completion_contract_reminder" });
+      store.recordEvent({ coordinatorThreadId: item.coordinatorThreadId, type: "worker.completion_reminder", workstreamKey: item.key, workerThreadId: thread.id, outcome: "sent", reasonCode: "completion_contract_missing", details: { hadAssistantOutput: lastAssistantText !== null && lastAssistantText.trim().length > 0 } });
+      await notify(thread.id, "Your workstream is still marked running because no structured completion was recorded. Review your work, then call orchestrator_worker_done exactly once with status, summary, changed files, validation, blockers, and commits. Do not make unrelated changes.", item.coordinatorThreadId);
+      return;
+    }
     store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", {
       error: "Worker became idle without a structured completion record.",
+      reasonCode: "completion_contract_missing",
       result: { status: "failed", summary: lastAssistantText ?? "No worker output was recorded.", changedFiles: [], validation: [], blockers: ["Missing orchestrator_worker_done call."] },
     });
     store.releaseProjectLane(item.coordinatorThreadId, item.key);
@@ -1397,11 +1563,15 @@ export default async function plugin(bb: BbPluginApi) {
     const run = store.getRun(item.coordinatorThreadId);
     if (run === null) return;
     if (item.attemptCount < run.policy.maxAttemptsPerWorkstream) {
-      store.setWorkstreamState(item.coordinatorThreadId, item.key, "running", { incrementAttempt: true, error: event.errorInfo === null ? "Provider turn failed." : `${event.errorInfo.category}${event.errorInfo.providerCode === null ? "" : ` (${event.errorInfo.providerCode})`}` });
+      const failure = event.errorInfo === null ? "Provider turn failed." : `${event.errorInfo.category}${event.errorInfo.providerCode === null ? "" : ` (${event.errorInfo.providerCode})`}`;
+      store.setWorkstreamState(item.coordinatorThreadId, item.key, "running", { incrementAttempt: true, error: failure });
+      store.recordEvent({ coordinatorThreadId: item.coordinatorThreadId, type: "worker.retry", workstreamKey: item.key, workerThreadId: event.threadId, outcome: "scheduled", reasonCode: event.errorInfo?.category ?? "provider_failure", details: { requestId: event.requestId, providerCode: event.errorInfo?.providerCode ?? null, nextAttempt: item.attemptCount + 1 } });
       await bb.sdk.threads.retry({ threadId: event.threadId, turnRequestId: event.requestId, reason: `Orchestrator retry ${item.attemptCount + 1}/${run.policy.maxAttemptsPerWorkstream}` });
       return;
     }
-    store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", { error: event.errorInfo === null ? "Provider turn failed and retry limit was reached." : `${event.errorInfo.category}${event.errorInfo.providerCode === null ? "" : ` (${event.errorInfo.providerCode})`}` });
+    const failure = event.errorInfo === null ? "Provider turn failed and retry limit was reached." : `${event.errorInfo.category}${event.errorInfo.providerCode === null ? "" : ` (${event.errorInfo.providerCode})`}`;
+    const evidence = await captureCompletionEvidence(item, event.threadId);
+    store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", { error: failure, reasonCode: event.errorInfo?.category ?? "provider_failure", result: { status: "failed", summary: failure, changedFiles: [], validation: [], blockers: [failure], commits: [], pushedCommits: [], evidence } });
     await cancelDescendants(item.coordinatorThreadId, item.key, "Parent worker exhausted its retry limit.");
     store.releaseProjectLane(item.coordinatorThreadId, item.key);
     store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
@@ -1412,15 +1582,9 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("experimental_thread.events", async ({ thread }) => {
     const item = store.getWorkstreamByThread(thread.id);
     if (item === null) return;
-    const rows = await bb.sdk.threads.events.list({ threadId: thread.id, afterSeq: String(item.lastEventSeq), limit: "100", types: ["thread/tokenUsage/updated"] });
-    if (rows.length === 0) return;
-    let tokens = item.totalTokens;
-    let seq = item.lastEventSeq;
-    for (const row of rows) {
-      seq = Math.max(seq, row.seq);
-      if (row.type === "thread/tokenUsage/updated") tokens = row.data.tokenUsage.total.totalTokens;
-    }
-    const total = store.setUsage(item.coordinatorThreadId, item.key, tokens, seq);
+    const refreshed = await refreshWorkstreamUsage(item);
+    if (refreshed.lastEventSeq === item.lastEventSeq) return;
+    const total = store.getRun(item.coordinatorThreadId)?.totalTokens ?? 0;
     const run = store.getRun(item.coordinatorThreadId);
     if (run !== null && run.policy.tokenBudget > 0 && total > run.policy.tokenBudget) {
       await notify(item.coordinatorThreadId, `Run token budget exceeded (${total}/${run.policy.tokenBudget}). Active workers were stopped.`);
@@ -1473,6 +1637,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
         store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", {
           error: "Reload reconciliation found an idle worker without a structured completion record.",
+          reasonCode: "completion_contract_missing",
           result: { status: "failed", summary: "No structured completion was recorded.", changedFiles: [], validation: [], blockers: ["Missing orchestrator_worker_done call."], commits: [], pushedCommits: [] },
         });
         await cancelDescendants(item.coordinatorThreadId, item.key, "Parent worker failed reload reconciliation.");
@@ -1487,7 +1652,7 @@ export default async function plugin(bb: BbPluginApi) {
     const timedOutThreadIds = timedOut.flatMap((item) => item.threadId === null ? [] : [item.threadId]);
     await stopWorkers(timedOutThreadIds);
     for (const item of timedOut) {
-      store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", { error: "Worker timeout was reached." });
+      store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", { error: "Worker timeout was reached.", reasonCode: "worker_timeout" });
       await cancelDescendants(item.coordinatorThreadId, item.key, "Parent worker timed out.");
       store.releaseProjectLane(item.coordinatorThreadId, item.key);
       store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });

@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
-import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadResponse, makeTurnFailedEvent } from "@get-bb/plugin-sdk/testing";
+import { createFakePluginHost, makeMessageDispatchHookContext, makePluginAgentConfigurationContext, makeThreadResponse, makeTurnFailedEvent } from "@get-bb/plugin-sdk/testing";
 import plugin, { deriveCoordinatorTitle, ORCHESTRATOR_MIGRATIONS, waitForEnvironmentAttachment } from "../server.ts";
 import { DEFAULT_POLICY, effectiveProtectedBranches, parseOrchestrationPolicy } from "../lib/policy.ts";
+import { encodeNewThreadOrchestrationMarker } from "../lib/new-thread-marker.ts";
 
 const projects = [
   { id: "personal", name: "Personal", kind: "personal", sources: [] },
-  { id: "api", name: "API", kind: "standard", sources: [{ path: "/repos/api", isDefault: true }] },
-  { id: "web", name: "Web", kind: "standard", sources: [{ path: "/repos/web", isDefault: true }] },
+  { id: "api", name: "API", kind: "standard", sources: [{ path: "/repos/api", isDefault: true, hostId: "host-local" }] },
+  { id: "web", name: "Web", kind: "standard", sources: [{ path: "/repos/web", isDefault: true, hostId: "host-local" }] },
 ];
 
 const model = (id: string, defaultReasoningEffort = "medium") => ({
@@ -53,6 +54,7 @@ async function load(providerId = "codex", options: { delayedAttachmentGets?: num
   const stopped: string[] = [];
   const retries: Array<Record<string, unknown>> = [];
   const eventRows = new Map<string, unknown[]>();
+  const environmentDiffInputs: Array<Record<string, unknown>> = [];
   const attachmentTargets = new Map<string, string>();
   const attachmentGets = new Map<string, number>();
   let nextId = 1;
@@ -160,15 +162,20 @@ async function load(providerId = "codex", options: { delayedAttachmentGets?: num
         },
       } as never,
       environments: {
-        diffFiles: async ({ environmentId }: { environmentId: string }) => ({
-          environmentId, outcome: "available", shortstat: "", mergeBaseRef: null, truncated: false, files: [],
-        }) as never,
+        get: async ({ environmentId }: { environmentId: string }) => ({ id: environmentId, mergeBaseBranch: "base-sha" }) as never,
+        diffFiles: async (input: Record<string, unknown>) => {
+          environmentDiffInputs.push(input);
+          const environmentId = String(input.environmentId);
+          return ({
+          environmentId, outcome: "available", shortstat: "", mergeBaseRef: "base-sha", truncated: false, files: [],
+          }) as never;
+        },
       } as never,
     },
   });
   await plugin(bb);
   await harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off" });
-  return { bb, harness, metadata, threads, spawned, sent, archived, stopped, retries, eventRows };
+  return { bb, harness, metadata, threads, spawned, sent, archived, stopped, retries, eventRows, environmentDiffInputs };
 }
 
 test("start creates a personal coordinator titled from its task", async () => {
@@ -192,6 +199,26 @@ test("start creates a personal coordinator titled from its task", async () => {
   assert.match(text, /one at a time in a shared project environment/);
   assert.match(text, /read-only descendants/);
   assert.match(text, /protected branches \["main","develop"\]/);
+});
+
+test("a new-thread orchestration marker enables the coordinator before first dispatch", async () => {
+  const state = await load();
+  const marker = encodeNewThreadOrchestrationMarker({ label: "New product run", projectIds: ["api", "web"] });
+  const context = makeMessageDispatchHookContext({
+    thread: makeThreadResponse({ id: "fresh", projectId: "api", parentThreadId: null }),
+    input: {
+      text: "Ship the feature.",
+      blocks: [{ type: "text", text: "Ship the feature.", mentions: [{ start: 0, end: 12, resource: { kind: "plugin", pluginId: "orchestrator", itemId: `orchestration:${marker}`, label: "Orchestrate" } }] }],
+    },
+  });
+  state.threads.set("fresh", context.thread);
+  state.metadata.set("fresh", {});
+  const hook = state.harness.inspection.registrations.hooks["message.dispatch"];
+  assert.ok(hook !== null);
+  assert.deepEqual(await hook(context), { action: "proceed" });
+  assert.deepEqual(state.metadata.get("fresh"), { role: "coordinator", label: "New product run", allowedProjectIds: ["api", "web"] });
+  assert.equal((await state.harness.behavior.callRpc("run_dashboard_get", { threadId: "fresh" }) as { available: boolean }).available, true);
+  assert.deepEqual(await hook(context), { action: "proceed" });
 });
 
 test("coordinator titles skip prompt scaffolding and remain compact", () => {
@@ -249,8 +276,9 @@ test("run dashboard combines live worker state with captured completion evidence
   assert.equal(completed.workstreams[0]?.evidence?.output, "Worker output.");
   assert.equal(completed.workstreams[0]?.evidence?.storage?.rootPath, "/thread-storage");
   assert.deepEqual(completed.workstreams[0]?.evidence?.environmentDiff, {
-    environmentId: "env-api", outcome: "available", shortstat: "", mergeBaseRef: null, truncated: false, files: [], message: null,
+    environmentId: "env-api", outcome: "available", shortstat: "", mergeBaseRef: "base-sha", truncated: false, files: [], message: null,
   });
+  assert.deepEqual(state.environmentDiffInputs.at(-1), { environmentId: "env-api", target: "all", mergeBaseBranch: "base-sha" });
 });
 
 test("large plans run independent investigations in parallel and gate dependent mutation", async () => {
@@ -324,10 +352,13 @@ test("same-project workstreams serialize and share the captured project environm
   ]) as string);
   assert.deepEqual(first.workers.map((worker: { action: string }) => worker.action), ["spawned", "queued", "spawned"]);
   assert.deepEqual(first.workers.map((worker: { state: string }) => worker.state), ["running", "queued", "running"]);
-  assert.deepEqual(state.spawned.map((input) => input.environment), [
-    { type: "project-default" },
-    { type: "project-default" },
-  ]);
+  const initialEnvironments = state.spawned.map((input) => input.environment as { type: string; environmentProviderId: string; machine: { hostId: string }; inputs: { branchName: string; baseRef: string } });
+  assert.equal(initialEnvironments[0]?.type, "provider");
+  assert.equal(initialEnvironments[0]?.environmentProviderId, "orchestrator-worktree");
+  assert.equal(initialEnvironments[0]?.machine.hostId, "host-local");
+  assert.equal(initialEnvironments[0]?.inputs.baseRef, "HEAD");
+  assert.match(initialEnvironments[0]?.inputs.branchName ?? "", /^orchestrator\/product-/);
+  assert.equal(initialEnvironments[0]?.inputs.branchName, initialEnvironments[1]?.inputs.branchName, "all repositories use the same feature branch name");
   assert.equal(state.spawned[0]?.model, "gpt-5.6-luna");
   assert.equal(state.spawned[1]?.model, "gpt-5.6-terra");
 
@@ -441,6 +472,10 @@ test("transient idle between bootstrap and the real turn does not fail a worker"
 
   thread.status = "idle";
   await state.harness.behavior.emitThreadEvent("thread.idle", { thread, lastAssistantText: "Stopped without reporting." });
+  status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.workstreams[0].state, "running");
+  assert.ok(state.sent.some((message) => message.threadId === worker.threadId && message.text.includes("orchestrator_worker_done")));
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread, lastAssistantText: "Still stopped without reporting." });
   status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(status.workstreams[0].state, "failed");
   assert.deepEqual(status.workstreams[0].result.blockers, ["Missing orchestrator_worker_done call."]);
@@ -706,6 +741,10 @@ test("provider failure exhausts retries and advances the same-project queue", as
   const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(status.workstreams[0].state, "failed");
   assert.equal(status.workstreams[1].state, "running");
+  const analytics = await state.harness.behavior.callRpc("analytics_get", null) as { totals: { sessions: number }; failures: Array<{ reasonCode: string; count: number }>; sessions: Array<{ featureBranch: string }> };
+  assert.equal(analytics.totals.sessions, 1);
+  assert.match(analytics.sessions[0]?.featureBranch ?? "", /^orchestrator\/product-/);
+  assert.ok(analytics.failures.some((failure) => failure.reasonCode === "provider_failure" && failure.count >= 1));
 });
 
 test("observed token usage enforces the run budget", async () => {
@@ -871,11 +910,11 @@ test("a stale durable environment lease is cleared and reprovisioned", async () 
   }, { threadId: "coord", projectId: "personal" }) as string);
   await state.harness.behavior.callAgentTool("orchestrator_worker_done", { status: "success", summary: "First done.", changedFiles: [], validation: [], blockers: [] }, { threadId: dispatched.workers[0].threadId, projectId: "api" });
   await state.harness.behavior.emitThreadEvent("thread.idle", { thread: state.threads.get(dispatched.workers[0].threadId)!, lastAssistantText: "Done." });
-  assert.deepEqual(state.spawned.map((item) => item.environment), [
-    { type: "project-default" },
-    { type: "reuse", environmentId: "env-api" },
-    { type: "project-default" },
-  ]);
+  const environments = state.spawned.map((item) => item.environment as { type: string; environmentId?: string; inputs?: { branchName: string } });
+  assert.equal(environments[0]?.type, "provider");
+  assert.deepEqual(environments[1], { type: "reuse", environmentId: "env-api" });
+  assert.equal(environments[2]?.type, "provider");
+  assert.equal(environments[0]?.inputs?.branchName, environments[2]?.inputs?.branchName, "reprovisioning keeps the run branch");
   assert.ok(state.stopped.includes("spawned-2"));
   const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(status.workstreams[1].state, "running");
@@ -984,6 +1023,16 @@ test("read-only descendants cannot report writes or commits", async () => {
   await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_worker_done", {
     status: "success", summary: "I wrote.", changedFiles: ["x.ts"], validation: [], blockers: [], commits: ["abcdef1"], branch: { name: "feature", ownership: "orchestrator" },
   }, { threadId: child.threadId, projectId: "api" }), /Read-only/);
+});
+
+test("successful completion cannot report unresolved blockers", async () => {
+  const state = await load();
+  const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "quality", projectId: "api", prompt: "Finish cleanly." }],
+  }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "Mostly done.", changedFiles: [], validation: [], blockers: ["Production verification is still missing."],
+  }, { threadId: worker.threadId, projectId: "api" }), /Successful work cannot have blockers/);
 });
 
 test("commit policy defaults and protected branch normalization are durable and replaceable", async () => {

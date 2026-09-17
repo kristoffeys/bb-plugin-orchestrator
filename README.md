@@ -27,6 +27,12 @@ As an alternative, asking the agent to enable orchestration exposes the
 `orchestrator_enable` tool. Opt-in keeps routine threads from acquiring
 worker-management tools by default.
 
+On the New thread screen, use the workflow button beside Send to choose the
+worker projects and attach orchestration to the draft. Sending through the
+normal composer preserves the selected provider, model, reasoning, permission
+mode, environment, attachments, and mentions; the thread is initialized as a
+coordinator before its first turn starts.
+
 Before workers start, the coordinator records a durable size decision through
 `orchestrator_plan`. The default `auto` mode keeps bounded work fast: a request
 is small only when it touches at most one project, needs at most two independent
@@ -45,10 +51,15 @@ succeeds and the project's single-writer lane opens. A failed prerequisite
 cancels its blocked dependents with a durable reason. Dispatch must match the
 current plan version, so scope or dependency changes require a plan revision.
 
-Each run provisions one project-default environment for every project it
-touches and records the environment id durably. Later workstreams,
-replacements, and retries for that project reuse it, so they see the same
-branch and working tree. Only one workstream per project runs at a time;
+Each run creates one shared feature branch name, such as
+`orchestrator/checkout-flow-mabc123`, across every repository it touches. The
+first worker for each project receives a dedicated Git worktree on that branch,
+and the environment id is recorded durably. If the configured source checkout
+has staged, unstaged, or untracked changes, those changes remain untouched in
+the source checkout; the worker starts from its committed `HEAD` in a clean
+worktree. Later workstreams, replacements, and retries for that project reuse
+the worktree, so they see the same branch and files. Only one mutating
+workstream per project runs at a time;
 different projects can use the configured parallel capacity concurrently.
 Queued and running states remain distinct in dispatch results and durable
 status, including after a plugin reload. Status also reports the snapshotted
@@ -103,6 +114,15 @@ snapshots this policy when orchestration is enabled, so changing global defaults
 never changes a run already in progress.
 
 Planning mode is configurable as `off`, `auto` (default), or `always`.
+
+Orchestrator keeps a durable learning record after a run ends. Open
+**Settings → Installed Plugins → Orchestrator → Orchestrator learning data** to
+inspect session completion rates, token totals, feature branches, duration,
+and failure categories. The event log also captures plan revisions,
+workstream lifecycle and queue timing, provider/model/profile routing, retries,
+validation summaries, changed-file evidence, environment base state, and
+bounded failure evidence. Raw prompts and full conversations are excluded from
+analytics by default.
 
 Commit policy is declarative and persisted in the run snapshot:
 
