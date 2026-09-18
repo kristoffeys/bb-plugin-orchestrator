@@ -1129,9 +1129,9 @@ function RoutingSettings() {
 }
 
 type AnalyticsData = {
-  totals: { sessions: number; completed: number; failed: number; totalTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number };
+  totals: { sessions: number; completed: number; failed: number; totalTokens: number; coordinatorTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number };
   failures: Array<{ reasonCode: string; count: number }>;
-  sessions: Array<{ sessionId: string; coordinatorThreadId: string; label: string; featureBranch: string; state: string; totalTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number; startedAt: number; updatedAt: number; completedAt: number | null; error: string | null }>;
+  sessions: Array<{ sessionId: string; coordinatorThreadId: string; label: string; featureBranch: string; state: string; totalTokens: number; coordinatorTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number; startedAt: number; updatedAt: number; completedAt: number | null; error: string | null }>;
 };
 
 function LearningDataSettings() {
@@ -1150,12 +1150,13 @@ function LearningDataSettings() {
   const inputTokens = data.totals.inputTokens + data.totals.cachedInputTokens;
   const cachedPercent = inputTokens === 0 ? 0 : Math.round(data.totals.cachedInputTokens / inputTokens * 1000) / 10;
   const breakdownCoverage = data.totals.totalTokens === 0 ? 0 : Math.min(100, Math.round(categorizedTokens / data.totals.totalTokens * 1000) / 10);
+  const coordinatorPercent = data.totals.totalTokens === 0 ? 0 : Math.round(data.totals.coordinatorTokens / data.totals.totalTokens * 1000) / 10;
   return (
     <div className="space-y-5">
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
         {([['Sessions', data.totals.sessions], ['Completed', `${completionRate}%`], ['Failed', data.totals.failed], ['Tokens', formatCount(data.totals.totalTokens)]] as const).map(([label, value]) => <div key={label} className="rounded-md border border-border bg-card p-3"><p className="text-lg font-semibold text-foreground">{value}</p><p className="text-xs text-muted-foreground">{label}</p></div>)}
       </div>
-      <div className="rounded-md border border-border bg-card p-3"><div className="flex items-center justify-between gap-3"><div><p className="text-sm font-semibold text-foreground">Token composition</p><p className="mt-0.5 text-xs text-muted-foreground">Provider-reported totals; cached input is cheaper than fresh input but still signals repeated context processing. Breakdown coverage: {breakdownCoverage}%.</p></div><span className="text-sm font-semibold text-foreground">{cachedPercent}% cached</span></div><div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4"><span>Fresh input <strong>{formatCount(data.totals.inputTokens)}</strong></span><span>Cached input <strong>{formatCount(data.totals.cachedInputTokens)}</strong></span><span>Output <strong>{formatCount(data.totals.outputTokens)}</strong></span><span>Reasoning <strong>{formatCount(data.totals.reasoningOutputTokens)}</strong></span></div></div>
+      <div className="rounded-md border border-border bg-card p-3"><div className="flex items-center justify-between gap-3"><div><p className="text-sm font-semibold text-foreground">Token composition</p><p className="mt-0.5 text-xs text-muted-foreground">Provider-reported totals; cached input is cheaper than fresh input but still signals repeated context processing. Breakdown coverage: {breakdownCoverage}%.</p></div><div className="text-right text-sm font-semibold text-foreground"><div>{cachedPercent}% cached</div><div>{coordinatorPercent}% coordinator</div></div></div><div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4"><span>Fresh input <strong>{formatCount(data.totals.inputTokens)}</strong></span><span>Cached input <strong>{formatCount(data.totals.cachedInputTokens)}</strong></span><span>Output <strong>{formatCount(data.totals.outputTokens)}</strong></span><span>Reasoning <strong>{formatCount(data.totals.reasoningOutputTokens)}</strong></span></div></div>
       <section>
         <h3 className="mb-2 text-sm font-semibold text-foreground">Failure categories</h3>
         {data.failures.length === 0 ? <p className="text-xs text-muted-foreground">No failures recorded.</p> : <div className="overflow-hidden rounded-md border border-border">{data.failures.map((item) => <div key={item.reasonCode} className="flex justify-between border-b border-border px-3 py-2 text-xs last:border-b-0"><span className="text-foreground">{item.reasonCode.replaceAll('_', ' ')}</span><span className="tabular-nums text-muted-foreground">{item.count}</span></div>)}</div>}

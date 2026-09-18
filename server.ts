@@ -121,9 +121,9 @@ export const rpcContract = defineRpcContract({
   policy_get: { input: z.null(), output: orchestrationPolicy },
   policy_set: { input: orchestrationPolicy, output: orchestrationPolicy },
   analytics_get: { input: z.null(), output: z.object({
-    totals: z.object({ sessions: z.number(), completed: z.number(), failed: z.number(), totalTokens: z.number(), inputTokens: z.number(), cachedInputTokens: z.number(), outputTokens: z.number(), reasoningOutputTokens: z.number() }),
+    totals: z.object({ sessions: z.number(), completed: z.number(), failed: z.number(), totalTokens: z.number(), coordinatorTokens: z.number(), inputTokens: z.number(), cachedInputTokens: z.number(), outputTokens: z.number(), reasoningOutputTokens: z.number() }),
     failures: z.array(z.object({ reasonCode: z.string(), count: z.number() })),
-    sessions: z.array(z.object({ sessionId: z.string(), coordinatorThreadId: z.string(), label: z.string(), featureBranch: z.string(), state: z.string(), totalTokens: z.number(), inputTokens: z.number(), cachedInputTokens: z.number(), outputTokens: z.number(), reasoningOutputTokens: z.number(), startedAt: z.number(), updatedAt: z.number(), completedAt: z.number().nullable(), error: z.string().nullable() })),
+    sessions: z.array(z.object({ sessionId: z.string(), coordinatorThreadId: z.string(), label: z.string(), featureBranch: z.string(), state: z.string(), totalTokens: z.number(), coordinatorTokens: z.number(), inputTokens: z.number(), cachedInputTokens: z.number(), outputTokens: z.number(), reasoningOutputTokens: z.number(), startedAt: z.number(), updatedAt: z.number(), completedAt: z.number().nullable(), error: z.string().nullable() })),
   }) },
 });
 
@@ -169,6 +169,8 @@ export const ORCHESTRATOR_MIGRATIONS = [
   `ALTER TABLE runs ADD COLUMN coordinator_baseline_cached_input_tokens INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE runs ADD COLUMN coordinator_baseline_output_tokens INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE runs ADD COLUMN coordinator_baseline_reasoning_output_tokens INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE orchestration_sessions ADD COLUMN coordinator_tokens INTEGER NOT NULL DEFAULT 0`,
+  `UPDATE orchestration_sessions SET coordinator_tokens = COALESCE((SELECT coordinator_total_tokens FROM runs WHERE runs.session_id = orchestration_sessions.session_id), 0)`,
 ] as const;
 
 const workerAssignment = z.object({
@@ -1371,10 +1373,10 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.agents.registerTool({
     name: "orchestrator_status",
-    description: "Read durable state, structured results, limits, and artifacts for this run.",
+    description: "Read bounded durable state, structured results, limits, and artifacts for this run. Compact detail is the normal coordination view; request full only for a specific debugging need.",
     presentation: { label: { pending: "Reading orchestration status", completed: "Read orchestration status" } },
-    parameters: z.object({}),
-    async execute(_input, { threadId }) {
+    parameters: z.object({ detail: z.enum(["compact", "full"]).default("compact") }),
+    async execute({ detail }, { threadId }) {
       const meta = await metadata(threadId);
       if (meta === null) throw new Error("This thread is not in a managed run.");
       const coordinatorThreadId = meta.role === "coordinator" ? threadId : meta.coordinatorThreadId;
@@ -1386,14 +1388,40 @@ export default async function plugin(bb: BbPluginApi) {
         effectiveReasoningLevel: item.reasoningLevel,
         environmentId: environmentByProject.get(item.projectId) ?? null,
       }));
-      return JSON.stringify({
+      const full = {
         run: store.getRun(coordinatorThreadId),
         plan: store.getPlan(coordinatorThreadId),
         routing: { policy: routingPolicyValue, configuredRoutes },
         environments,
         workstreams,
         artifacts: store.listArtifacts(coordinatorThreadId),
-      });
+      };
+      const compactResult = (value: unknown) => {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+        const result = value as Record<string, unknown>;
+        const strings = (key: string, limit: number) => Array.isArray(result[key]) ? result[key].filter((item): item is string => typeof item === "string").slice(0, limit) : [];
+        return {
+          status: typeof result.status === "string" ? result.status : null,
+          summary: typeof result.summary === "string" ? clip(result.summary, 2_000) : null,
+          changedFiles: strings("changedFiles", 100),
+          validation: Array.isArray(result.validation) ? result.validation.slice(0, 30) : [],
+          blockers: strings("blockers", 30), commits: strings("commits", 50), pushedCommits: strings("pushedCommits", 50),
+          branch: result.branch ?? null,
+        };
+      };
+      const payload = detail === "full" ? full : {
+        ...full,
+        plan: full.plan === null ? null : {
+          version: full.plan.version, scale: full.plan.scale, rationale: clip(full.plan.rationale, 1_000),
+          createdAt: full.plan.createdAt, updatedAt: full.plan.updatedAt,
+          steps: full.plan.steps.map(({ prompt: _prompt, successCriteria: _successCriteria, ...step }) => step),
+        },
+        workstreams: full.workstreams.map(({ assignment: _assignment, result, ...item }) => ({ ...item, result: compactResult(result) })),
+        artifacts: full.artifacts.map(({ content: _content, ...artifact }) => artifact),
+      };
+      const output = JSON.stringify(payload);
+      store.recordEvent({ coordinatorThreadId, type: "coordinator.status", outcome: detail, details: { bytes: Buffer.byteLength(output), workstreamCount: workstreams.length } });
+      return output;
     },
   });
 
@@ -1492,7 +1520,6 @@ export default async function plugin(bb: BbPluginApi) {
       if (!review || result.status !== "success") {
         store.recordMetric({ providerId: measuredItem.providerId, model: measuredItem.model, profile: measuredItem.profile, succeeded: result.status === "success", durationMs: Math.max(0, Date.now() - (measuredItem.startedAt ?? measuredItem.createdAt)), totalTokens: measuredItem.totalTokens });
       }
-      await notify(meta.coordinatorThreadId, `Workstream ${meta.key} ${review ? "is ready for review" : state}: ${result.summary}`, threadId);
       if (item.parentKey !== null) {
         const parent = store.getWorkstream(meta.coordinatorThreadId, item.parentKey);
         if (parent?.threadId !== null && parent?.threadId !== undefined) {
@@ -1553,14 +1580,20 @@ export default async function plugin(bb: BbPluginApi) {
     async execute({ workerThreadIds }, { threadId }) {
       await requireCoordinator(threadId);
       const all = store.listWorkstreams(threadId);
+      const plan = store.getPlan(threadId);
+      const desiredRoots = plan !== null && plan.steps.length > 0 ? new Set(plan.steps.map((step) => step.key)) : null;
+      const relevant = desiredRoots === null ? all : all.filter((item) => item.parentKey === null
+        ? desiredRoots.has(item.key)
+        : [...desiredRoots].some((root) => item.key.startsWith(`${root}/`)));
+      const relevantKeys = new Set(relevant.map((item) => item.key));
       const managed = new Set(all.flatMap((item) => item.threadId === null ? [] : [item.threadId]));
       for (const id of workerThreadIds) if (!managed.has(id)) throw new Error(`Thread ${id} is not a managed worker.`);
-      const unsettled = all.filter((item) => !["completed", "failed", "cancelled"].includes(item.state));
+      const unsettled = relevant.filter((item) => !["completed", "failed", "cancelled"].includes(item.state));
       if (unsettled.length > 0) throw new Error(`Cannot finish while workstreams are unsettled: ${unsettled.map((item) => item.key).join(", ")}.`);
       await Promise.allSettled([...managed].map(retireWorker));
       for (const item of all) store.releaseProjectLane(threadId, item.key);
-      store.setRunState(threadId, all.some((item) => item.state === "failed") ? "failed" : "completed");
-      return JSON.stringify({ retired: [...managed], state: store.getRun(threadId)?.state });
+      store.setRunState(threadId, relevant.some((item) => item.state === "failed") ? "failed" : "completed");
+      return JSON.stringify({ retired: [...managed], state: store.getRun(threadId)?.state, ignoredHistoricalFailures: all.filter((item) => item.state === "failed" && !relevantKeys.has(item.key)).map((item) => item.key) });
     },
   });
 
@@ -1751,7 +1784,7 @@ export default async function plugin(bb: BbPluginApi) {
       return {
         tools: ["orchestrator_plan", "orchestrator_dispatch", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_review", "orchestrator_finish"],
         skills: [],
-        instructions: "You are a managed Orchestrator coordinator. The plugin is the single lifecycle writer. First classify the request with orchestrator_plan: small requests take the fast path, while large requests need a dependency-aware global plan and may begin with parallel read-only investigation. Dispatch the complete current plan with stable keys. Use the cheapest adequate profile, durable status, and artifacts; finish only when every workstream is terminal.",
+        instructions: "You are a managed Orchestrator coordinator. The plugin is the single lifecycle writer. First classify the request with orchestrator_plan: small requests take the fast path, while large requests need a dependency-aware global plan and may begin with parallel read-only investigation. Dispatch the complete current plan with stable keys. Use the cheapest adequate profile, durable status, and artifacts; finish only when every workstream is terminal. Orchestrator status is compact by default. Do not use shell sleeps or repeatedly poll status while workers run; completion notices wake you automatically, after which one status read is enough.",
       };
     }
     if (parsed.success && parsed.data.role === "worker") {
@@ -1760,7 +1793,7 @@ export default async function plugin(bb: BbPluginApi) {
       return {
         tools: ["orchestrator_delegate", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_worker_done"],
         skills: [],
-        instructions: `You are managed workstream ${JSON.stringify(parsed.data.key)} at depth ${parsed.data.depth} with ${parsed.data.accessMode} access. Stay on the run-owned branch ${JSON.stringify(run?.featureBranch ?? "unknown")}; do not create, check out, or switch branches. Keep work within roughly ${WORKSTREAM_ACTION_BUDGET[parsed.data.profile]} tool actions. Delegate only bounded read-only children through orchestrator_delegate and never spawn threads directly. Commit mode: ${policy.commitMode}; push mode: ${policy.pushMode}; protected branches: ${JSON.stringify(effectiveProtectedBranches(policy))}. Existing branches require explicit user approval for commits and a separate explicit approval for pushes. Report ordered commit SHAs. Publish contracts early, communicate blockers, and call orchestrator_worker_done exactly once after every descendant is terminal.`,
+        instructions: `You are managed workstream ${JSON.stringify(parsed.data.key)} at depth ${parsed.data.depth} with ${parsed.data.accessMode} access. Stay on the run-owned branch ${JSON.stringify(run?.featureBranch ?? "unknown")}; do not create, check out, or switch branches. Keep work within roughly ${WORKSTREAM_ACTION_BUDGET[parsed.data.profile]} tool actions. Delegate only bounded read-only children through orchestrator_delegate and never spawn threads directly. Commit mode: ${policy.commitMode}; push mode: ${policy.pushMode}; protected branches: ${JSON.stringify(effectiveProtectedBranches(policy))}. Existing branches require explicit user approval for commits and a separate explicit approval for pushes. Report ordered commit SHAs. Publish contracts early and communicate blockers or handoffs while work is active, but do not send a separate message that merely repeats the final worker_done result. Call orchestrator_worker_done exactly once after every descendant is terminal.`,
       };
     }
     if (context.thread.parentThreadId === null) {

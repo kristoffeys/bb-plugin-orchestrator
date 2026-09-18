@@ -505,6 +505,24 @@ test("reconciling a new desired set preserves terminal workstream outcomes", asy
   assert.deepEqual(investigation.result.blockers, ["No access"]);
 });
 
+test("finish evaluates the current plan without erasing obsolete failure history", async () => {
+  const state = await load();
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "auto", evaluator: "never" });
+  const investigate = { key: "investigate", projectId: "api", prompt: "Investigate.", accessMode: "read-only" as const };
+  await state.harness.behavior.callAgentTool("orchestrator_plan", { scale: "large", rationale: "Investigate before implementation.", steps: [investigate] }, { threadId: "coord", projectId: "personal" });
+  const first = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [investigate] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", { status: "failed", summary: "Optional investigation unavailable.", changedFiles: [], validation: [], blockers: ["No checkout"] }, { threadId: first.threadId, projectId: "api" });
+  const implement = { key: "implement", projectId: "web", prompt: "Implement the verified fix." };
+  await state.harness.behavior.callAgentTool("orchestrator_plan", { scale: "large", rationale: "Proceed without the optional repository.", steps: [implement] }, { threadId: "coord", projectId: "personal" });
+  const second = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [implement] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", { status: "success", summary: "Implemented.", changedFiles: ["fix.ts"], validation: [], blockers: [] }, { threadId: second.threadId, projectId: "web" });
+  const finished = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_finish", { workerThreadIds: [first.threadId, second.threadId] }, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(finished.state, "completed");
+  assert.deepEqual(finished.ignoredHistoricalFailures, ["investigate"]);
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.workstreams.find((item: { key: string }) => item.key === "investigate").state, "failed");
+});
+
 test("a new plan resets a terminal run and direct dispatch cannot reuse its old clock", async () => {
   const state = await load();
   const worker = JSON.parse(await state.harness.behavior.callAgentTool(
@@ -569,7 +587,7 @@ test("workers exchange handoffs and finish archives plus stops managed threads",
   );
   assert.equal(state.spawned[0]?.model, "claude-haiku-4-5-20251001");
   assert.equal(state.sent[0]?.text, "The endpoint is GET /v2/items.");
-  assert.match(state.sent[1]?.text ?? "", /Workstream api completed/);
+  assert.equal(state.sent.length, 1, "worker_done relies on BB's child completion notice instead of sending a duplicate");
   assert.deepEqual(state.archived, [workerId]);
   assert.deepEqual(state.stopped, [workerId]);
 });
@@ -778,7 +796,7 @@ test("observed token usage enforces the run budget", async () => {
   assert.equal(status.run.totalTokens, 121);
   assert.ok(state.stopped.includes(workerId));
   const analytics = await state.harness.behavior.callRpc("analytics_get", null) as { totals: Record<string, number> };
-  assert.deepEqual(analytics.totals, { sessions: 1, completed: 0, failed: 1, totalTokens: 121, inputTokens: 101, cachedInputTokens: 0, outputTokens: 20, reasoningOutputTokens: 0 });
+  assert.deepEqual(analytics.totals, { sessions: 1, completed: 0, failed: 1, totalTokens: 121, coordinatorTokens: 0, inputTokens: 101, cachedInputTokens: 0, outputTokens: 20, reasoningOutputTokens: 0 });
 });
 
 test("coordinator token usage counts toward the run budget and learning data", async () => {
@@ -800,6 +818,7 @@ test("coordinator token usage counts toward the run budget and learning data", a
   const analytics = await state.harness.behavior.callRpc("analytics_get", null) as { totals: Record<string, number> };
   assert.equal(analytics.totals.cachedInputTokens, 80);
   assert.equal(analytics.totals.inputTokens, 10);
+  assert.equal(analytics.totals.coordinatorTokens, 101);
 });
 
 test("artifacts notify named consumers and remain in durable status", async () => {
@@ -820,6 +839,11 @@ test("artifacts notify named consumers and remain in durable status", async () =
   assert.ok(state.sent.some((item) => item.threadId === frontend && item.text.includes("Items API")));
   const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(status.artifacts[0].version, "v2");
+  assert.equal(status.artifacts[0].content, undefined);
+  assert.equal(status.workstreams[0].assignment, undefined);
+  const full = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", { detail: "full" }, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(full.artifacts[0].content, "{items: Item[]}");
+  assert.equal(full.workstreams[0].assignment, "Define API.");
 });
 
 test("critical dispatch approval and evaluator review are enforced", async () => {

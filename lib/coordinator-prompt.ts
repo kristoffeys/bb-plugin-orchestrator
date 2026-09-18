@@ -83,7 +83,11 @@ Protocol:
    structured completion records; queued work starts automatically when both
    global capacity and its project lane open, and failures retry only within
    the configured attempt limit. Do not poll raw thread output or create
-   replacement loops.
+   replacement loops. Status is compact by default; request full detail only
+   to debug a specific missing field. Do not use shell sleep commands or call
+   status repeatedly while workers are running. Worker messages and completion
+   notices wake this coordinator automatically; after a notice, read status
+   once and act on the changed workstream.
 
    Workers may delegate read-only descendants through \`orchestrator_delegate\`
    to depth ${policy.maxDelegationDepth}, with at most ${policy.maxChildrenPerWorker}
