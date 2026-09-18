@@ -210,11 +210,13 @@ export class OrchestratorStore {
         first_dispatch_approved AS firstDispatchApproved, error
       FROM runs WHERE coordinator_thread_id = ?
     `).get(coordinatorThreadId) as RunRow | undefined;
-    return row === undefined ? null : {
-      ...row,
-      allowedProjectIds: parseJson<string[]>(row.allowedProjectIdsJson),
-      policy: parseOrchestrationPolicy({ planningMode: "off", ...parseJson<Record<string, unknown>>(row.policyJson) }),
-      firstDispatchApproved: row.firstDispatchApproved === 1,
+    if (row === undefined) return null;
+    const { allowedProjectIdsJson, policyJson, firstDispatchApproved, ...record } = row;
+    return {
+      ...record,
+      allowedProjectIds: parseJson<string[]>(allowedProjectIdsJson),
+      policy: parseOrchestrationPolicy({ planningMode: "off", ...parseJson<Record<string, unknown>>(policyJson) }),
+      firstDispatchApproved: firstDispatchApproved === 1,
     };
   }
 
@@ -262,7 +264,9 @@ export class OrchestratorStore {
         steps_json AS stepsJson, created_at AS createdAt, updated_at AS updatedAt
       FROM plans WHERE coordinator_thread_id = ?
     `).get(coordinatorThreadId) as (Omit<PlanRecord, "steps"> & { stepsJson: string }) | undefined;
-    return row === undefined ? null : { ...row, steps: parseJson<PlanStepRecord[]>(row.stepsJson) };
+    if (row === undefined) return null;
+    const { stepsJson, ...record } = row;
+    return { ...record, steps: parseJson<PlanStepRecord[]>(stepsJson) };
   }
 
   listExpiredRuns(now: number) {
@@ -321,7 +325,9 @@ export class OrchestratorStore {
         result_json AS resultJson, error
       FROM workstreams WHERE coordinator_thread_id = ? AND key = ?
     `).get(coordinatorThreadId, key) as WorkstreamRow | undefined;
-    return row === undefined ? null : { ...row, result: row.resultJson === null ? null : parseJson(row.resultJson) };
+    if (row === undefined) return null;
+    const { resultJson, ...record } = row;
+    return { ...record, result: resultJson === null ? null : parseJson(resultJson) };
   }
 
   getWorkstreamByThread(threadId: string): WorkstreamRecord | null {
@@ -519,7 +525,7 @@ export class OrchestratorStore {
         kind, name, version, summary, content, path, consumers_json AS consumersJson, created_at AS createdAt
       FROM artifacts WHERE coordinator_thread_id = ? ORDER BY created_at, id
     `).all(coordinatorThreadId) as ArtifactRow[];
-    return rows.map((row) => ({ ...row, consumers: parseJson<string[]>(row.consumersJson) }));
+    return rows.map(({ consumersJson, ...row }) => ({ ...row, consumers: parseJson<string[]>(consumersJson) }));
   }
 
   recordMetric(input: { providerId: string; model: string; profile: WorkerProfile; succeeded: boolean; durationMs: number; totalTokens: number }) {

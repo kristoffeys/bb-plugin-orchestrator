@@ -844,6 +844,10 @@ test("artifacts notify named consumers and remain in durable status", async () =
   const full = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", { detail: "full" }, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(full.artifacts[0].content, "{items: Item[]}");
   assert.equal(full.workstreams[0].assignment, "Define API.");
+  assert.equal(full.run.allowedProjectIdsJson, undefined);
+  assert.equal(full.run.policyJson, undefined);
+  assert.equal(full.workstreams[0].resultJson, undefined);
+  assert.equal(full.artifacts[0].consumersJson, undefined);
 });
 
 test("critical dispatch approval and evaluator review are enforced", async () => {
