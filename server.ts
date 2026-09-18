@@ -210,6 +210,36 @@ const planInput = z.object({
     }
   }
 });
+const planKey = z.string().trim().min(1).max(100).regex(/^[^/]+$/, "Keys cannot contain '/'.");
+const planUpdateInput = z.object({
+  expectedVersion: z.number().int().min(1),
+  scale: z.enum(["small", "large"]).optional(),
+  rationale: z.string().trim().min(1).max(2_000).optional(),
+  upsertSteps: z.array(workerAssignment).max(50).default([]),
+  removeKeys: z.array(planKey).max(50).default([]),
+}).superRefine((update, ctx) => {
+  if (update.scale === undefined && update.rationale === undefined && update.upsertSteps.length === 0 && update.removeKeys.length === 0) {
+    ctx.addIssue({ code: "custom", message: "A plan update must change metadata, upsert a step, or remove a step." });
+  }
+  if (new Set(update.upsertSteps.map((step) => step.key)).size !== update.upsertSteps.length) {
+    ctx.addIssue({ code: "custom", path: ["upsertSteps"], message: "Upserted plan step keys must be unique." });
+  }
+  if (new Set(update.removeKeys).size !== update.removeKeys.length) {
+    ctx.addIssue({ code: "custom", path: ["removeKeys"], message: "Removed plan step keys must be unique." });
+  }
+  const removed = new Set(update.removeKeys);
+  for (const [index, step] of update.upsertSteps.entries()) if (removed.has(step.key)) {
+    ctx.addIssue({ code: "custom", path: ["upsertSteps", index, "key"], message: "A plan step cannot be upserted and removed in the same update." });
+  }
+});
+const dispatchInput = z.object({
+  assignments: z.array(workerAssignment).max(50).refine((items) => new Set(items.map((item) => item.key)).size === items.length, "Worker keys must be unique.").optional(),
+  planVersion: z.number().int().min(1).optional(),
+}).superRefine((input, ctx) => {
+  if ((input.assignments === undefined) === (input.planVersion === undefined)) {
+    ctx.addIssue({ code: "custom", message: "Provide either complete assignments or one durable planVersion." });
+  }
+});
 type WorkerAssignment = z.infer<typeof workerAssignment>;
 
 const THREAD_TITLE_LIMIT = 80;
@@ -1111,26 +1141,97 @@ export default async function plugin(bb: BbPluginApi) {
         allowedProjectIds: coordinatorMetadata.allowedProjectIds, policy,
       }, coordinatorBaseline) : run;
       const plan = store.setPlan({ coordinatorThreadId: threadId, scale, rationale, steps });
-      store.recordEvent({ coordinatorThreadId: threadId, type: "plan.recorded", outcome: scale, details: { version: plan.version, stepCount: plan.steps.length, dependencyCount: plan.steps.reduce((sum, step) => sum + step.dependsOn.length, 0), restart } });
+      store.recordEvent({ coordinatorThreadId: threadId, type: "plan.recorded", outcome: scale, details: { version: plan.version, stepCount: plan.steps.length, dependencyCount: plan.steps.reduce((sum, step) => sum + step.dependsOn.length, 0), inputBytes: Buffer.byteLength(JSON.stringify({ scale, rationale, steps })), restart } });
       return JSON.stringify({ plan, restarted: restart, fastPath: scale === "small" && steps.length === 0, planningMode: run.policy.planningMode });
     },
   });
 
   bb.agents.registerTool({
+    name: "orchestrator_plan_update",
+    description: "Incrementally revise the current durable plan without resending unchanged steps.",
+    instructions: "Use after the initial orchestrator_plan call. Supply the current expectedVersion, complete definitions only for added or changed steps, and keys to remove. The merged plan is validated and versioned atomically.",
+    presentation: { label: { pending: "Updating orchestration plan", completed: "Orchestration plan updated" } },
+    parameters: planUpdateInput,
+    async execute({ expectedVersion, scale, rationale, upsertSteps, removeKeys }, { threadId }) {
+      const coordinatorMetadata = await requireCoordinator(threadId);
+      const run = store.getRun(threadId);
+      if (run === null) throw new Error("Record an initial plan with orchestrator_plan before updating it.");
+      if (isTerminalRun(run.state)) throw new Error(`This Orchestrator run is ${run.state}. Start the next request with orchestrator_plan.`);
+      const current = store.getPlan(threadId);
+      if (current === null) throw new Error("Record an initial plan with orchestrator_plan before updating it.");
+      if (current.version !== expectedVersion) throw new Error(`Plan version conflict: expected ${expectedVersion}, current version is ${current.version}. Read compact status once and retry against the current version.`);
+
+      const merged = new Map(current.steps.map((step) => [step.key, workerAssignment.parse(step)]));
+      for (const key of removeKeys) if (!merged.has(key)) throw new Error(`Cannot remove unknown plan step ${key}.`);
+      for (const key of removeKeys) merged.delete(key);
+      for (const step of upsertSteps) merged.set(step.key, step);
+      const steps = [...merged.values()];
+      const nextScale = scale ?? current.scale;
+      const nextRationale = rationale ?? current.rationale;
+      const { selected } = await resolveProjects(coordinatorMetadata.allowedProjectIds);
+      const allowed = new Set(selected.map((project) => project.id));
+      for (const step of steps) if (!allowed.has(step.projectId)) throw new Error(`Project ${step.projectId} is not allowed in this run.`);
+      if (steps.length > run.policy.maxWorkersPerRun) throw new Error(`This run allows at most ${run.policy.maxWorkersPerRun} planned workstreams including descendants.`);
+      const keys = new Set(steps.map((step) => step.key));
+      for (const step of steps) for (const dependency of step.dependsOn) if (!keys.has(dependency)) {
+        throw new Error(`Workstream ${step.key} has unknown dependency ${dependency}. Update or remove its dependency in the same plan patch.`);
+      }
+      const cycle = dependencyCycle(steps);
+      if (cycle !== null) throw new Error(`Worker plan contains a dependency cycle: ${cycle.join(" -> ")}.`);
+      if (nextScale === "large" && steps.length === 0) throw new Error("A large request needs at least one planned step.");
+      if (nextScale === "small" && steps.length > 0 && !isSmallRequest(steps)) {
+        throw new Error("The updated steps exceed the small-request fast path. Change the plan scale to large in the same update.");
+      }
+      if (run.policy.planningMode === "always" && steps.length === 0) {
+        throw new Error("Planning mode is always, so even a small request needs explicit plan steps.");
+      }
+
+      const plan = store.updatePlan({ coordinatorThreadId: threadId, expectedVersion, scale: nextScale, rationale: nextRationale, steps });
+      if (plan === null) {
+        const actual = store.getPlan(threadId)?.version;
+        throw new Error(`Plan version conflict: expected ${expectedVersion}, current version is ${actual ?? "unavailable"}. Read compact status once and retry against the current version.`);
+      }
+      const patch = { expectedVersion, scale, rationale, upsertSteps, removeKeys };
+      const inputBytes = Buffer.byteLength(JSON.stringify(patch));
+      const fullReplacementBytes = Buffer.byteLength(JSON.stringify({ scale: plan.scale, rationale: plan.rationale, steps: plan.steps }));
+      store.recordEvent({
+        coordinatorThreadId: threadId, type: "plan.updated", outcome: plan.scale,
+        details: {
+          previousVersion: expectedVersion, version: plan.version, stepCount: plan.steps.length,
+          upsertedKeys: upsertSteps.map((step) => step.key), removedKeys: removeKeys,
+          inputBytes, fullReplacementBytes, avoidedBytes: Math.max(0, fullReplacementBytes - inputBytes),
+          resultingPlanBytes: Buffer.byteLength(JSON.stringify(plan.steps)),
+        },
+      });
+      return JSON.stringify({
+        previousVersion: expectedVersion, version: plan.version, scale: plan.scale, stepCount: plan.steps.length,
+        upsertedKeys: upsertSteps.map((step) => step.key), removedKeys: removeKeys,
+      });
+    },
+  });
+
+  bb.agents.registerTool({
     name: "orchestrator_dispatch",
-    description: "Reconcile a coordinator's complete desired managed-workstream set.",
-    instructions: "Use stable keys and send the complete desired set. Quick is the cheap default; stronger profiles require a concrete reason.",
+    description: "Reconcile managed workstreams from a durable plan version or a complete desired assignment set.",
+    instructions: "For an explicit large plan, send only planVersion so the server dispatches its durable steps without repeating prompts. Send complete assignments for a small fast-path plan without steps or when planning is disabled. Quick is the cheap default; stronger profiles require a concrete reason.",
     presentation: { label: { pending: "Reconciling workstreams", completed: "Reconciled workstreams" } },
-    parameters: z.object({
-      assignments: z.array(workerAssignment).max(50).refine((items) => new Set(items.map((item) => item.key)).size === items.length, "Worker keys must be unique."),
-    }),
-    async execute({ assignments }, { threadId, signal }) {
+    parameters: dispatchInput,
+    async execute(input, { threadId, signal }) {
       const [coordinatorMetadata, coordinator] = await Promise.all([requireCoordinator(threadId), bb.sdk.threads.get({ threadId })]);
       let run = store.getRun(threadId) ?? store.upsertRun({
         coordinatorThreadId: threadId, label: coordinatorMetadata.label,
         allowedProjectIds: coordinatorMetadata.allowedProjectIds, policy: await readPolicy(),
       });
       if (isTerminalRun(run.state)) throw new Error(`This Orchestrator run is ${run.state}. Start the next request with orchestrator_plan so it can reset the run and its timeout clock.`);
+      const referencedPlan = input.planVersion === undefined ? null : store.getPlan(threadId);
+      if (input.planVersion !== undefined && referencedPlan === null) throw new Error("No durable plan is available for planVersion dispatch.");
+      if (input.planVersion !== undefined && referencedPlan!.version !== input.planVersion) {
+        throw new Error(`Plan version conflict: requested ${input.planVersion}, current version is ${referencedPlan!.version}.`);
+      }
+      if (input.planVersion !== undefined && referencedPlan!.steps.length === 0) {
+        throw new Error("This durable plan has no explicit steps. Dispatch the complete assignments for the small-request fast path.");
+      }
+      const assignments = input.assignments ?? z.array(workerAssignment).parse(referencedPlan!.steps);
       if (assignments.length > run.policy.maxWorkersPerRun) throw new Error(`This run allows at most ${run.policy.maxWorkersPerRun} workstreams including descendants.`);
       const existingKeys = new Set(store.listWorkstreams(threadId).map((item) => item.key));
       const additionalKeys = assignments.filter((assignment) => !existingKeys.has(assignment.key)).length;
@@ -1280,6 +1381,16 @@ export default async function plugin(bb: BbPluginApi) {
         });
       }
       const workers = assignments.map((assignment) => byKey.get(assignment.key)!);
+      const inputBytes = Buffer.byteLength(JSON.stringify(input));
+      const resolvedAssignmentsBytes = Buffer.byteLength(JSON.stringify({ assignments }));
+      store.recordEvent({
+        coordinatorThreadId: threadId, type: "coordinator.dispatch", outcome: input.planVersion === undefined ? "assignments" : "plan-version",
+        details: {
+          planVersion: input.planVersion ?? plan?.version ?? null, workstreamCount: assignments.length,
+          inputBytes, resolvedAssignmentsBytes,
+          avoidedBytes: input.planVersion === undefined ? 0 : Math.max(0, resolvedAssignmentsBytes - inputBytes),
+        },
+      });
       return JSON.stringify({
         approved: true, workers, retired,
         limits: { maxParallelWorkers: run.policy.maxParallelWorkers, maxAttemptsPerWorkstream: run.policy.maxAttemptsPerWorkstream, tokenBudget: run.policy.tokenBudget },
@@ -1782,9 +1893,9 @@ export default async function plugin(bb: BbPluginApi) {
         };
       }
       return {
-        tools: ["orchestrator_plan", "orchestrator_dispatch", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_review", "orchestrator_finish"],
+        tools: ["orchestrator_plan", "orchestrator_plan_update", "orchestrator_dispatch", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_review", "orchestrator_finish"],
         skills: [],
-        instructions: "You are a managed Orchestrator coordinator. The plugin is the single lifecycle writer. First classify the request with orchestrator_plan: small requests take the fast path, while large requests need a dependency-aware global plan and may begin with parallel read-only investigation. Dispatch the complete current plan with stable keys. Use the cheapest adequate profile, durable status, and artifacts; finish only when every workstream is terminal. Orchestrator status is compact by default. Do not use shell sleeps or repeatedly poll status while workers run; completion notices wake you automatically, after which one status read is enough.",
+        instructions: "You are a managed Orchestrator coordinator. The plugin is the single lifecycle writer. First classify the request with orchestrator_plan: small requests take the fast path, while large requests need a dependency-aware global plan and may begin with parallel read-only investigation. Revise an existing plan with orchestrator_plan_update, sending only added or changed steps and removed keys. Dispatch explicit durable plans by planVersion so prompts are not repeated; use complete assignments only for the small fast path or planning-off mode. Use the cheapest adequate profile, durable status, and artifacts; finish only when every workstream is terminal. Orchestrator status is compact by default. Do not use shell sleeps or repeatedly poll status while workers run; completion notices wake you automatically, after which one status read is enough.",
       };
     }
     if (parsed.success && parsed.data.role === "worker") {

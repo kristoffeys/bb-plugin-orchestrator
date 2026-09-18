@@ -45,8 +45,13 @@ legacy direct dispatch.
 
 Large uncertain requests can begin with root-level read-only investigations.
 Those may run concurrently in one project and delegate bounded read-only
-subtrees. After joining their findings, the coordinator revises the global plan
-before implementation. Mutating steps start only after every `dependsOn` step
+subtrees. After joining their findings, the coordinator calls
+`orchestrator_plan_update` with the current version, complete definitions for
+only the added or changed steps, and any keys to remove. The server merges and
+validates the resulting DAG atomically, then returns a compact change summary.
+The coordinator dispatches that durable plan by version, so unchanged worker
+prompts are not sent again in the dispatch call.
+Mutating steps start only after every `dependsOn` step
 succeeds and the project's single-writer lane opens. A failed prerequisite
 cancels its blocked dependents with a durable reason. Dispatch must match the
 current plan version, so scope or dependency changes require a plan revision.

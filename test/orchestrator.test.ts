@@ -310,6 +310,52 @@ test("large plans run independent investigations in parallel and gate dependent 
   assert.match(String(state.spawned[2]?.prompt), /inspect-api, inspect-tests/);
 });
 
+test("incremental plan updates preserve unchanged steps and reject stale or invalid patches", async () => {
+  const state = await load();
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  const inspect = { key: "inspect", projectId: "api", prompt: "Inspect the current contract.", accessMode: "read-only" as const };
+  const obsolete = { key: "obsolete", projectId: "web", prompt: "Inspect an approach that is no longer needed.", accessMode: "read-only" as const };
+  await state.harness.behavior.callAgentTool("orchestrator_plan", {
+    scale: "large", rationale: "Investigate before implementation.", steps: [inspect, obsolete],
+  }, { threadId: "coord", projectId: "personal" });
+
+  const implement = { key: "implement", projectId: "api", prompt: "Implement the verified contract change.", dependsOn: ["inspect"] };
+  const rawUpdate = await state.harness.behavior.callAgentTool("orchestrator_plan_update", {
+    expectedVersion: 1,
+    rationale: "The investigation identified the implementation path.",
+    upsertSteps: [implement],
+    removeKeys: ["obsolete"],
+  }, { threadId: "coord", projectId: "personal" }) as string;
+  const update = JSON.parse(rawUpdate);
+  assert.deepEqual(update, {
+    previousVersion: 1, version: 2, scale: "large", stepCount: 2,
+    upsertedKeys: ["implement"], removedKeys: ["obsolete"],
+  });
+  assert.equal(rawUpdate.includes(inspect.prompt), false, "the update response stays bounded and does not echo unchanged prompts");
+
+  await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_plan_update", {
+    expectedVersion: 1, rationale: "Stale revision.",
+  }, { threadId: "coord", projectId: "personal" }), /expected 1, current version is 2/);
+  await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_plan_update", {
+    expectedVersion: 2, removeKeys: ["typo"],
+  }, { threadId: "coord", projectId: "personal" }), /Cannot remove unknown plan step typo/);
+  await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_plan_update", {
+    expectedVersion: 2, removeKeys: ["inspect"],
+  }, { threadId: "coord", projectId: "personal" }), /implement has unknown dependency inspect/);
+
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", { detail: "full" }, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.plan.version, 2);
+  assert.deepEqual(status.plan.steps.map((step: { key: string }) => step.key), ["inspect", "implement"]);
+  assert.equal(status.plan.steps[0].prompt, inspect.prompt);
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    planVersion: 2,
+  }, { threadId: "coord", projectId: "personal" }) as string);
+  assert.deepEqual(dispatched.workers.map((worker: { state: string }) => worker.state), ["running", "queued"]);
+  await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    planVersion: 1,
+  }, { threadId: "coord", projectId: "personal" }), /requested 1, current version is 2/);
+});
+
 test("planning rejects dependency cycles and cancels work blocked by a failed prerequisite", async () => {
   const state = await load();
   await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
@@ -1286,6 +1332,7 @@ test("only terminal coordinators regain orchestrator_enable discoverability", as
     thread: state.threads.get("coord")!, pluginMetadata: state.metadata.get("coord")! as never,
   }));
   assert.equal(active.tools.some((tool) => tool.name === "orchestrator_enable"), false);
+  assert.equal(active.tools.some((tool) => tool.name === "orchestrator_plan_update"), true);
   const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "done", projectId: "api", prompt: "Finish." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
   const workerConfig = await state.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({
     thread: state.threads.get(worker.threadId)!, pluginMetadata: state.metadata.get(worker.threadId)! as never,

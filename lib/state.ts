@@ -258,6 +258,17 @@ export class OrchestratorStore {
     return this.getPlan(input.coordinatorThreadId)!;
   }
 
+  updatePlan(input: Omit<PlanRecord, "version" | "createdAt" | "updatedAt"> & { expectedVersion: number }) {
+    const now = Date.now();
+    const result = this.db.prepare(`
+      UPDATE plans SET version = version + 1, scale = ?, rationale = ?, steps_json = ?, updated_at = ?
+      WHERE coordinator_thread_id = ? AND version = ?
+    `).run(input.scale, input.rationale, JSON.stringify(input.steps), now, input.coordinatorThreadId, input.expectedVersion);
+    if (result.changes === 0) return null;
+    this.touchRun(input.coordinatorThreadId);
+    return this.getPlan(input.coordinatorThreadId)!;
+  }
+
   getPlan(coordinatorThreadId: string): PlanRecord | null {
     const row = this.db.prepare(`
       SELECT coordinator_thread_id AS coordinatorThreadId, version, scale, rationale,
