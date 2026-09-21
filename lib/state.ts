@@ -221,6 +221,8 @@ export class OrchestratorStore {
   }
 
   setRunState(coordinatorThreadId: string, state: RunState, error: string | null = null) {
+    const current = this.getRun(coordinatorThreadId);
+    if (current === null || ["completed", "failed", "cancelled"].includes(current.state)) return;
     const now = Date.now();
     this.db.prepare("UPDATE runs SET state = ?, error = ?, updated_at = ?, last_activity_at = ? WHERE coordinator_thread_id = ?")
       .run(state, error, now, now, coordinatorThreadId);
@@ -476,6 +478,13 @@ export class OrchestratorStore {
   }
 
   setUsage(coordinatorThreadId: string, key: string, usage: { totalTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number }, lastEventSeq: number) {
+    const current = this.getWorkstream(coordinatorThreadId, key);
+    if (current !== null && usage.totalTokens < current.totalTokens) {
+      this.db.prepare("UPDATE workstreams SET last_event_seq = ? WHERE coordinator_thread_id = ? AND key = ?")
+        .run(lastEventSeq, coordinatorThreadId, key);
+      this.recordEvent({ coordinatorThreadId, type: "usage.regression_ignored", workstreamKey: key, workerThreadId: current.threadId, outcome: "worker", details: { previousTokens: current.totalTokens, reportedTokens: usage.totalTokens, lastEventSeq } });
+      return this.getRun(coordinatorThreadId)?.totalTokens ?? 0;
+    }
     this.db.prepare("UPDATE workstreams SET total_tokens = ?, input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, reasoning_output_tokens = ?, last_event_seq = ?, updated_at = ? WHERE coordinator_thread_id = ? AND key = ?")
       .run(usage.totalTokens, usage.inputTokens, usage.cachedInputTokens, usage.outputTokens, usage.reasoningOutputTokens, lastEventSeq, Date.now(), coordinatorThreadId, key);
     return this.updateAggregatedUsage(coordinatorThreadId);
@@ -484,8 +493,14 @@ export class OrchestratorStore {
   setCoordinatorUsage(coordinatorThreadId: string, usage: { totalTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number }, lastEventSeq: number) {
     const run = this.getRun(coordinatorThreadId);
     if (run === null) return 0;
+    const reportedTotal = Math.max(0, usage.totalTokens - run.coordinatorBaselineTotalTokens);
+    if (reportedTotal < run.coordinatorTotalTokens) {
+      this.db.prepare("UPDATE runs SET coordinator_last_event_seq = ? WHERE coordinator_thread_id = ?").run(lastEventSeq, coordinatorThreadId);
+      this.recordEvent({ coordinatorThreadId, type: "usage.regression_ignored", outcome: "coordinator", details: { previousTokens: run.coordinatorTotalTokens, reportedTokens: reportedTotal, lastEventSeq } });
+      return run.totalTokens;
+    }
     this.db.prepare("UPDATE runs SET coordinator_total_tokens = ?, coordinator_input_tokens = ?, coordinator_cached_input_tokens = ?, coordinator_output_tokens = ?, coordinator_reasoning_output_tokens = ?, coordinator_last_event_seq = ?, updated_at = ? WHERE coordinator_thread_id = ?")
-      .run(Math.max(0, usage.totalTokens - run.coordinatorBaselineTotalTokens), Math.max(0, usage.inputTokens - run.coordinatorBaselineInputTokens), Math.max(0, usage.cachedInputTokens - run.coordinatorBaselineCachedInputTokens), Math.max(0, usage.outputTokens - run.coordinatorBaselineOutputTokens), Math.max(0, usage.reasoningOutputTokens - run.coordinatorBaselineReasoningOutputTokens), lastEventSeq, Date.now(), coordinatorThreadId);
+      .run(reportedTotal, Math.max(0, usage.inputTokens - run.coordinatorBaselineInputTokens), Math.max(0, usage.cachedInputTokens - run.coordinatorBaselineCachedInputTokens), Math.max(0, usage.outputTokens - run.coordinatorBaselineOutputTokens), Math.max(0, usage.reasoningOutputTokens - run.coordinatorBaselineReasoningOutputTokens), lastEventSeq, Date.now(), coordinatorThreadId);
     return this.updateAggregatedUsage(coordinatorThreadId);
   }
 

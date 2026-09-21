@@ -45,6 +45,21 @@ test("upgrades the prior released migration ledger without changing its statemen
   db.close();
 });
 
+test("repairs terminal sessions that coordinator archival incorrectly cancelled", () => {
+  const db = new Database(":memory:");
+  for (const statement of ORCHESTRATOR_MIGRATIONS.slice(0, -2)) db.exec(statement);
+  db.prepare("INSERT INTO runs (coordinator_thread_id, session_id, feature_branch, label, allowed_project_ids_json, state, policy_json, created_at, updated_at, last_activity_at, total_tokens, first_dispatch_approved, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .run("coord", "session-1", "orchestrator/test", "Test", "[]", "cancelled", "{}", 10, 300, 300, 100, 0, "Coordinator was archived.");
+  db.prepare("INSERT INTO orchestration_sessions (session_id, coordinator_thread_id, label, feature_branch, allowed_project_ids_json, state, policy_json, total_tokens, started_at, updated_at, completed_at, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .run("session-1", "coord", "Test", "orchestrator/test", "[]", "cancelled", "{}", 100, 10, 300, 300, "Coordinator was archived.");
+  db.prepare("INSERT INTO orchestration_events (session_id, coordinator_thread_id, event_type, outcome, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .run("session-1", "coord", "run.state", "completed", "{}", 200);
+  for (const statement of ORCHESTRATOR_MIGRATIONS.slice(-2)) db.exec(statement);
+  assert.deepEqual(db.prepare("SELECT state, error, updated_at AS updatedAt, completed_at AS completedAt FROM orchestration_sessions").get(), { state: "completed", error: null, updatedAt: 200, completedAt: 200 });
+  assert.deepEqual(db.prepare("SELECT state, error, updated_at AS updatedAt, last_activity_at AS lastActivityAt FROM runs").get(), { state: "completed", error: null, updatedAt: 200, lastActivityAt: 200 });
+  db.close();
+});
+
 async function load(providerId = "codex", options: { delayedAttachmentGets?: number; provisioningStatus?: "error"; failFirstReuseProvisioning?: boolean } = {}) {
   const metadata = new Map<string, Record<string, unknown>>();
   const threads = new Map<string, ReturnType<typeof makeThreadResponse>>();
@@ -867,6 +882,30 @@ test("coordinator token usage counts toward the run budget and learning data", a
   assert.equal(analytics.totals.coordinatorTokens, 101);
 });
 
+test("later token snapshots cannot shrink recorded coordinator or worker usage", async () => {
+  const state = await load();
+  const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "measured", projectId: "api", prompt: "Measure usage." }],
+  }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  const usageEvent = (threadId: string, seq: number, totalTokens: number) => ({
+    id: `${threadId}-${seq}`, threadId, seq, createdAt: Date.now(), scope: { kind: "thread" },
+    type: "thread/tokenUsage/updated",
+    data: { providerThreadId: `provider-${threadId}`, tokenUsage: { last: { cachedInputTokens: 0, inputTokens: totalTokens - 10, outputTokens: 10, reasoningOutputTokens: 0, totalTokens }, total: { cachedInputTokens: 0, inputTokens: totalTokens - 10, outputTokens: 10, reasoningOutputTokens: 0, totalTokens }, modelContextWindow: 1000 } },
+  });
+  state.eventRows.set("coord", [usageEvent("coord", 1, 500)]);
+  await state.harness.behavior.emitThreadEvent("experimental_thread.events", { thread: state.threads.get("coord")!, sequence: 1 });
+  state.eventRows.set(worker.threadId, [usageEvent(worker.threadId, 1, 500)]);
+  await state.harness.behavior.emitThreadEvent("experimental_thread.events", { thread: state.threads.get(worker.threadId)!, sequence: 1 });
+  state.eventRows.set("coord", [usageEvent("coord", 2, 200)]);
+  await state.harness.behavior.emitThreadEvent("experimental_thread.events", { thread: state.threads.get("coord")!, sequence: 2 });
+  state.eventRows.set(worker.threadId, [usageEvent(worker.threadId, 2, 200)]);
+  await state.harness.behavior.emitThreadEvent("experimental_thread.events", { thread: state.threads.get(worker.threadId)!, sequence: 2 });
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.run.totalTokens, 1_000);
+  assert.equal(status.run.coordinatorTotalTokens, 500);
+  assert.equal(status.workstreams[0].totalTokens, 500);
+});
+
 test("artifacts notify named consumers and remain in durable status", async () => {
   const state = await load();
   const dispatched = JSON.parse(await state.harness.behavior.callAgentTool(
@@ -1345,6 +1384,9 @@ test("only terminal coordinators regain orchestrator_enable discoverability", as
   }));
   assert.ok(terminal.tools.some((tool) => tool.name === "orchestrator_enable"));
   assert.ok(terminal.tools.some((tool) => tool.name === "orchestrator_plan"));
+  await state.harness.behavior.emitThreadEvent("thread.archived", { thread: state.threads.get("coord")! });
+  const afterArchive = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(afterArchive.run.state, "completed");
   await state.harness.behavior.callAgentTool("orchestrator_enable", { label: "Reset", projectIds: ["web"] }, { threadId: "coord", projectId: "personal" });
   const refreshed = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(refreshed.run.state, "configured");

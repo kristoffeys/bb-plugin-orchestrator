@@ -171,6 +171,8 @@ export const ORCHESTRATOR_MIGRATIONS = [
   `ALTER TABLE runs ADD COLUMN coordinator_baseline_reasoning_output_tokens INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE orchestration_sessions ADD COLUMN coordinator_tokens INTEGER NOT NULL DEFAULT 0`,
   `UPDATE orchestration_sessions SET coordinator_tokens = COALESCE((SELECT coordinator_total_tokens FROM runs WHERE runs.session_id = orchestration_sessions.session_id), 0)`,
+  `UPDATE orchestration_sessions AS session SET state = (SELECT event.outcome FROM orchestration_events AS event WHERE event.session_id = session.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed') ORDER BY event.created_at DESC, event.id DESC LIMIT 1), error = NULL, completed_at = (SELECT event.created_at FROM orchestration_events AS event WHERE event.session_id = session.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed') ORDER BY event.created_at DESC, event.id DESC LIMIT 1), updated_at = (SELECT event.created_at FROM orchestration_events AS event WHERE event.session_id = session.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed') ORDER BY event.created_at DESC, event.id DESC LIMIT 1) WHERE session.state = 'cancelled' AND session.error IN ('Coordinator was archived.', 'Coordinator was deleted.') AND EXISTS (SELECT 1 FROM orchestration_events AS event WHERE event.session_id = session.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed'))`,
+  `UPDATE runs AS run SET state = (SELECT event.outcome FROM orchestration_events AS event WHERE event.session_id = run.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed') ORDER BY event.created_at DESC, event.id DESC LIMIT 1), error = NULL, updated_at = (SELECT event.created_at FROM orchestration_events AS event WHERE event.session_id = run.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed') ORDER BY event.created_at DESC, event.id DESC LIMIT 1), last_activity_at = (SELECT event.created_at FROM orchestration_events AS event WHERE event.session_id = run.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed') ORDER BY event.created_at DESC, event.id DESC LIMIT 1) WHERE run.state = 'cancelled' AND run.error IN ('Coordinator was archived.', 'Coordinator was deleted.') AND EXISTS (SELECT 1 FROM orchestration_events AS event WHERE event.session_id = run.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed'))`,
 ] as const;
 
 const workerAssignment = z.object({
@@ -1800,8 +1802,9 @@ export default async function plugin(bb: BbPluginApi) {
   });
   for (const eventName of ["thread.archived", "thread.deleted"] as const) {
     bb.events.on(eventName, async ({ thread }) => {
-      if (store.getRun(thread.id) !== null) {
-        await cleanupRun(thread.id, "cancelled", `Coordinator was ${eventName === "thread.archived" ? "archived" : "deleted"}.`);
+      const coordinatorRun = store.getRun(thread.id);
+      if (coordinatorRun !== null) {
+        if (!isTerminalRun(coordinatorRun.state)) await cleanupRun(thread.id, "cancelled", `Coordinator was ${eventName === "thread.archived" ? "archived" : "deleted"}.`);
         return;
       }
       const item = store.getWorkstreamByThread(thread.id);
