@@ -761,7 +761,7 @@ test("run and workstream state survive a plugin reload", async () => {
     { threadId: "coord", projectId: "personal" },
   );
   const reloaded = await state.harness.lifecycle.reload(plugin);
-  const status = JSON.parse(await reloaded.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  const status = JSON.parse(await reloaded.harness.behavior.callAgentTool("orchestrator_status", { detail: "full" }, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(status.run.state, "running");
   assert.equal(status.workstreams[0].key, "durable");
   assert.equal(status.workstreams[0].attemptCount, 1);
@@ -989,7 +989,7 @@ test("provisioning polling waits for delayed attachment and is reload durable", 
   assert.equal(dispatched.workers[0].state, "running");
   assert.equal(state.stopped.length, 0, "a healthy provisioning thread is not stopped");
   const reloaded = await state.harness.lifecycle.reload(plugin);
-  const status = JSON.parse(await reloaded.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  const status = JSON.parse(await reloaded.harness.behavior.callAgentTool("orchestrator_status", { detail: "full" }, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(status.environments[0].environmentId, "env-api");
 });
 
@@ -1060,7 +1060,7 @@ test("a stale durable environment lease is cleared and reprovisioned", async () 
   assert.equal(environments[2]?.type, "provider");
   assert.equal(environments[0]?.inputs?.branchName, environments[2]?.inputs?.branchName, "reprovisioning keeps the run branch");
   assert.ok(state.stopped.includes("spawned-2"));
-  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", { detail: "full" }, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(status.workstreams[1].state, "running");
   assert.equal(status.environments[0].environmentId, "env-api");
 });
@@ -1082,8 +1082,8 @@ test("nested delegation is namespaced, visible under its parent, read-only, and 
   assert.equal(state.spawned[1]?.parentThreadId, root.threadId);
   assert.deepEqual(state.spawned[1]?.environment, { type: "reuse", environmentId: "env-api" });
   const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: root.threadId, projectId: "api" }) as string);
-  assert.deepEqual(status.workstreams.map((item: { key: string; parentKey: string | null; depth: number }) => [item.key, item.parentKey, item.depth]), [
-    ["root", null, 0], ["root/inspect", "root", 1],
+  assert.deepEqual(status.workstreams.map((item: { key: string; parentKey: string | null; }) => [item.key, item.parentKey]), [
+    ["root", null], ["root/inspect", "root"],
   ]);
 });
 
@@ -1360,7 +1360,7 @@ test("reasoning policy survives reload and descendants inherit or override their
   assert.deepEqual(delegated.workers.map((item: { reasoningLevel: string }) => item.reasoningLevel), ["high", "medium"]);
   assert.deepEqual(delegated.workers.map((item: { providerId: string; model: string }) => [item.providerId, item.model]), [["opencode", "budget-code"], ["opencode", "budget-code"]]);
   const reloaded = await state.harness.lifecycle.reload(plugin);
-  const status = JSON.parse(await reloaded.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  const status = JSON.parse(await reloaded.harness.behavior.callAgentTool("orchestrator_status", { detail: "full" }, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(status.routing.policy.profileRoutes.quick.reasoningLevel, "high");
   assert.deepEqual(status.workstreams.map((item: { configuredReasoningLevel: string; requestedReasoningLevel: string; effectiveReasoningLevel: string }) => [item.configuredReasoningLevel, item.requestedReasoningLevel, item.effectiveReasoningLevel]), [
     ["high", "low", "low"], ["high", "high", "high"], ["high", "medium", "medium"],
@@ -1390,7 +1390,7 @@ test("only terminal coordinators regain orchestrator_enable discoverability", as
   const afterArchive = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(afterArchive.run.state, "completed");
   await state.harness.behavior.callAgentTool("orchestrator_enable", { label: "Reset", projectIds: ["web"] }, { threadId: "coord", projectId: "personal" });
-  const refreshed = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  const refreshed = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", { detail: "full" }, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(refreshed.run.state, "configured");
   assert.deepEqual(refreshed.run.allowedProjectIds, ["web"]);
 });
@@ -1482,7 +1482,7 @@ test("workstream conditions name the reason each workstream is not ready", async
   });
   assert.equal(second.nextAction, "Another api workstream holds the single mutating lane");
   const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
-  assert.equal(status.workstreams.find((item: { key: string }) => item.key === "second").conditions.at(-1).reason, "ProjectLaneBusy");
+  assert.equal(status.workstreams.find((item: { key: string }) => item.key === "second").waiting.reason, "ProjectLaneBusy");
 
   const planned = await load();
   await planned.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
@@ -1527,7 +1527,7 @@ test("suspending holds the project lane and pauses the run's clocks until it is 
     const suspended = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
     assert.equal(suspended.run.state, "suspended");
     assert.deepEqual(suspended.workstreams.map((item: { state: string }) => item.state), ["suspended", "suspended"]);
-    assert.deepEqual(suspended.workstreams[0].conditions, [{ type: "Ready", status: false, reason: "Suspended", message: "Resume this workstream to continue it." }]);
+    assert.deepEqual(suspended.workstreams[0].waiting, { reason: "Suspended", message: "Resume this workstream to continue it." });
     await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_dispatch", {
       assignments: [{ key: "first", projectId: "api", prompt: "First." }],
     }, { threadId: "coord", projectId: "personal" }), /run is suspended/);

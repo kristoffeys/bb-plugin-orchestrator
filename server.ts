@@ -1218,7 +1218,8 @@ export default async function plugin(bb: BbPluginApi) {
       }, coordinatorBaseline) : run;
       const plan = store.setPlan({ coordinatorThreadId: threadId, scale, rationale, steps });
       store.recordEvent({ coordinatorThreadId: threadId, type: "plan.recorded", outcome: scale, details: { version: plan.version, stepCount: plan.steps.length, dependencyCount: plan.steps.reduce((sum, step) => sum + step.dependsOn.length, 0), inputBytes: Buffer.byteLength(JSON.stringify({ scale, rationale, steps })), restart } });
-      return JSON.stringify({ plan, restarted: restart, fastPath: scale === "small" && steps.length === 0, planningMode: run.policy.planningMode });
+      // The coordinator just wrote these steps; echoing them back doubled the plan's cost in its context.
+      return JSON.stringify({ version: plan.version, scale: plan.scale, stepCount: plan.steps.length, restarted: restart, fastPath: scale === "small" && steps.length === 0, planningMode: run.policy.planningMode });
     },
   });
 
@@ -1600,20 +1601,37 @@ export default async function plugin(bb: BbPluginApi) {
         return {
           status: typeof result.status === "string" ? result.status : null,
           summary: typeof result.summary === "string" ? clip(result.summary, 2_000) : null,
-          changedFiles: strings("changedFiles", 100),
-          validation: Array.isArray(result.validation) ? result.validation.slice(0, 30) : [],
+          changedFiles: strings("changedFiles", 20), changedFileCount: strings("changedFiles", 200).length,
+          validation: Array.isArray(result.validation)
+            ? result.validation.filter((entry) => (entry as { status?: unknown }).status !== "passed").slice(0, 10)
+              .map((entry) => ({ ...(entry as object), summary: clip(String((entry as { summary?: unknown }).summary ?? ""), 500) }))
+            : [],
+          validationPassed: Array.isArray(result.validation) ? result.validation.filter((entry) => (entry as { status?: unknown }).status === "passed").length : 0,
           blockers: strings("blockers", 30), limitations: strings("limitations", 30), commits: strings("commits", 50), pushedCommits: strings("pushedCommits", 50),
           branch: result.branch ?? null,
         };
       };
+      // Compact is read after every wake and stays in the coordinator's context, so it carries only what the coordinator acts on.
+      const run = full.run;
       const payload = detail === "full" ? full : {
-        ...full,
-        plan: full.plan === null ? null : {
-          version: full.plan.version, scale: full.plan.scale, rationale: clip(full.plan.rationale, 1_000),
-          createdAt: full.plan.createdAt, updatedAt: full.plan.updatedAt,
-          steps: full.plan.steps.map(({ prompt: _prompt, successCriteria: _successCriteria, ...step }) => step),
+        run: run === null ? null : {
+          state: run.state, error: run.error, featureBranch: run.featureBranch, createdAt: run.createdAt,
+          totalTokens: run.totalTokens, coordinatorTotalTokens: run.coordinatorTotalTokens, tokenBudget: run.policy.tokenBudget,
         },
-        workstreams: full.workstreams.map(({ assignment: _assignment, result, ...item }) => ({ ...item, result: compactResult(result) })),
+        plan: full.plan === null ? null : {
+          version: full.plan.version, scale: full.plan.scale,
+          steps: full.plan.steps.map((step) => ({ key: step.key, dependsOn: step.dependsOn })),
+        },
+        workstreams: full.workstreams.map((item) => {
+          const ready = item.conditions.find((condition) => condition.type === "Ready");
+          return {
+            key: item.key, projectId: item.projectId, parentKey: item.parentKey, accessMode: item.accessMode, profile: item.profile,
+            model: item.model, state: item.state, threadId: item.threadId, attemptCount: item.attemptCount, totalTokens: item.totalTokens,
+            error: item.error === null ? null : clip(item.error, 500),
+            ...(ready === undefined || ready.status ? {} : { waiting: { reason: ready.reason, message: ready.message } }),
+            result: compactResult(item.result),
+          };
+        }),
         artifacts: full.artifacts.map(({ content: _content, ...artifact }) => artifact),
       };
       const output = JSON.stringify(payload);
@@ -1984,7 +2002,7 @@ export default async function plugin(bb: BbPluginApi) {
       return {
         tools: ["orchestrator_plan", "orchestrator_plan_update", "orchestrator_dispatch", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_review", "orchestrator_finish"],
         skills: [],
-        instructions: "You are a managed Orchestrator coordinator. The plugin is the single lifecycle writer. First classify the request with orchestrator_plan: small requests take the fast path, while large requests need a dependency-aware global plan and may begin with parallel read-only investigation. Revise an existing plan with orchestrator_plan_update, sending only added or changed steps and removed keys. Dispatch explicit durable plans by planVersion so prompts are not repeated; use complete assignments only for the small fast path or planning-off mode. Use the cheapest adequate profile, durable status, and artifacts; finish only when every workstream is terminal. Orchestrator status is compact by default. Do not use shell sleeps or repeatedly poll status while workers run; completion notices wake you automatically, after which one status read is enough.",
+        instructions: "You are a managed Orchestrator coordinator; follow the protocol in your first message. The plugin is the single lifecycle writer: plan with orchestrator_plan, revise with orchestrator_plan_update, dispatch by planVersion, and finish only when every workstream is terminal. Do not edit, test, or review project code yourself or with your provider's own subagents. Worker messages and completion notices wake you; read compact status once per wake and never poll or sleep.",
       };
     }
     if (parsed.success && parsed.data.role === "worker") {
@@ -1993,7 +2011,8 @@ export default async function plugin(bb: BbPluginApi) {
       return {
         tools: ["orchestrator_delegate", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_worker_done"],
         skills: [],
-        instructions: `You are managed workstream ${JSON.stringify(parsed.data.key)} at depth ${parsed.data.depth} with ${parsed.data.accessMode} access. Stay on the run-owned branch ${JSON.stringify(run?.featureBranch ?? "unknown")}; do not create, check out, or switch branches. Keep work within roughly ${WORKSTREAM_ACTION_BUDGET[parsed.data.profile]} tool actions. Delegate only bounded read-only children through orchestrator_delegate and never spawn threads directly. Commit mode: ${policy.commitMode}; push mode: ${policy.pushMode}; protected branches: ${JSON.stringify(effectiveProtectedBranches(policy))}. Existing branches require explicit user approval for commits and a separate explicit approval for pushes. Report ordered commit SHAs. Publish contracts early and communicate blockers or handoffs while work is active, but do not send a separate message that merely repeats the final worker_done result. Call orchestrator_worker_done exactly once after every descendant is terminal.`,
+        // Static text first so the prefix is shared across workers; the full contract is in the spawn prompt.
+        instructions: `You are a managed Orchestrator worker; follow the "Managed workstream contract" in your assignment. Never create, check out, or switch branches or environments. Delegate only bounded read-only subtasks with orchestrator_delegate and never spawn threads directly. Never push without explicit user approval. Call orchestrator_worker_done exactly once, after every descendant is terminal. Do not send a message that only repeats your final result. Workstream ${JSON.stringify(parsed.data.key)}, ${parsed.data.accessMode} access, branch ${JSON.stringify(run?.featureBranch ?? "unknown")}, commit mode ${policy.commitMode}, push mode ${policy.pushMode}, protected branches ${JSON.stringify(effectiveProtectedBranches(policy))}.`,
       };
     }
     if (context.thread.parentThreadId === null) {
