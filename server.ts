@@ -53,8 +53,6 @@ const catalogModel = z.object({
   defaultReasoningLevel: reasoningLevel, supportedReasoningLevels: z.array(reasoningLevel),
 });
 const catalogProvider = z.object({ id: z.string(), displayName: z.string(), models: z.array(catalogModel), modelLoadError: z.string().nullable(), recommendedRoutes: profileModels.nullable() });
-const routeMetric = z.object({ providerId: z.string(), model: z.string(), profile: workerProfile, samples: z.number(), successes: z.number(), failures: z.number(), averageDurationMs: z.number(), averageTokens: z.number() });
-const routeRecommendation = z.object({ profile: workerProfile, providerId: z.string(), model: z.string(), samples: z.number(), successRate: z.number(), reason: z.string() });
 const threadOrchestrationState = z.object({
   eligible: z.boolean(), enabled: z.boolean(), label: z.string(), allowedProjectIds: z.array(z.string()),
   projects: z.array(z.object({ id: z.string(), name: z.string(), current: z.boolean() })),
@@ -124,7 +122,7 @@ export const rpcContract = defineRpcContract({
     output: z.object({ runState: z.string(), affected: z.array(z.string()) }),
   },
   routing_catalog: { input: z.null(), output: z.object({ providers: z.array(catalogProvider) }) },
-  routing_get: { input: z.null(), output: z.object({ routes: routingMap, policy: routingPolicy, metrics: z.array(routeMetric), recommendations: z.array(routeRecommendation) }) },
+  routing_get: { input: z.null(), output: z.object({ routes: routingMap, policy: routingPolicy }) },
   routing_set_provider: { input: z.object({ providerId: z.string().min(1), routes: providerProfileRoutes }), output: z.object({ routes: routingMap }) },
   routing_policy_set: { input: routingPolicy, output: routingPolicy },
   policy_get: { input: z.null(), output: orchestrationPolicy },
@@ -260,7 +258,6 @@ const TERMINAL_WORKSTREAM_STATES = new Set(["completed", "failed", "cancelled"])
 const WORKER_IDLE_SETTLE_MS = 250;
 const COMPLETION_REMINDER = "Worker became idle without orchestrator_worker_done and was asked once to submit its structured completion record.";
 const AWAITING_REPLY = "Worker asked the coordinator a question and is waiting for the reply.";
-const ROUTE_RECOMMENDATION_MIN_SAMPLES = 5;
 const WORKSTREAM_ACTION_BUDGET: Record<WorkerProfile, number> = { quick: 20, standard: 40, complex: 60, critical: 80 };
 type TokenUsage = { totalTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number };
 
@@ -269,16 +266,6 @@ const normalizeTokenUsage = (usage: TokenUsage): TokenUsage => {
     && usage.inputTokens >= usage.cachedInputTokens
     && usage.inputTokens + usage.outputTokens <= usage.totalTokens;
   return cachedIsIncludedInInput ? { ...usage, inputTokens: usage.inputTokens - usage.cachedInputTokens } : usage;
-};
-
-const wilsonLowerBound = (successes: number, samples: number) => {
-  if (samples === 0) return 0;
-  const z = 1.96;
-  const rate = successes / samples;
-  const denominator = 1 + z * z / samples;
-  const centre = rate + z * z / (2 * samples);
-  const margin = z * Math.sqrt((rate * (1 - rate) + z * z / (4 * samples)) / samples);
-  return (centre - margin) / denominator;
 };
 
 const isTerminalRun = (state: string) => TERMINAL_RUN_STATES.has(state);
@@ -1105,30 +1092,7 @@ export default async function plugin(bb: BbPluginApi) {
       return null;
     },
     routing_catalog: async () => ({ providers: await providerCatalog() }),
-    routing_get: async () => {
-      const measured = store.listMetrics();
-      const metrics = measured.map((item) => ({
-        providerId: item.providerId, model: item.model, profile: item.profile, samples: item.samples,
-        successes: item.successes, failures: item.failures,
-        averageDurationMs: item.samples === 0 ? 0 : Math.round(item.durationMs / item.samples),
-        averageTokens: item.samples === 0 ? 0 : Math.round(item.totalTokens / item.samples),
-      }));
-      const recommendations = workerProfile.options.flatMap((profileId) => {
-        const candidates = metrics.filter((item) => item.profile === profileId && item.samples >= ROUTE_RECOMMENDATION_MIN_SAMPLES).sort((left, right) => {
-          const leftConfidence = wilsonLowerBound(left.successes, left.samples); const rightConfidence = wilsonLowerBound(right.successes, right.samples);
-          if (leftConfidence !== rightConfidence) return rightConfidence - leftConfidence;
-          if (left.averageTokens !== right.averageTokens) return left.averageTokens - right.averageTokens;
-          return left.averageDurationMs - right.averageDurationMs;
-        });
-        const best = candidates[0];
-        return best === undefined ? [] : [{
-          profile: profileId, providerId: best.providerId, model: best.model, samples: best.samples,
-          successRate: best.successes / best.samples,
-          reason: `${best.successes}/${best.samples} successful; confidence-adjusted against routes with at least ${ROUTE_RECOMMENDATION_MIN_SAMPLES} samples; ${best.averageTokens.toLocaleString()} average tokens; ${Math.round(best.averageDurationMs / 1000)}s average runtime.`,
-        }];
-      });
-      return { routes: await readRoutes(), policy: await readRoutingPolicy(), metrics, recommendations };
-    },
+    routing_get: async () => ({ routes: await readRoutes(), policy: await readRoutingPolicy() }),
     routing_set_provider: async ({ providerId, routes }) => {
       const provider = (await providerCatalog()).find((candidate) => candidate.id === providerId);
       if (provider === undefined) throw new Error(`Provider ${providerId} is not currently available.`);
@@ -1769,9 +1733,6 @@ export default async function plugin(bb: BbPluginApi) {
       const review = result.status === "success" && (run.policy.evaluator === "always" || (run.policy.evaluator === "critical" && item.profile === "critical"));
       const state = result.status === "success" ? (review ? "reviewing" : "completed") : "failed";
       const next = store.setWorkstreamState(meta.coordinatorThreadId, meta.key, state, { result: resultWithEvidence, error: result.status === "success" ? null : result.summary, reasonCode: result.status === "success" ? null : result.status === "blocked" ? "worker_blocked" : "worker_reported_failure" })!;
-      if (!review || result.status !== "success") {
-        store.recordMetric({ providerId: measuredItem.providerId, model: measuredItem.model, profile: measuredItem.profile, succeeded: result.status === "success", durationMs: Math.max(0, Date.now() - (measuredItem.startedAt ?? measuredItem.createdAt)), totalTokens: measuredItem.totalTokens });
-      }
       if (item.parentKey !== null) {
         const parent = store.getWorkstream(meta.coordinatorThreadId, item.parentKey);
         if (parent?.threadId !== null && parent?.threadId !== undefined) {
@@ -1800,7 +1761,6 @@ export default async function plugin(bb: BbPluginApi) {
       if (decision === "accept") {
         store.setWorkstreamState(threadId, key, "completed");
         store.releaseProjectLane(threadId, key);
-        store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: true, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
         await launchQueued(threadId);
         if (item.threadId !== null) await retireWorker(item.threadId);
         return JSON.stringify({ key, state: "completed" });
@@ -1808,7 +1768,6 @@ export default async function plugin(bb: BbPluginApi) {
       if (item.attemptCount >= run.policy.maxAttemptsPerWorkstream || item.threadId === null) {
         store.setWorkstreamState(threadId, key, "failed", { error: feedback, reasonCode: "evaluation_rejected" });
         store.releaseProjectLane(threadId, key);
-        store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
         await launchQueued(threadId);
         if (item.threadId !== null) await retireWorker(item.threadId);
         return JSON.stringify({ key, state: "failed", retry: false });
@@ -1897,7 +1856,6 @@ export default async function plugin(bb: BbPluginApi) {
       result: { status: "failed", summary: lastAssistantText ?? "No worker output was recorded.", changedFiles: [], validation: [], blockers: ["Missing orchestrator_worker_done call."] },
     });
     store.releaseProjectLane(item.coordinatorThreadId, item.key);
-    store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
     await cancelDescendants(item.coordinatorThreadId, item.key, "Parent worker failed its completion contract.");
     await notify(item.coordinatorThreadId, `Workstream ${item.key} failed its completion contract: the worker became idle without orchestrator_worker_done.`, thread.id);
     await launchQueued(item.coordinatorThreadId);
@@ -1920,7 +1878,6 @@ export default async function plugin(bb: BbPluginApi) {
     store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", { error: failure, reasonCode: event.errorInfo?.category ?? "provider_failure", result: { status: "failed", summary: failure, changedFiles: [], validation: [], blockers: [failure], commits: [], pushedCommits: [], evidence } });
     await cancelDescendants(item.coordinatorThreadId, item.key, "Parent worker exhausted its retry limit.");
     store.releaseProjectLane(item.coordinatorThreadId, item.key);
-    store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
     await notify(item.coordinatorThreadId, `Workstream ${item.key} failed after ${item.attemptCount} attempt(s).`, event.threadId);
     await launchQueued(item.coordinatorThreadId);
     await retireWorker(event.threadId);
@@ -2016,7 +1973,6 @@ export default async function plugin(bb: BbPluginApi) {
       store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", { error: "Worker timeout was reached.", reasonCode: "worker_timeout" });
       await cancelDescendants(item.coordinatorThreadId, item.key, "Parent worker timed out.");
       store.releaseProjectLane(item.coordinatorThreadId, item.key);
-      store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
     }
     await Promise.all(timedOut.map((item) => notify(item.coordinatorThreadId, `Workstream ${item.key} was stopped after reaching its worker timeout.`)));
     await Promise.all([...new Set(timedOut.map((item) => item.coordinatorThreadId))].map((id) => launchQueued(id)));

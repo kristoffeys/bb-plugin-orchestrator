@@ -168,9 +168,7 @@ provider and model lists come from BB's live catalogs, so OpenCode and future
 providers appear without an Orchestrator release. Claude Code and Codex retain
 the defaults above until explicitly changed. Select **Route by workload
 profile** to send quick, standard, complex, and critical work to different
-providers. Completed work records success, duration, and observed tokens;
-measured recommendations appear after three samples and never change routing
-without an explicit save.
+providers. Per-route outcomes, duration, and tokens are in the learning data.
 
 Reasoning is configured beside every exact provider/model route, both in the
 provider-local table and cross-provider profile strategy. This means two

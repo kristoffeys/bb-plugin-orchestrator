@@ -562,23 +562,4 @@ export class OrchestratorStore {
     `).all(coordinatorThreadId) as ArtifactRow[];
     return rows.map(({ consumersJson, ...row }) => ({ ...row, consumers: parseJson<string[]>(consumersJson) }));
   }
-
-  recordMetric(input: { providerId: string; model: string; profile: WorkerProfile; succeeded: boolean; durationMs: number; totalTokens: number }) {
-    this.db.prepare(`
-      INSERT INTO route_metrics (provider_id, model, profile, samples, successes, failures, duration_ms, total_tokens)
-      VALUES (?, ?, ?, 1, ?, ?, ?, ?)
-      ON CONFLICT(provider_id, model, profile) DO UPDATE SET
-        samples = samples + 1, successes = successes + excluded.successes,
-        failures = failures + excluded.failures, duration_ms = duration_ms + excluded.duration_ms,
-        total_tokens = total_tokens + excluded.total_tokens
-    `).run(input.providerId, input.model, input.profile, input.succeeded ? 1 : 0, input.succeeded ? 0 : 1, input.durationMs, input.totalTokens);
-  }
-
-  listMetrics() {
-    return this.db.prepare(`
-      SELECT provider_id AS providerId, model, profile, samples, successes, failures,
-        duration_ms AS durationMs, total_tokens AS totalTokens
-      FROM route_metrics ORDER BY profile, provider_id, model
-    `).all() as Array<{ providerId: string; model: string; profile: WorkerProfile; samples: number; successes: number; failures: number; durationMs: number; totalTokens: number }>;
-  }
 }
