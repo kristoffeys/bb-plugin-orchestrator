@@ -10,6 +10,10 @@ export interface WorkstreamCondition {
 
 const TERMINAL_REASON: Record<string, string> = { completed: "Completed", failed: "Failed", cancelled: "Cancelled" };
 
+/** A worker that reported `blocked` could not finish, but its dependents wait for the coordinator to revise the plan instead of being cancelled. */
+export const reportedBlocked = (item: WorkstreamRecord | undefined) => item?.state === "failed"
+  && typeof item.result === "object" && item.result !== null && (item.result as { status?: unknown }).status === "blocked";
+
 /** Projects whose single mutating lane is taken. The launcher and the reported conditions must agree on this. */
 export const mutatingLaneHolders = (workstreams: readonly WorkstreamRecord[]) => new Set(workstreams
   .filter((item) => item.accessMode === "mutating" && (
@@ -26,7 +30,7 @@ export const runConditions = (input: {
   environmentAttached: (projectId: string) => boolean;
   maxParallelWorkers: number;
 }) => {
-  const stateOf = new Map(input.workstreams.map((item) => [item.key, item.state]));
+  const byKey = new Map(input.workstreams.map((item) => [item.key, item]));
   const holders = mutatingLaneHolders(input.workstreams);
   const slotsAvailable = input.workstreams.filter((item) => item.state === "running").length < input.maxParallelWorkers;
   return new Map(input.workstreams.map((item): [string, WorkstreamCondition[]] => {
@@ -34,10 +38,13 @@ export const runConditions = (input: {
     if (terminal !== undefined) return [item.key, [{ type: "Ready", status: false, reason: terminal, message: item.error }]];
     if (item.state === "suspended") return [item.key, [{ type: "Ready", status: false, reason: "Suspended", message: "Resume this workstream to continue it." }]];
     const conditions: WorkstreamCondition[] = [];
-    const unmet = input.dependencies(item.key).filter((key) => stateOf.get(key) !== "completed");
+    const unmet = input.dependencies(item.key).filter((key) => byKey.get(key)?.state !== "completed");
+    const blocked = unmet.filter((key) => reportedBlocked(byKey.get(key)));
     conditions.push(unmet.length === 0
       ? { type: "DependenciesSatisfied", status: true, reason: "Satisfied", message: null }
-      : { type: "DependenciesSatisfied", status: false, reason: "WaitingForDependencies", message: `Waiting for ${unmet.join(", ")}` });
+      : blocked.length > 0
+        ? { type: "DependenciesSatisfied", status: false, reason: "DependencyBlocked", message: `${blocked.join(", ")} reported blocked. Revise the plan: drop or replace the dependency, or remove this step.` }
+        : { type: "DependenciesSatisfied", status: false, reason: "WaitingForDependencies", message: `Waiting for ${unmet.join(", ")}` });
     if (item.state === "planned" || item.state === "queued") {
       conditions.push(item.accessMode === "mutating" && holders.has(item.projectId)
         ? { type: "LaneAvailable", status: false, reason: "ProjectLaneBusy", message: `Another ${item.projectId} workstream holds the single mutating lane` }

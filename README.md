@@ -53,7 +53,10 @@ The coordinator dispatches that durable plan by version, so unchanged worker
 prompts are not sent again in the dispatch call.
 Mutating steps start only after every `dependsOn` step
 succeeds and the project's single-writer lane opens. A failed prerequisite
-cancels its blocked dependents with a durable reason. Dispatch must match the
+cancels its dependents with a durable reason. A prerequisite whose worker
+reports `blocked` holds them queued with reason `DependencyBlocked` until the
+coordinator revises the plan. Workers can report `success` with
+`limitations` for caveats that did not stop the assignment. Dispatch must match the
 current plan version, so scope or dependency changes require a plan revision.
 
 Each run creates one shared feature branch name, such as

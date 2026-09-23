@@ -922,6 +922,7 @@ test("artifacts notify named consumers and remain in durable status", async () =
     kind: "api-contract", name: "Items API", version: "v2", summary: "GET /v2/items returns Item[].", content: "{items: Item[]}", consumers: ["frontend"],
   }, { threadId: backend, projectId: "api" });
   assert.ok(state.sent.some((item) => item.threadId === frontend && item.text.includes("Items API")));
+  assert.ok(!state.sent.some((item) => item.threadId === "coord"), "artifact publishes do not wake the coordinator");
   const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(status.artifacts[0].version, "v2");
   assert.equal(status.artifacts[0].content, undefined);
@@ -1281,7 +1282,8 @@ test("exact provider/model routes retain distinct reasoning and pass explicit sp
       assignments: [{ key: `reason-${level}`, projectId: "api", prompt: "Use configured reasoning." }],
     }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
     assert.equal(state.spawned[0]?.reasoningLevel, level);
-    assert.deepEqual(state.spawned[0]?.executionInputSources, { providerId: "explicit", model: "explicit", reasoningLevel: "explicit" });
+    assert.deepEqual(state.spawned[0]?.executionInputSources, { providerId: "explicit", model: "explicit", reasoningLevel: "explicit", permissionMode: "explicit" });
+    assert.equal(state.spawned[0]?.permissionMode, "auto");
     assert.equal(worker.requestedReasoningLevel, level);
     assert.equal(worker.reasoningLevel, level);
     assert.equal(state.threads.get(worker.threadId)!.providerId, "codex");
@@ -1542,4 +1544,56 @@ test("suspending holds the project lane and pauses the run's clocks until it is 
   } finally {
     Date.now = originalNow;
   }
+});
+
+test("a terminal run is not re-notified when its budget stays exceeded", async () => {
+  const state = await load();
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off", tokenBudget: 100 });
+  await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "worker", projectId: "api", prompt: "Work." }],
+  }, { threadId: "coord", projectId: "personal" });
+  const usage = (seq: number, totalTokens: number) => state.eventRows.set("coord", [{
+    id: `usage-${seq}`, threadId: "coord", seq, createdAt: Date.now(), scope: { kind: "thread" },
+    type: "thread/tokenUsage/updated",
+    data: { providerThreadId: "provider-coordinator", tokenUsage: { last: { cachedInputTokens: 0, inputTokens: totalTokens, outputTokens: 0, reasoningOutputTokens: 0, totalTokens }, total: { cachedInputTokens: 0, inputTokens: totalTokens, outputTokens: 0, reasoningOutputTokens: 0, totalTokens }, modelContextWindow: 1000 } },
+  }]);
+  for (const [seq, tokens] of [[1, 150], [2, 200], [3, 250]] as const) {
+    usage(seq, tokens);
+    await state.harness.behavior.emitThreadEvent("experimental_thread.events", { thread: state.threads.get("coord")!, sequence: seq });
+  }
+  assert.equal(state.sent.filter((item) => item.threadId === "coord" && item.text.includes("token budget exceeded")).length, 1);
+});
+
+test("success may carry limitations, and commits default to the run branch", async () => {
+  const { state, worker, featureBranch } = await commitPolicyWorker();
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "Verified: the claim is refuted.", changedFiles: ["a.ts"], validation: [], blockers: [],
+    limitations: ["Could not run the end-to-end suite locally."], commits: ["abc1234"],
+  }, { threadId: worker.threadId, projectId: "api" });
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.workstreams[0].state, "completed");
+  assert.deepEqual(status.workstreams[0].result.limitations, ["Could not run the end-to-end suite locally."]);
+  assert.deepEqual(status.workstreams[0].result.branch, { name: featureBranch, ownership: "orchestrator" });
+});
+
+test("a blocked prerequisite holds its dependents for the coordinator instead of cancelling them", async () => {
+  const state = await load();
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  const steps = [
+    { key: "inspect", projectId: "api", prompt: "Inspect.", accessMode: "read-only" },
+    { key: "implement", projectId: "api", prompt: "Implement.", dependsOn: ["inspect"] },
+  ];
+  await state.harness.behavior.callAgentTool("orchestrator_plan", { scale: "large", rationale: "Depends on investigation.", steps }, { threadId: "coord", projectId: "personal" });
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: steps }, { threadId: "coord", projectId: "personal" }) as string);
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "blocked", summary: "Database access was denied.", changedFiles: [], validation: [], blockers: ["No DB credentials."],
+  }, { threadId: dispatched.workers[0].threadId, projectId: "api" });
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread: state.threads.get(dispatched.workers[0].threadId)!, lastAssistantText: "Blocked." });
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  const dependent = status.workstreams.find((item: { key: string }) => item.key === "implement");
+  assert.equal(dependent.state, "queued");
+  assert.equal(state.spawned.length, 1);
+  const dashboard = await state.harness.behavior.callRpc("run_dashboard_get", { threadId: "coord" }) as { workstreams: Array<{ key: string; conditions: Array<{ type: string; reason: string }> }> };
+  const ready = dashboard.workstreams.find((item) => item.key === "implement")!.conditions.find((condition) => condition.type === "Ready");
+  assert.equal(ready?.reason, "DependencyBlocked");
 });

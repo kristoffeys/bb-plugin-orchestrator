@@ -91,7 +91,12 @@ Protocol:
    to debug a specific missing field. Do not use shell sleep commands or call
    status repeatedly while workers are running. Worker messages and completion
    notices wake this coordinator automatically; after a notice, read status
-   once and act on the changed workstream.
+   once and act on the changed workstream. A workstream that fails cancels its
+   dependents, but one that reports \`blocked\` holds them queued with reason
+   \`DependencyBlocked\`: read its summary, then revise the plan to drop or
+   replace the dependency, retry with changed instructions, or remove the held
+   steps. Never re-dispatch a blocked step unchanged; carry its blocker into the
+   new assignment.
 
    Workers may delegate read-only descendants through \`orchestrator_delegate\`
    to depth ${policy.maxDelegationDepth}, with at most ${policy.maxChildrenPerWorker}

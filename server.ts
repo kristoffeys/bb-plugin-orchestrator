@@ -15,7 +15,7 @@ import {
   type WorkerProfile,
 } from "./lib/policy.ts";
 import { OrchestratorStore, type RunRecord, type WorkstreamRecord } from "./lib/state.ts";
-import { mutatingLaneHolders, runConditions } from "./lib/conditions.ts";
+import { mutatingLaneHolders, reportedBlocked, runConditions } from "./lib/conditions.ts";
 import { parseNewThreadOrchestrationMarker } from "./lib/new-thread-marker.ts";
 import { worktreeHostContract } from "./lib/host-contract.ts";
 
@@ -345,6 +345,7 @@ const completionResult = z.object({
   changedFiles: z.array(z.string().max(1_000)).max(200).default([]),
   validation: z.array(z.object({ command: z.string().max(2_000), status: z.enum(["passed", "failed", "not-run"]), summary: z.string().max(2_000) })).max(50).default([]),
   blockers: z.array(z.string().max(2_000)).max(30).default([]),
+  limitations: z.array(z.string().max(2_000)).max(30).default([]),
   commits: z.array(z.string().regex(/^[0-9a-f]{7,64}$/i, "Commit SHAs must be hexadecimal.")).max(50).default([]),
   branch: z.object({
     name: z.string().trim().min(1).max(500),
@@ -355,7 +356,7 @@ const completionResult = z.object({
   pushApproval: z.object({ approvedByUser: z.literal(true), evidence: z.string().trim().min(1).max(2_000) }).optional(),
 }).superRefine((result, ctx) => {
   if (result.status === "success" && result.blockers.length > 0) {
-    ctx.addIssue({ code: "custom", path: ["blockers"], message: "Successful work cannot have blockers. Use status blocked, or move non-blocking limitations into the summary or validation notes." });
+    ctx.addIssue({ code: "custom", path: ["blockers"], message: "Successful work cannot have blockers. Move caveats that did not stop the assignment into limitations." });
   }
 });
 const artifactInput = z.object({
@@ -717,7 +718,7 @@ export default async function plugin(bb: BbPluginApi) {
       ? "This delegated workstream is read-only. Do not edit files, create commits, or push. Report findings through messages/artifacts and worker_done."
       : "This is the sole mutating workstream in its project lane. Nested delegation is read-only only, so descendants cannot race this writer.";
     const planning = plannedStep === undefined ? "" : `\nPlan context:\n- Phase: ${plannedStep.phase ?? "unspecified"}.\n- Dependencies: ${plannedStep.dependsOn.length === 0 ? "none" : plannedStep.dependsOn.join(", ")}.\n- Success criteria: ${plannedStep.successCriteria?.length ? plannedStep.successCriteria.join("; ") : "use the assignment and completion contract"}.`;
-    return `${item.assignment}${planning}\n\nManaged workstream contract:\n- Work on the Orchestrator-owned feature branch ${JSON.stringify(run.featureBranch)}. This workstream shares one durable project worktree with this run's other ${item.projectId} workstreams. Preserve unrelated changes and do not create, check out, or switch to another branch or environment.\n- ${access}\n- Keep the execution bounded to roughly ${WORKSTREAM_ACTION_BUDGET[item.profile]} tool actions. Read the smallest relevant surface, implement, and validate targeted behavior. If the scope cannot be completed within that budget, report a blocker or delegate a bounded read-only investigation instead of exhaustively exploring.\n- You may delegate bounded read-only subtasks only with orchestrator_delegate; never spawn threads directly.\n- Commit mode is ${run.policy.commitMode}; push mode is ${run.policy.pushMode}; protected branches are ${JSON.stringify(protectedBranches)}. Protected branches cannot be committed to or pushed. Existing branches require separate explicit user approval for commits and pushes. Orchestrator-owned branches need no commit approval. Never push without explicit user approval.\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers.\n- Before ending, call orchestrator_worker_done exactly once with ordered commit SHAs, changed files, validation, and blockers. Parent completion is rejected while descendants are live. An idle turn without that record is treated as a failed workstream.`;
+    return `${item.assignment}${planning}\n\nManaged workstream contract:\n- Work on the Orchestrator-owned feature branch ${JSON.stringify(run.featureBranch)}. This workstream shares one durable project worktree with this run's other ${item.projectId} workstreams. Preserve unrelated changes and do not create, check out, or switch to another branch or environment.\n- ${access}\n- Keep the execution bounded to roughly ${WORKSTREAM_ACTION_BUDGET[item.profile]} tool actions. Read the smallest relevant surface, implement, and validate targeted behavior. If the scope cannot be completed within that budget, report a blocker or delegate a bounded read-only investigation instead of exhaustively exploring.\n- You may delegate bounded read-only subtasks only with orchestrator_delegate; never spawn threads directly.\n- Commit mode is ${run.policy.commitMode}; push mode is ${run.policy.pushMode}; protected branches are ${JSON.stringify(protectedBranches)}. Protected branches cannot be committed to or pushed. Existing branches require separate explicit user approval for commits and pushes. Orchestrator-owned branches need no commit approval. Never push without explicit user approval.\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers.\n- Before ending, call orchestrator_worker_done exactly once with ordered commit SHAs, changed files, validation, and blockers. Status says whether you finished your assignment, not whether the news is good: a verification that refutes a claim, or an investigation that answers the question, is success. Put caveats that did not stop the assignment (an untested path, missing access for an optional check) in limitations. Use blocked only when the assignment itself could not be finished. Parent completion is rejected while descendants are live. An idle turn without that record is treated as a failed workstream.`;
   };
 
   const launchQueuedUnlocked = async (coordinatorThreadId: string, signal?: AbortSignal) => {
@@ -733,7 +734,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (signal?.aborted) throw abortError();
       if (available <= 0) break;
       const dependencies = item.parentKey === null ? planSteps.get(item.key)?.dependsOn ?? [] : [];
-      const failedDependency = dependencies.find((key) => ["failed", "cancelled"].includes(workstreamsByKey.get(key)?.state ?? "cancelled"));
+      const failedDependency = dependencies.find((key) => ["failed", "cancelled"].includes(workstreamsByKey.get(key)?.state ?? "cancelled") && !reportedBlocked(workstreamsByKey.get(key)));
       if (failedDependency !== undefined) {
         store.setWorkstreamState(coordinatorThreadId, item.key, "cancelled", { error: `Dependency ${failedDependency} did not complete successfully.` });
         store.releaseProjectLane(coordinatorThreadId, item.key);
@@ -763,7 +764,9 @@ export default async function plugin(bb: BbPluginApi) {
           providerId: item.providerId,
           model: item.model,
           reasoningLevel: item.reasoningLevel as z.output<typeof reasoningLevel>,
-          executionInputSources: { providerId: "explicit", model: "explicit", reasoningLevel: "explicit" },
+          // Without an explicit mode, workers could inherit one that prompts for every edit, and each prompt woke the coordinator.
+          permissionMode: "auto",
+          executionInputSources: { providerId: "explicit", model: "explicit", reasoningLevel: "explicit", permissionMode: "explicit" },
           pluginMetadata: {
             role: "worker", coordinatorThreadId, key: item.key, parentKey: item.parentKey, depth: item.depth,
             accessMode: item.accessMode, projectId: item.projectId, assignment: item.assignment,
@@ -1584,7 +1587,7 @@ export default async function plugin(bb: BbPluginApi) {
           summary: typeof result.summary === "string" ? clip(result.summary, 2_000) : null,
           changedFiles: strings("changedFiles", 100),
           validation: Array.isArray(result.validation) ? result.validation.slice(0, 30) : [],
-          blockers: strings("blockers", 30), commits: strings("commits", 50), pushedCommits: strings("pushedCommits", 50),
+          blockers: strings("blockers", 30), limitations: strings("limitations", 30), commits: strings("commits", 50), pushedCommits: strings("pushedCommits", 50),
           branch: result.branch ?? null,
         };
       };
@@ -1627,7 +1630,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.agents.registerTool({
     name: "orchestrator_publish_artifact",
-    description: "Publish a versioned contract or decision and notify its consumers.",
+    description: "Publish a versioned contract or decision and notify its consumer workstreams. The coordinator is not woken; it reads artifacts from status.",
     presentation: { label: { pending: "Publishing handoff artifact", completed: "Published handoff artifact" } },
     parameters: artifactInput,
     async execute(input, { threadId }) {
@@ -1642,7 +1645,7 @@ export default async function plugin(bb: BbPluginApi) {
         summary: input.summary, content: input.content ?? null, path: input.path ?? null, consumers: input.consumers,
       });
       const notice = `Orchestrator artifact #${id}: ${input.name}${input.version === undefined ? "" : ` (${input.version})`} — ${input.summary}`;
-      await notify(coordinatorThreadId, notice, threadId);
+      // The coordinator sees artifacts in status; waking it for every publish cost a full-context turn each time.
       await Promise.all(input.consumers.map(async (key) => {
         const consumer = known.get(key);
         if (consumer?.threadId !== null && consumer?.threadId !== undefined) await notify(consumer.threadId, notice, threadId);
@@ -1670,29 +1673,30 @@ export default async function plugin(bb: BbPluginApi) {
         throw new Error("Read-only delegated workstreams cannot report file changes, commits, or pushes.");
       }
       const hasVcsAction = result.commits.length > 0 || result.pushedCommits.length > 0;
-      if (hasVcsAction && result.branch === undefined) throw new Error("A branch record is required when commits or pushes are reported.");
-      if (result.branch !== undefined && effectiveProtectedBranches(run.policy).includes(result.branch.name) && hasVcsAction) {
-        throw new Error(`Branch ${result.branch.name} is protected by this run and cannot be committed to or pushed.`);
+      // Workers run in the run-owned worktree, so an omitted branch means the run's feature branch.
+      const branch = result.branch ?? { name: run.featureBranch, ownership: "orchestrator" as const };
+      if (effectiveProtectedBranches(run.policy).includes(branch.name) && hasVcsAction) {
+        throw new Error(`Branch ${branch.name} is protected by this run and cannot be committed to or pushed.`);
       }
       if (result.commits.length > 0) {
         if (run.policy.commitMode === "disabled") throw new Error("Commits are disabled by this run's policy.");
-        if (result.branch?.ownership === "existing") {
+        if (branch.ownership === "existing") {
           if (run.policy.commitMode !== "owned-or-approved-existing") throw new Error("This run permits commits only on Orchestrator-owned branches.");
           if (result.commitApproval === undefined) throw new Error("Committing to an existing branch requires explicit user approval evidence.");
         }
       }
       if (result.pushedCommits.length > 0) {
         if (run.policy.pushMode === "disabled") throw new Error("Pushes are disabled by this run's policy.");
-        if (result.pushApproval === undefined) throw new Error("Every push requires separate explicit user approval evidence.");
+        if (result.pushApproval === undefined) throw new Error("Every push requires separate explicit user approval evidence. Add pushApproval quoting the user's instruction that asked for this push. Never invent approval evidence.");
         const commits = new Set(result.commits);
         if (result.pushedCommits.some((sha) => !commits.has(sha))) throw new Error("Pushed commit SHAs must be included in this workstream's ordered commits.");
       }
-      if (result.branch?.ownership === "orchestrator" && result.branch.name !== run.featureBranch) {
-        throw new Error(`Orchestrator-owned commits must stay on the run branch ${run.featureBranch}; reported branch ${result.branch.name} is outside this run.`);
+      if (branch.ownership === "orchestrator" && branch.name !== run.featureBranch) {
+        throw new Error(`Orchestrator-owned commits must stay on the run branch ${run.featureBranch}; reported branch ${branch.name} is outside this run.`);
       }
       const measuredItem = await refreshWorkstreamUsage(item);
       const evidence = await captureCompletionEvidence(measuredItem, threadId);
-      const resultWithEvidence = { ...result, evidence };
+      const resultWithEvidence = { ...result, ...(hasVcsAction ? { branch } : {}), evidence };
       const review = result.status === "success" && (run.policy.evaluator === "always" || (run.policy.evaluator === "critical" && item.profile === "critical"));
       const state = result.status === "success" ? (review ? "reviewing" : "completed") : "failed";
       const next = store.setWorkstreamState(meta.coordinatorThreadId, meta.key, state, { result: resultWithEvidence, error: result.status === "success" ? null : result.summary, reasonCode: result.status === "success" ? null : result.status === "blocked" ? "worker_blocked" : "worker_reported_failure" })!;
@@ -1861,7 +1865,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (refreshed.lastEventSeq === item.lastEventSeq) return;
     }
     const total = store.getRun(run.coordinatorThreadId)?.totalTokens ?? 0;
-    if (run !== null && run.policy.tokenBudget > 0 && total > run.policy.tokenBudget) {
+    // A terminal run must not re-notify: each notice starts a coordinator turn whose events would land here again.
+    if (!isTerminalRun(store.getRun(run.coordinatorThreadId)?.state ?? run.state) && run.policy.tokenBudget > 0 && total > run.policy.tokenBudget) {
       await notify(run.coordinatorThreadId, `Run token budget exceeded (${total}/${run.policy.tokenBudget}). Active workers were stopped.`);
       await cleanupRun(run.coordinatorThreadId, "failed", `Token budget exceeded (${total}/${run.policy.tokenBudget}).`);
     }
