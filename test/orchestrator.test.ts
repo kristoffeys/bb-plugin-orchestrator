@@ -248,7 +248,7 @@ test("coordinator titles skip prompt scaffolding and remain compact", () => {
 
 test("auto planning classifies small requests before taking the fast path", async () => {
   const state = await load();
-  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never" });
   await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_dispatch", {
     assignments: [{ key: "small", projectId: "api", prompt: "Make a focused fix." }],
   }, { threadId: "coord", projectId: "personal" }), /orchestrator_plan/);
@@ -298,7 +298,7 @@ test("run dashboard combines live worker state with captured completion evidence
 
 test("large plans run independent investigations in parallel and gate dependent mutation", async () => {
   const state = await load();
-  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never" });
   const steps = [
     { key: "inspect-api", projectId: "api", prompt: "Inspect the API contract.", accessMode: "read-only", phase: "investigate", successCriteria: ["Publish findings"] },
     { key: "inspect-tests", projectId: "api", prompt: "Inspect test coverage.", accessMode: "read-only", phase: "investigate", successCriteria: ["Identify gaps"] },
@@ -327,7 +327,7 @@ test("large plans run independent investigations in parallel and gate dependent 
 
 test("incremental plan updates preserve unchanged steps and reject stale or invalid patches", async () => {
   const state = await load();
-  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never" });
   const inspect = { key: "inspect", projectId: "api", prompt: "Inspect the current contract.", accessMode: "read-only" as const };
   const obsolete = { key: "obsolete", projectId: "web", prompt: "Inspect an approach that is no longer needed.", accessMode: "read-only" as const };
   await state.harness.behavior.callAgentTool("orchestrator_plan", {
@@ -373,7 +373,7 @@ test("incremental plan updates preserve unchanged steps and reject stale or inva
 
 test("planning rejects dependency cycles and cancels work blocked by a failed prerequisite", async () => {
   const state = await load();
-  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never" });
   await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_plan", {
     scale: "large", rationale: "Invalid cycle.", steps: [
       { key: "a", projectId: "api", prompt: "A", dependsOn: ["b"] },
@@ -568,7 +568,7 @@ test("reconciling a new desired set preserves terminal workstream outcomes", asy
 
 test("finish evaluates the current plan without erasing obsolete failure history", async () => {
   const state = await load();
-  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "auto", evaluator: "never" });
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "auto" });
   const investigate = { key: "investigate", projectId: "api", prompt: "Investigate.", accessMode: "read-only" as const };
   await state.harness.behavior.callAgentTool("orchestrator_plan", { scale: "large", rationale: "Investigate before implementation.", steps: [investigate] }, { threadId: "coord", projectId: "personal" });
   const first = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [investigate] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
@@ -727,7 +727,7 @@ test("durable concurrency queues work and completion launches the next worker", 
   await state.harness.behavior.callRpc("policy_set", {
     maxParallelWorkers: 1, maxWorkersPerRun: 4, maxAttemptsPerWorkstream: 2,
     workerTimeoutMinutes: 30, runTimeoutMinutes: 120, inactiveCleanupMinutes: 60,
-    tokenBudget: 0, planningMode: "off", approval: "never", evaluator: "never",
+    tokenBudget: 0, planningMode: "off", approval: "never",
   });
   const dispatched = JSON.parse(await state.harness.behavior.callAgentTool(
     "orchestrator_dispatch",
@@ -838,7 +838,7 @@ test("observed token usage enforces the run budget", async () => {
   await state.harness.behavior.callRpc("policy_set", {
     maxParallelWorkers: 2, maxWorkersPerRun: 4, maxAttemptsPerWorkstream: 2,
     workerTimeoutMinutes: 30, runTimeoutMinutes: 120, inactiveCleanupMinutes: 60,
-    tokenBudget: 100, planningMode: "off", approval: "never", evaluator: "never",
+    tokenBudget: 100, planningMode: "off", approval: "never",
   });
   const dispatched = JSON.parse(await state.harness.behavior.callAgentTool(
     "orchestrator_dispatch",
@@ -936,7 +936,7 @@ test("artifacts notify named consumers and remain in durable status", async () =
   assert.equal(full.artifacts[0].consumersJson, undefined);
 });
 
-test("critical dispatch approval and evaluator review are enforced", async () => {
+test("critical dispatch approval is enforced and completion needs no coordinator review", async () => {
   const state = await load();
   const pending = state.harness.behavior.callAgentTool(
     "orchestrator_dispatch",
@@ -951,11 +951,14 @@ test("critical dispatch approval and evaluator review are enforced", async () =>
   await state.harness.behavior.callAgentTool("orchestrator_worker_done", {
     status: "success", summary: "Auth change validated.", changedFiles: ["auth.ts"], validation: [], blockers: [],
   }, { threadId: dispatched.workers[0].threadId, projectId: "api" });
-  let status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
-  assert.equal(status.workstreams[0].state, "reviewing");
-  await state.harness.behavior.callAgentTool("orchestrator_review", { key: "critical", decision: "accept" }, { threadId: "coord", projectId: "personal" });
-  status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(status.workstreams[0].state, "completed");
+});
+
+test("saved policies from before the evaluator gate was removed still load", () => {
+  const parsed = parseOrchestrationPolicy({ ...DEFAULT_POLICY, evaluator: "critical" });
+  assert.equal("evaluator" in parsed, false);
+  assert.equal(parsed.approval, DEFAULT_POLICY.approval);
 });
 
 test("profile routing can select another active provider", async () => {
@@ -1214,7 +1217,7 @@ test("commit policy defaults and protected branch normalization are durable and 
 
 async function commitPolicyWorker(policy: Partial<typeof DEFAULT_POLICY> = {}) {
   const state = await load();
-  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off", evaluator: "never", ...policy });
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off", ...policy });
   const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
     assignments: [{ key: "commit", projectId: "api", prompt: "Commit atomically." }],
   }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
@@ -1488,7 +1491,7 @@ test("workstream conditions name the reason each workstream is not ready", async
   assert.equal(status.workstreams.find((item: { key: string }) => item.key === "second").waiting.reason, "ProjectLaneBusy");
 
   const planned = await load();
-  await planned.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  await planned.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never" });
   const steps = [
     { key: "inspect", projectId: "api", prompt: "Inspect.", accessMode: "read-only" },
     { key: "implement", projectId: "api", prompt: "Implement.", dependsOn: ["inspect"] },
@@ -1581,7 +1584,7 @@ test("success may carry limitations, and commits default to the run branch", asy
 
 test("a blocked prerequisite holds its dependents for the coordinator instead of cancelling them", async () => {
   const state = await load();
-  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never" });
   const steps = [
     { key: "inspect", projectId: "api", prompt: "Inspect.", accessMode: "read-only" },
     { key: "implement", projectId: "api", prompt: "Implement.", dependsOn: ["inspect"] },
@@ -1626,7 +1629,7 @@ test("coordinator turns after finish count toward neither the finished nor the n
 
 test("a dependent worker's prompt carries upstream results and its artifacts", async () => {
   const state = await load();
-  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never" });
   const steps = [
     { key: "inspect", projectId: "api", prompt: "Inspect.", accessMode: "read-only" },
     { key: "implement", projectId: "api", prompt: "Implement.", dependsOn: ["inspect"] },

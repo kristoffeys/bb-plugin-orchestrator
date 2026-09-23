@@ -10,7 +10,7 @@ bb plugin install git:https://github.com/kristoffeys/bb-plugin-orchestrator.git@
 
 The plugin owns durable run/workstream state, bounded hierarchical worker
 reconciliation, event-driven completion and retry handling, parent/worker
-messaging, cleanup, approval and evaluator gates, structured artifacts,
+messaging, cleanup, dispatch approval gates, structured artifacts,
 configurable commit policy, and cost-aware model and reasoning routing.
 Callers such as the Sidebar plugin provide a label, task, and allowed project
 ids through the `start` RPC; they do not manage worker threads themselves.
@@ -132,7 +132,7 @@ complexity reason. The default routing is:
 Open **Settings → Installed Plugins → Orchestrator → Orchestration policy** to
 configure parallelism, per-run workstream and attempt ceilings, worker/run/
 inactivity timeouts, an optional observed token budget, dispatch approvals,
-evaluator gates, delegation limits, and version-control policy. Each run
+delegation limits, and version-control policy. Each run
 snapshots this policy when orchestration is enabled, so changing global defaults
 never changes a run already in progress.
 

@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { parseOrchestrationPolicy, type OrchestrationPolicy, type WorkerProfile } from "./policy.ts";
 
 export type RunState = "configured" | "running" | "awaiting_approval" | "blocked" | "suspended" | "completed" | "failed" | "cancelled";
-export type WorkstreamState = "planned" | "awaiting_approval" | "queued" | "running" | "suspended" | "reviewing" | "completed" | "failed" | "cancelled";
+export type WorkstreamState = "planned" | "awaiting_approval" | "queued" | "running" | "suspended" | "completed" | "failed" | "cancelled";
 
 export interface RunRecord {
   coordinatorThreadId: string;

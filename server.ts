@@ -99,7 +99,7 @@ const runDashboard = z.object({
     label: z.string(), sessionId: z.string(), featureBranch: z.string(), state: z.string(), createdAt: z.number(), updatedAt: z.number(), lastActivityAt: z.number(),
     totalTokens: z.number(), tokenBudget: z.number(), error: z.string().nullable(),
   }).nullable(),
-  counts: z.object({ total: z.number(), active: z.number(), queued: z.number(), completed: z.number(), failed: z.number(), reviewing: z.number() }),
+  counts: z.object({ total: z.number(), active: z.number(), queued: z.number(), completed: z.number(), failed: z.number() }),
   workstreams: z.array(dashboardWorkstream),
   artifacts: z.array(z.object({ id: z.number(), workstreamKey: z.string(), kind: z.string(), name: z.string(), version: z.string().nullable(), summary: z.string(), path: z.string().nullable(), createdAt: z.number() })),
 });
@@ -971,7 +971,7 @@ export default async function plugin(bb: BbPluginApi) {
   };
 
   const liveWorkerSnapshotFor = async (item: WorkstreamRecord): Promise<z.output<typeof liveWorkerSnapshot> | null> => {
-    if (item.threadId === null || !["running", "reviewing"].includes(item.state)) return null;
+    if (item.threadId === null || item.state !== "running") return null;
     const threadId = item.threadId;
     const [threadResult, outputResult, contextResult, timelineResult, tokenResult] = await Promise.allSettled([
       bb.sdk.threads.get({ threadId }),
@@ -1024,7 +1024,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (coordinatorThreadId === null || run === null) {
         return {
           available: false, coordinatorThreadId: null, run: null,
-          counts: { total: 0, active: 0, queued: 0, completed: 0, failed: 0, reviewing: 0 },
+          counts: { total: 0, active: 0, queued: 0, completed: 0, failed: 0 },
           workstreams: [], artifacts: [],
         };
       }
@@ -1071,7 +1071,6 @@ export default async function plugin(bb: BbPluginApi) {
           queued: workstreams.filter((item) => item.state === "queued").length,
           completed: workstreams.filter((item) => item.state === "completed").length,
           failed: workstreams.filter((item) => item.state === "failed" || item.state === "cancelled").length,
-          reviewing: workstreams.filter((item) => item.state === "reviewing").length,
         },
         workstreams,
         artifacts: store.listArtifacts(coordinatorThreadId).map(({ id, workstreamKey, kind, name, version, summary, path, createdAt }) => ({ id, workstreamKey, kind, name, version, summary, path, createdAt })),
@@ -1730,62 +1729,23 @@ export default async function plugin(bb: BbPluginApi) {
       const measuredItem = await refreshWorkstreamUsage(item);
       const evidence = await captureCompletionEvidence(measuredItem, threadId);
       const resultWithEvidence = { ...result, ...(hasVcsAction ? { branch } : {}), evidence };
-      const review = result.status === "success" && (run.policy.evaluator === "always" || (run.policy.evaluator === "critical" && item.profile === "critical"));
-      const state = result.status === "success" ? (review ? "reviewing" : "completed") : "failed";
+      const state = result.status === "success" ? "completed" : "failed";
       const next = store.setWorkstreamState(meta.coordinatorThreadId, meta.key, state, { result: resultWithEvidence, error: result.status === "success" ? null : result.summary, reasonCode: result.status === "success" ? null : result.status === "blocked" ? "worker_blocked" : "worker_reported_failure" })!;
       if (item.parentKey !== null) {
         const parent = store.getWorkstream(meta.coordinatorThreadId, item.parentKey);
         if (parent?.threadId !== null && parent?.threadId !== undefined) {
-          await notify(parent.threadId, `Child workstream ${meta.key} ${review ? "is ready for review" : state}: ${result.summary}`, threadId);
+          await notify(parent.threadId, `Child workstream ${meta.key} ${state}: ${result.summary}`, threadId);
         }
       }
       bb.realtime.publish("run-changed", { threadId: meta.coordinatorThreadId });
-      return JSON.stringify({ key: meta.key, state: next.state, reviewRequired: review });
-    },
-  });
-
-  bb.agents.registerTool({
-    name: "orchestrator_review",
-    description: "Accept or reject a structured workstream result at its evaluator gate.",
-    presentation: { label: { pending: "Reviewing workstream", completed: "Reviewed workstream" } },
-    parameters: z.object({
-      key: z.string().min(1).max(100), decision: z.enum(["accept", "reject"]), feedback: z.string().trim().min(1).max(5_000).optional(),
-    }).superRefine((value, ctx) => {
-      if (value.decision === "reject" && value.feedback === undefined) ctx.addIssue({ code: "custom", path: ["feedback"], message: "Rejected work needs feedback." });
-    }),
-    async execute({ key, decision, feedback }, { threadId }) {
-      await requireCoordinator(threadId);
-      const run = store.getRun(threadId);
-      const item = store.getWorkstream(threadId, key);
-      if (run === null || item?.state !== "reviewing") throw new Error(`Workstream ${key} is not awaiting review.`);
-      if (decision === "accept") {
-        store.setWorkstreamState(threadId, key, "completed");
-        store.releaseProjectLane(threadId, key);
-        await launchQueued(threadId);
-        if (item.threadId !== null) await retireWorker(item.threadId);
-        return JSON.stringify({ key, state: "completed" });
-      }
-      if (item.attemptCount >= run.policy.maxAttemptsPerWorkstream || item.threadId === null) {
-        store.setWorkstreamState(threadId, key, "failed", { error: feedback, reasonCode: "evaluation_rejected" });
-        store.releaseProjectLane(threadId, key);
-        await launchQueued(threadId);
-        if (item.threadId !== null) await retireWorker(item.threadId);
-        return JSON.stringify({ key, state: "failed", retry: false });
-      }
-      store.setWorkstreamState(threadId, key, "running", { incrementAttempt: true, error: feedback });
-      await bb.sdk.threads.send({
-        threadId: item.threadId, senderThreadId: threadId, mode: "auto", model: item.model,
-        reasoningLevel: item.reasoningLevel as z.output<typeof reasoningLevel>,
-        input: [{ type: "text", text: `Evaluator rejected the result. Address this feedback, validate again, and call orchestrator_worker_done:\n\n${feedback}`, mentions: [] }],
-      });
-      return JSON.stringify({ key, state: "running", retry: true });
+      return JSON.stringify({ key: meta.key, state: next.state });
     },
   });
 
   bb.agents.registerTool({
     name: "orchestrator_finish",
     description: "Complete a run and archive all managed workers without deleting history.",
-    instructions: "Call after all structured results and evaluator gates are settled.",
+    instructions: "Call after all structured results and integration are settled.",
     presentation: { label: { pending: "Completing orchestration run", completed: "Completed orchestration run" } },
     parameters: z.object({ workerThreadIds: z.array(z.string().min(1)).max(50).default([]) }),
     async execute({ workerThreadIds }, { threadId }) {
@@ -1999,7 +1959,7 @@ export default async function plugin(bb: BbPluginApi) {
         };
       }
       return {
-        tools: ["orchestrator_plan", "orchestrator_plan_update", "orchestrator_dispatch", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_review", "orchestrator_finish"],
+        tools: ["orchestrator_plan", "orchestrator_plan_update", "orchestrator_dispatch", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_finish"],
         skills: [],
         instructions: "You are a managed Orchestrator coordinator; follow the protocol in your first message. The plugin is the single lifecycle writer: plan with orchestrator_plan, revise with orchestrator_plan_update, dispatch by planVersion, and finish only when every workstream is terminal. Do not edit, test, or review project code yourself or with your provider's own subagents. Worker messages and completion notices wake you; read compact status once per wake and never poll or sleep.",
       };

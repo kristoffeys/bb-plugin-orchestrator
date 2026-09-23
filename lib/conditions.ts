@@ -18,7 +18,6 @@ export const reportedBlocked = (item: WorkstreamRecord | undefined) => item?.sta
 export const mutatingLaneHolders = (workstreams: readonly WorkstreamRecord[]) => new Set(workstreams
   .filter((item) => item.accessMode === "mutating" && (
     item.state === "running"
-    || item.state === "reviewing"
     || (item.state === "suspended" && item.threadId !== null)
     || (item.threadId !== null && item.laneReleasedAt === null && ["completed", "failed", "cancelled"].includes(item.state))))
   .map((item) => item.projectId));
@@ -59,7 +58,6 @@ export const runConditions = (input: {
     const blocking = conditions.find((condition) => !condition.status) ?? null;
     conditions.push(
       item.state === "running" && workspaceReady ? { type: "Ready", status: true, reason: "Running", message: null }
-      : item.state === "reviewing" ? { type: "Ready", status: false, reason: "AwaitingReview", message: "Waiting for coordinator review" }
       : item.state === "awaiting_approval" ? { type: "Ready", status: false, reason: "AwaitingApproval", message: "Waiting for dispatch approval" }
       : blocking !== null ? { type: "Ready", status: false, reason: blocking.reason, message: blocking.message }
       : { type: "Ready", status: false, reason: "Queued", message: "Waiting for a launch slot" },

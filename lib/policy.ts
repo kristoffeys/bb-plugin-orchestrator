@@ -4,7 +4,6 @@ export const workerProfile = z.enum(["quick", "standard", "complex", "critical"]
 export type WorkerProfile = z.infer<typeof workerProfile>;
 
 export const approvalPolicy = z.enum(["never", "first-dispatch", "critical", "every-dispatch"]);
-export const evaluatorPolicy = z.enum(["never", "critical", "always"]);
 export const providerStrategy = z.enum(["coordinator", "profile"]);
 export const reasoningChoice = z.enum(["model-default", "none", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"]);
 export const commitMode = z.enum(["disabled", "owned-only", "owned-or-approved-existing"]);
@@ -23,7 +22,6 @@ export const orchestrationPolicy = z.object({
   tokenBudget: z.number().int().min(0).max(100_000_000),
   planningMode: planningMode.default("auto"),
   approval: approvalPolicy,
-  evaluator: evaluatorPolicy,
   commitMode: commitMode.default("owned-or-approved-existing"),
   pushMode: pushMode.default("explicit-approval"),
   protectedBranches: z.array(z.string().trim().min(1).max(200)).max(50).default(["main", "develop"])
@@ -43,7 +41,6 @@ export const DEFAULT_POLICY: OrchestrationPolicy = {
   tokenBudget: 40_000_000,
   planningMode: "auto",
   approval: "critical",
-  evaluator: "critical",
   commitMode: "owned-or-approved-existing",
   pushMode: "explicit-approval",
   protectedBranches: ["main", "develop"],
