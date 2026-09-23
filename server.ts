@@ -648,9 +648,11 @@ export default async function plugin(bb: BbPluginApi) {
     if (thread.parentThreadId !== null) throw new Error("Only a root thread can become an orchestrator.");
     await resolveProjects(input.projectIds);
     const existingRun = store.getRun(input.threadId);
-    if (existingRun !== null && ["completed", "failed", "cancelled"].includes(existingRun.state)) store.resetRun(input.threadId);
+    const restarted = existingRun !== null && ["completed", "failed", "cancelled"].includes(existingRun.state);
+    const resetBaseline = restarted ? store.resetRun(input.threadId) : undefined;
+    const baseline = restarted ? await coordinatorUsageBaseline(input.threadId) ?? resetBaseline : undefined;
     await bb.sdk.threads.updatePluginMetadata({ threadId: input.threadId, set: { role: "coordinator", label: input.label, allowedProjectIds: input.projectIds } });
-    store.upsertRun({ coordinatorThreadId: input.threadId, label: input.label, allowedProjectIds: input.projectIds, policy: await readPolicy() });
+    store.upsertRun({ coordinatorThreadId: input.threadId, label: input.label, allowedProjectIds: input.projectIds, policy: await readPolicy() }, baseline);
     bb.realtime.publish("thread-orchestration-changed", { threadId: input.threadId });
     return { threadId: input.threadId };
   };
@@ -857,7 +859,19 @@ export default async function plugin(bb: BbPluginApi) {
       return item;
     }
   };
+  // A new session starts from the coordinator's real current usage, so work done between runs is charged to neither.
+  const coordinatorUsageBaseline = async (threadId: string) => {
+    try {
+      const [row] = await bb.sdk.threads.events.list({ threadId, order: "desc", limit: "1", types: ["thread/tokenUsage/updated"] });
+      return row?.type === "thread/tokenUsage/updated" ? { lastEventSeq: row.seq, ...normalizeTokenUsage(row.data.tokenUsage.total) } : undefined;
+    } catch (error) {
+      bb.log.warn(`Could not read coordinator token usage for ${threadId}: ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
+  };
   const refreshCoordinatorUsage = async (run: RunRecord) => {
+    // A finished run's budget covers its own work only; the coordinator's later turns belong to the next run.
+    if (isTerminalRun(run.state)) return run;
     try {
       const needsNormalization = run.coordinatorInputTokens + run.coordinatorCachedInputTokens + run.coordinatorOutputTokens > run.coordinatorTotalTokens;
       const rows = await bb.sdk.threads.events.list({ threadId: run.coordinatorThreadId, order: "desc", limit: "1", types: ["thread/tokenUsage/updated"] });
@@ -1196,7 +1210,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (policy.planningMode === "always" && steps.length === 0) {
         throw new Error("Planning mode is always, so even a small request needs explicit plan steps.");
       }
-      const coordinatorBaseline = restart ? store.resetRun(threadId) : undefined;
+      const resetBaseline = restart ? store.resetRun(threadId) : undefined;
+      const coordinatorBaseline = restart ? await coordinatorUsageBaseline(threadId) ?? resetBaseline : undefined;
       run = restart || run === null ? store.upsertRun({
         coordinatorThreadId: threadId, label: coordinatorMetadata.label,
         allowedProjectIds: coordinatorMetadata.allowedProjectIds, policy,
@@ -1963,7 +1978,7 @@ export default async function plugin(bb: BbPluginApi) {
         return {
           tools: ["orchestrator_plan", "orchestrator_enable", "orchestrator_status"],
           skills: [],
-          instructions: "This Orchestrator run is terminal. For a new user request, begin with orchestrator_plan; it resets the prior run and refreshes the timeout clock. Use orchestrator_enable only when the user asks to change the allowed projects.",
+          instructions: "This Orchestrator run is finished, but you are still the coordinator: do not edit, commit, push, test, or review project code yourself, and do not use your provider's own subagents or background agents for it. For any new request that touches a project, begin with orchestrator_plan; it starts a fresh run with its own budget and timeout. Answer questions about finished work from the results you already have. Use orchestrator_enable only when the user asks to change the allowed projects.",
         };
       }
       return {

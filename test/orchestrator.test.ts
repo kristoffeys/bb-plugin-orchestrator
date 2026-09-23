@@ -1597,3 +1597,26 @@ test("a blocked prerequisite holds its dependents for the coordinator instead of
   const ready = dashboard.workstreams.find((item) => item.key === "implement")!.conditions.find((condition) => condition.type === "Ready");
   assert.equal(ready?.reason, "DependencyBlocked");
 });
+
+test("coordinator turns after finish count toward neither the finished nor the next run", async () => {
+  const state = await load();
+  const usage = (seq: number, totalTokens: number) => {
+    state.eventRows.set("coord", [{
+      id: `coord-${seq}`, threadId: "coord", seq, createdAt: Date.now(), scope: { kind: "thread" }, type: "thread/tokenUsage/updated",
+      data: { providerThreadId: "provider-coord", tokenUsage: { last: { cachedInputTokens: 0, inputTokens: totalTokens - 10, outputTokens: 10, reasoningOutputTokens: 0, totalTokens }, total: { cachedInputTokens: 0, inputTokens: totalTokens - 10, outputTokens: 10, reasoningOutputTokens: 0, totalTokens }, modelContextWindow: 1000 } },
+    }]);
+    return state.harness.behavior.emitThreadEvent("experimental_thread.events", { thread: state.threads.get("coord")!, sequence: seq });
+  };
+  const status = async () => JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "first", projectId: "api", prompt: "First." }],
+  }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  await usage(1, 100);
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", { status: "success", summary: "Done.", changedFiles: [], validation: [], blockers: [] }, { threadId: worker.threadId, projectId: "api" });
+  await state.harness.behavior.callAgentTool("orchestrator_finish", { workerThreadIds: [worker.threadId] }, { threadId: "coord", projectId: "personal" });
+  await usage(2, 900);
+  assert.equal((await status()).run.coordinatorTotalTokens, 100);
+  await state.harness.behavior.callAgentTool("orchestrator_plan", { scale: "small", rationale: "Follow-up." }, { threadId: "coord", projectId: "personal" });
+  await usage(3, 950);
+  assert.equal((await status()).run.coordinatorTotalTokens, 50);
+});
