@@ -1,8 +1,8 @@
 import type Database from "better-sqlite3";
 import { parseOrchestrationPolicy, type OrchestrationPolicy, type WorkerProfile } from "./policy.ts";
 
-export type RunState = "configured" | "running" | "awaiting_approval" | "blocked" | "completed" | "failed" | "cancelled";
-export type WorkstreamState = "planned" | "awaiting_approval" | "queued" | "running" | "reviewing" | "completed" | "failed" | "cancelled";
+export type RunState = "configured" | "running" | "awaiting_approval" | "blocked" | "suspended" | "completed" | "failed" | "cancelled";
+export type WorkstreamState = "planned" | "awaiting_approval" | "queued" | "running" | "suspended" | "reviewing" | "completed" | "failed" | "cancelled";
 
 export interface RunRecord {
   coordinatorThreadId: string;
@@ -283,7 +283,7 @@ export class OrchestratorStore {
   }
 
   listExpiredRuns(now: number) {
-    const rows = this.db.prepare("SELECT coordinator_thread_id AS coordinatorThreadId FROM runs WHERE state NOT IN ('completed','failed','cancelled')").all() as Array<{ coordinatorThreadId: string }>;
+    const rows = this.db.prepare("SELECT coordinator_thread_id AS coordinatorThreadId FROM runs WHERE state NOT IN ('completed','failed','cancelled','suspended')").all() as Array<{ coordinatorThreadId: string }>;
     return rows.map(({ coordinatorThreadId }) => this.getRun(coordinatorThreadId)!).filter((run) => {
       const runDeadline = run.createdAt + run.policy.runTimeoutMinutes * 60_000;
       const idleDeadline = run.lastActivityAt + run.policy.inactiveCleanupMinutes * 60_000;
@@ -425,6 +425,15 @@ export class OrchestratorStore {
       details: { from: current.state, attempt: updated.attemptCount, queueMs: state === "running" ? Math.max(0, now - current.createdAt) : null, providerId: updated.providerId, model: updated.model, profile: updated.profile, configuredReasoningLevel: updated.configuredReasoningLevel, requestedReasoningLevel: updated.requestedReasoningLevel, reasoningLevel: updated.reasoningLevel, accessMode: updated.accessMode, error: options.error ?? null, result: telemetryResult(options.result) },
     });
     return updated;
+  }
+
+  /** Move a suspended workstream's start forward by the time it spent suspended, so its worker timeout excludes that pause. */
+  resumeWorkstreamClock(coordinatorThreadId: string, key: string) {
+    const current = this.getWorkstream(coordinatorThreadId, key);
+    if (current === null || current.state !== "suspended" || current.startedAt === null) return current;
+    this.db.prepare("UPDATE workstreams SET started_at = ? WHERE coordinator_thread_id = ? AND key = ?")
+      .run(current.startedAt + Math.max(0, Date.now() - current.updatedAt), coordinatorThreadId, key);
+    return this.getWorkstream(coordinatorThreadId, key);
   }
 
   releaseProjectLane(coordinatorThreadId: string, key: string) {

@@ -73,6 +73,7 @@ type DashboardWorkstream = {
   createdAt: number; updatedAt: number; startedAt: number | null; completedAt: number | null; error: string | null; result: unknown | null;
   evidence: DashboardEvidence | null; live: { status: string | null; displayStatus: string | null; queuedMessageCount: number; outputPreview: string | null; context: { usedTokens: number; modelContextWindow: number; estimated: boolean } | null; pendingTodos: Array<{ id: string; status: "completed" | "in_progress" | "pending"; text: string }>; tokenHistory: Array<{ at: number; tokens: number }> } | null;
   dependencies: string[]; nextAction: string | null;
+  conditions: Array<{ type: "DependenciesSatisfied" | "LaneAvailable" | "WorkspaceReady" | "Ready"; status: boolean; reason: string; message: string | null }>;
 };
 type DashboardData = {
   available: boolean; coordinatorThreadId: string | null;
@@ -397,6 +398,7 @@ const STATE_STYLE: Record<string, string> = {
   failed: "bg-destructive/15 text-destructive",
   cancelled: "bg-muted text-muted-foreground",
   queued: "bg-violet-500/15 text-violet-700 dark:text-violet-300",
+  suspended: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
   awaiting_approval: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
   blocked: "bg-destructive/15 text-destructive",
 };
@@ -609,6 +611,7 @@ function EvidenceBundle({ evidence }: { evidence: DashboardEvidence }) {
   );
 }
 
+type RunControl = (action: "suspend" | "resume", workstreamKey: string | null) => Promise<void>;
 const ATTENTION_STATES = new Set(["failed", "blocked", "awaiting_approval"]);
 const ACTIVE_STATES = new Set(["running", "reviewing"]);
 
@@ -629,6 +632,7 @@ function WorkstreamDetail({ item, result, evidence }: { item: DashboardWorkstrea
       {item.live === null ? null : <div className="mt-3 flex items-center justify-between gap-3"><div className="min-w-0"><p className="text-xs font-medium text-foreground">{item.nextAction ?? "Worker is active"}</p>{item.live.queuedMessageCount > 0 ? <p className="text-[11px] text-muted-foreground">{item.live.queuedMessageCount} queued message{item.live.queuedMessageCount === 1 ? "" : "s"}</p> : null}</div><TokenSparkline samples={item.live.tokenHistory} /></div>}
       {item.live?.pendingTodos.length ? <div className="mt-3"><p className="text-[11px] font-medium text-foreground">Current checklist</p><ul className="mt-1 space-y-1">{item.live.pendingTodos.slice(0, 4).map((todo) => <li key={todo.id} className="flex gap-2 text-xs text-muted-foreground"><span className={todo.status === "completed" ? "text-emerald-600" : todo.status === "in_progress" ? "text-primary" : "text-muted-foreground"}>{todo.status === "completed" ? "✓" : todo.status === "in_progress" ? "●" : "○"}</span><span>{todo.text}</span></li>)}</ul></div> : null}
       {item.live?.outputPreview === null || item.live?.outputPreview === undefined ? null : <details className="group mt-3"><summary className="cursor-pointer list-none text-xs font-medium text-muted-foreground hover:text-foreground">Show live output</summary><div className="mt-2 max-h-64 overflow-y-auto rounded-md bg-muted/20 p-2.5"><FormattedResult text={item.live.outputPreview} /></div></details>}
+      {item.conditions.length === 0 ? null : <ul className="mt-3 space-y-1">{item.conditions.map((condition) => <li key={condition.type} className="flex items-start gap-2 text-[11px]"><span className={condition.status ? "text-emerald-600" : "text-muted-foreground"} aria-hidden="true">{condition.status ? "✓" : "○"}</span><span className="text-muted-foreground"><span className="font-medium text-foreground">{condition.type}</span> · {condition.reason}{condition.message === null ? "" : ` — ${condition.message}`}</span></li>)}</ul>}
       {result?.summary === undefined ? null : <div className="mt-3"><p className="mb-1.5 text-[11px] font-semibold text-foreground">Result</p><ResultPanel result={result} /></div>}
       {blockers.length === 0 ? null : <div className="mt-3 rounded-md border border-destructive/25 bg-destructive/5 px-2.5 py-2 text-xs text-destructive">{blockers.join(" · ")}</div>}
       {evidence === null ? null : <EvidenceBundle evidence={evidence} />}
@@ -636,7 +640,7 @@ function WorkstreamDetail({ item, result, evidence }: { item: DashboardWorkstrea
   );
 }
 
-function WorkstreamRow({ item }: { item: DashboardWorkstream }) {
+function WorkstreamRow({ item, onControl }: { item: DashboardWorkstream; onControl: RunControl }) {
   const navigate = useBbNavigate();
   const result = dashboardResult(item.result);
   const evidence = item.evidence ?? result?.evidence ?? null;
@@ -654,14 +658,19 @@ function WorkstreamRow({ item }: { item: DashboardWorkstream }) {
         <Icon name="ChevronDown" className="size-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" />
       </summary>
       <WorkstreamDetail item={item} result={result} evidence={evidence} />
-      {item.threadId === null ? null : <button type="button" onClick={() => navigate.toThread(item.threadId!)} className="mx-3 mb-3 flex items-center gap-1.5 text-xs font-medium text-primary hover:underline"><Icon name="ArrowUpRight" className="size-3.5" aria-hidden="true" />Open worker thread</button>}
+      <div className="mx-3 mb-3 flex items-center gap-4">
+        {item.threadId === null ? null : <button type="button" onClick={() => navigate.toThread(item.threadId!)} className="flex items-center gap-1.5 text-xs font-medium text-primary hover:underline"><Icon name="ArrowUpRight" className="size-3.5" aria-hidden="true" />Open worker thread</button>}
+        {item.state === "suspended" ? <button type="button" onClick={() => void onControl("resume", item.key)} className="flex items-center gap-1.5 text-xs font-medium text-primary hover:underline"><Icon name="Play" className="size-3.5" aria-hidden="true" />Resume</button>
+          : ["queued", "running"].includes(item.state) ? <button type="button" onClick={() => void onControl("suspend", item.key)} className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground hover:underline"><Icon name="Pause" className="size-3.5" aria-hidden="true" />Suspend</button>
+          : null}
+      </div>
     </details>
   );
 }
 
-function WorkstreamGroup({ title, items, tone = "default" }: { title: string; items: DashboardWorkstream[]; tone?: "default" | "attention" }) {
+function WorkstreamGroup({ title, items, onControl, tone = "default" }: { title: string; items: DashboardWorkstream[]; onControl: RunControl; tone?: "default" | "attention" }) {
   if (items.length === 0) return null;
-  return <section><div className="mb-1.5 flex items-center gap-2"><h3 className={`text-xs font-semibold ${tone === "attention" ? "text-destructive" : "text-foreground"}`}>{title}</h3><span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums text-muted-foreground">{items.length}</span></div><div className={`overflow-hidden rounded-md border bg-card ${tone === "attention" ? "border-destructive/35" : "border-border"}`}>{items.map((item) => <WorkstreamRow key={item.key} item={item} />)}</div></section>;
+  return <section><div className="mb-1.5 flex items-center gap-2"><h3 className={`text-xs font-semibold ${tone === "attention" ? "text-destructive" : "text-foreground"}`}>{title}</h3><span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums text-muted-foreground">{items.length}</span></div><div className={`overflow-hidden rounded-md border bg-card ${tone === "attention" ? "border-destructive/35" : "border-border"}`}>{items.map((item) => <WorkstreamRow key={item.key} item={item} onControl={onControl} />)}</div></section>;
 }
 
 function RunCommandCenter({ threadId }: PluginThreadPanelProps) {
@@ -681,6 +690,11 @@ function RunCommandCenter({ threadId }: PluginThreadPanelProps) {
     return () => window.clearInterval(timer);
   }, [load]);
   useRealtime("run-changed", load);
+  const control = useCallback<RunControl>(async (action, workstreamKey) => {
+    try { await rpc.call("run_control", { threadId, action, workstreamKey }); setError(null); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : `Could not ${action} this run.`); }
+    finally { await load(); }
+  }, [rpc, threadId, load]);
 
   if (data === null && error === null) return <div className="p-4 text-sm text-muted-foreground">Loading live run…</div>;
   if (error !== null && data === null) return <div role="alert" className="p-4 text-sm text-destructive">{error}</div>;
@@ -700,12 +714,15 @@ function RunCommandCenter({ threadId }: PluginThreadPanelProps) {
   return (
     <div className="space-y-4 pb-6">
       <header className="overflow-hidden rounded-lg border border-border bg-card">
-        <div className="flex items-start justify-between gap-3 px-3 pb-3 pt-3"><div className="min-w-0"><div className="flex items-center gap-2"><span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${STATE_STYLE[data.run.state] ?? "bg-muted text-muted-foreground"}`}>{data.run.state.replaceAll("_", " ")}</span><span className="truncate text-[10px] text-muted-foreground">{new Date(data.run.updatedAt).toLocaleTimeString()}</span></div><h2 className="mt-1 truncate text-base font-semibold text-foreground">{data.run.label}</h2><p className={`mt-0.5 text-xs font-medium ${attention.length > 0 ? "text-destructive" : "text-muted-foreground"}`}>{pulse}</p></div><button type="button" onClick={() => void load()} disabled={refreshing} className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50" aria-label="Refresh run"><Icon name="RefreshCw" className={`size-3.5 ${refreshing ? "animate-spin" : ""}`} aria-hidden="true" /></button></div>
+        <div className="flex items-start justify-between gap-3 px-3 pb-3 pt-3"><div className="min-w-0"><div className="flex items-center gap-2"><span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${STATE_STYLE[data.run.state] ?? "bg-muted text-muted-foreground"}`}>{data.run.state.replaceAll("_", " ")}</span><span className="truncate text-[10px] text-muted-foreground">{new Date(data.run.updatedAt).toLocaleTimeString()}</span></div><h2 className="mt-1 truncate text-base font-semibold text-foreground">{data.run.label}</h2><p className={`mt-0.5 text-xs font-medium ${attention.length > 0 ? "text-destructive" : "text-muted-foreground"}`}>{pulse}</p></div><div className="flex items-center gap-1">{data.run.state === "suspended"
+          ? <button type="button" onClick={() => void control("resume", null)} className="grid size-7 place-items-center rounded-md text-primary hover:bg-accent" aria-label="Resume run"><Icon name="Play" className="size-3.5" aria-hidden="true" /></button>
+          : ["running", "configured", "blocked"].includes(data.run.state) ? <button type="button" onClick={() => void control("suspend", null)} className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground" aria-label="Suspend run"><Icon name="Pause" className="size-3.5" aria-hidden="true" /></button> : null}
+          <button type="button" onClick={() => void load()} disabled={refreshing} className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50" aria-label="Refresh run"><Icon name="RefreshCw" className={`size-3.5 ${refreshing ? "animate-spin" : ""}`} aria-hidden="true" /></button></div></div>
         <div className="grid grid-cols-4 border-t border-border bg-muted/15">{([['Moving', active.length], ['Waiting', waiting.length], ['Done', completed.length], ['Issues', attention.length]] as const).map(([label, value]) => <div key={label} className="border-r border-border px-2 py-2 text-center last:border-r-0"><p className={`text-sm font-semibold ${label === "Issues" && value > 0 ? "text-destructive" : "text-foreground"}`}>{value}</p><p className="text-[10px] text-muted-foreground">{label}</p></div>)}</div>
         <div className="border-t border-border px-3 py-2"><p className="mb-1.5 truncate font-mono text-[10px] text-muted-foreground" title={data.run.featureBranch}>{data.run.featureBranch}</p><div className="flex items-center justify-between text-[10px] text-muted-foreground"><span>{formatCount(data.run.totalTokens)} tokens</span><span>{budgetPercent === null ? "No budget" : `${budgetPercent}% of ${formatCount(data.run.tokenBudget)}`}</span></div>{budgetPercent === null ? null : <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-muted"><div className={`h-full rounded-full ${budgetPercent >= 90 ? "bg-destructive" : budgetPercent >= 70 ? "bg-amber-500" : "bg-primary"}`} style={{ width: `${budgetPercent}%` }} /></div>}</div>
         {data.run.error === null ? null : <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">{data.run.error}</p>}
       </header>
-      {data.workstreams.length === 0 ? <p className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">No workstreams have been dispatched.</p> : <div className="space-y-4"><WorkstreamGroup title="Needs attention" items={attention} tone="attention" /><WorkstreamGroup title="In progress" items={active} /><WorkstreamGroup title="Waiting" items={waiting} /><WorkstreamGroup title="Completed" items={completed} /></div>}
+      {data.workstreams.length === 0 ? <p className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">No workstreams have been dispatched.</p> : <div className="space-y-4"><WorkstreamGroup title="Needs attention" items={attention} onControl={control} tone="attention" /><WorkstreamGroup title="In progress" items={active} onControl={control} /><WorkstreamGroup title="Waiting" items={waiting} onControl={control} /><WorkstreamGroup title="Completed" items={completed} onControl={control} /></div>}
       {data.artifacts.length === 0 ? null : <details className="group rounded-md border border-border bg-card"><summary className="flex cursor-pointer list-none items-center justify-between px-3 py-2.5 text-xs font-semibold text-foreground"><span>Artifacts <span className="ml-1 font-normal text-muted-foreground">{data.artifacts.length}</span></span><Icon name="ChevronDown" className="size-3.5 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" /></summary><div className="divide-y divide-border border-t border-border">{data.artifacts.map((artifact) => <div key={artifact.id} className="px-3 py-2"><p className="truncate text-xs font-medium text-foreground">{artifact.name}{artifact.version === null ? "" : ` · ${artifact.version}`}</p><p className="mt-0.5 line-clamp-2 text-[11px] text-muted-foreground">{artifact.workstreamKey} · {artifact.summary}</p></div>)}</div></details>}
     </div>
   );

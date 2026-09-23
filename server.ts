@@ -15,6 +15,7 @@ import {
   type WorkerProfile,
 } from "./lib/policy.ts";
 import { OrchestratorStore, type RunRecord, type WorkstreamRecord } from "./lib/state.ts";
+import { mutatingLaneHolders, runConditions } from "./lib/conditions.ts";
 import { parseNewThreadOrchestrationMarker } from "./lib/new-thread-marker.ts";
 import { worktreeHostContract } from "./lib/host-contract.ts";
 
@@ -82,13 +83,17 @@ const liveWorkerSnapshot = z.object({
   outputPreview: z.string().nullable(), context: evidenceContext.nullable(), pendingTodos: z.array(evidenceTodo),
   tokenHistory: z.array(z.object({ at: z.number(), tokens: z.number() })),
 });
+const workstreamCondition = z.object({
+  type: z.enum(["DependenciesSatisfied", "LaneAvailable", "WorkspaceReady", "Ready"]),
+  status: z.boolean(), reason: z.string(), message: z.string().nullable(),
+});
 const dashboardWorkstream = z.object({
   key: z.string(), title: z.string().nullable(), projectId: z.string(), parentKey: z.string().nullable(), depth: z.number(),
   accessMode: z.enum(["mutating", "read-only"]), profile: workerProfile, providerId: z.string(), model: z.string(),
   state: z.string(), threadId: z.string().nullable(), attemptCount: z.number(), totalTokens: z.number(),
   createdAt: z.number(), updatedAt: z.number(), startedAt: z.number().nullable(), completedAt: z.number().nullable(),
   error: z.string().nullable(), result: z.unknown().nullable(), evidence: completionEvidence.nullable(), live: liveWorkerSnapshot.nullable(),
-  dependencies: z.array(z.string()), nextAction: z.string().nullable(),
+  dependencies: z.array(z.string()), nextAction: z.string().nullable(), conditions: z.array(workstreamCondition),
 });
 const runDashboard = z.object({
   available: z.boolean(), coordinatorThreadId: z.string().nullable(),
@@ -114,6 +119,10 @@ export const rpcContract = defineRpcContract({
   thread_orchestration_get: { input: z.object({ threadId: z.string().min(1) }), output: threadOrchestrationState },
   run_dashboard_get: { input: z.object({ threadId: z.string().min(1) }), output: runDashboard },
   thread_orchestration_disable: { input: z.object({ threadId: z.string().min(1) }), output: z.null() },
+  run_control: {
+    input: z.object({ threadId: z.string().min(1), action: z.enum(["suspend", "resume"]), workstreamKey: z.string().min(1).nullable().default(null) }),
+    output: z.object({ runState: z.string(), affected: z.array(z.string()) }),
+  },
   routing_catalog: { input: z.null(), output: z.object({ providers: z.array(catalogProvider) }) },
   routing_get: { input: z.null(), output: z.object({ routes: routingMap, policy: routingPolicy, metrics: z.array(routeMetric), recommendations: z.array(routeRecommendation) }) },
   routing_set_provider: { input: z.object({ providerId: z.string().min(1), routes: providerProfileRoutes }), output: z.object({ routes: routingMap }) },
@@ -594,6 +603,45 @@ export default async function plugin(bb: BbPluginApi) {
     return descendants;
   };
 
+  const setSuspension = async (coordinatorThreadId: string, action: "suspend" | "resume", workstreamKey: string | null) => {
+    const run = store.getRun(coordinatorThreadId);
+    if (run === null) throw new Error("This thread is not part of a managed Orchestrator run.");
+    if (isTerminalRun(run.state)) throw new Error(`This run is ${run.state} and cannot be suspended or resumed.`);
+    const all = store.listWorkstreams(coordinatorThreadId);
+    const targets = workstreamKey === null ? all : all.filter((item) => item.key === workstreamKey);
+    if (targets.length === 0 && workstreamKey !== null) throw new Error(`No workstream ${workstreamKey} exists in this run.`);
+    const affected: string[] = [];
+    if (action === "suspend") {
+      const live = targets.filter((item) => ["queued", "running"].includes(item.state));
+      await stopWorkers(live.flatMap((item) => item.threadId === null ? [] : [item.threadId]));
+      for (const item of live) {
+        store.setWorkstreamState(coordinatorThreadId, item.key, "suspended", { reasonCode: "operator_suspended" });
+        affected.push(item.key);
+      }
+      if (workstreamKey === null) store.setRunState(coordinatorThreadId, "suspended");
+    } else {
+      for (const item of targets.filter((candidate) => candidate.state === "suspended")) {
+        if (item.threadId === null) {
+          store.setWorkstreamState(coordinatorThreadId, item.key, "queued", { reasonCode: "operator_resumed" });
+        } else {
+          intentionallyStoppingWorkerIds.delete(item.threadId);
+          store.resumeWorkstreamClock(coordinatorThreadId, item.key);
+          store.setWorkstreamState(coordinatorThreadId, item.key, "running", { reasonCode: "operator_resumed" });
+          await notify(item.threadId, "This workstream was resumed. Continue from where you stopped and call orchestrator_worker_done exactly once when it is finished.", coordinatorThreadId);
+        }
+        affected.push(item.key);
+      }
+      if (run.state === "suspended") {
+        const live = store.listWorkstreams(coordinatorThreadId).some((item) => !isTerminalWorkstream(item.state));
+        store.setRunState(coordinatorThreadId, live ? "running" : "configured");
+      }
+      await launchQueued(coordinatorThreadId);
+    }
+    store.recordEvent({ coordinatorThreadId, type: `run.${action}`, workstreamKey, outcome: action, reasonCode: `operator_${action}ed`, details: { affected } });
+    bb.realtime.publish("run-changed", { threadId: coordinatorThreadId });
+    return { runState: store.getRun(coordinatorThreadId)?.state ?? run.state, affected };
+  };
+
   const enable = async (input: z.output<typeof enableInput>) => {
     const thread = await bb.sdk.threads.get({ threadId: input.threadId });
     if (thread.parentThreadId !== null) throw new Error("Only a root thread can become an orchestrator.");
@@ -674,16 +722,12 @@ export default async function plugin(bb: BbPluginApi) {
 
   const launchQueuedUnlocked = async (coordinatorThreadId: string, signal?: AbortSignal) => {
     const run = store.getRun(coordinatorThreadId);
-    if (run === null || ["completed", "failed", "cancelled", "awaiting_approval"].includes(run.state)) return [];
+    if (run === null || ["completed", "failed", "cancelled", "awaiting_approval", "suspended"].includes(run.state)) return [];
     const all = store.listWorkstreams(coordinatorThreadId);
     const planSteps = new Map((store.getPlan(coordinatorThreadId)?.steps ?? []).map((step) => [step.key, step]));
     const workstreamsByKey = new Map(all.map((item) => [item.key, item]));
     let available = Math.max(0, run.policy.maxParallelWorkers - all.filter((item) => item.state === "running").length);
-    const activeProjects = new Set(all.filter((item) => item.accessMode === "mutating" && (
-      item.state === "running"
-      || item.state === "reviewing"
-      || (item.threadId !== null && item.laneReleasedAt === null && ["completed", "failed", "cancelled"].includes(item.state))),
-    ).map((item) => item.projectId));
+    const activeProjects = mutatingLaneHolders(all);
     const launched: WorkstreamRecord[] = [];
     for (const item of all.filter((candidate) => candidate.state === "queued" && candidate.attemptCount < run.policy.maxAttemptsPerWorkstream)) {
       if (signal?.aborted) throw abortError();
@@ -955,24 +999,30 @@ export default async function plugin(bb: BbPluginApi) {
       const dependencies = new Map((plan?.steps ?? []).map((step) => [step.key, step.dependsOn]));
       const durable = store.listWorkstreams(coordinatorThreadId);
       const live = await Promise.all(durable.map(liveWorkerSnapshotFor));
+      const attachedProjects = new Set(store.listProjectEnvironments(coordinatorThreadId).map((item) => item.projectId));
+      const conditions = runConditions({
+        workstreams: durable,
+        dependencies: (key) => dependencies.get(key) ?? [],
+        environmentAttached: (projectId) => attachedProjects.has(projectId),
+        maxParallelWorkers: run.policy.maxParallelWorkers,
+      });
       const workstreams = durable.map((item, index) => {
         const parsedEvidence = typeof item.result === "object" && item.result !== null && "evidence" in item.result
           ? completionEvidence.safeParse(item.result.evidence)
           : null;
         const itemDependencies = dependencies.get(item.key) ?? [];
-        const unmet = itemDependencies.filter((key) => store.getWorkstream(coordinatorThreadId, key)?.state !== "completed");
-        const nextAction = item.state === "queued"
-          ? unmet.length > 0 ? `Waiting for ${unmet.join(", ")}` : "Waiting for a project lane or worker slot"
-          : item.state === "reviewing" ? "Waiting for coordinator review"
-          : item.state === "running" && live[index]?.pendingTodos[0] !== undefined ? live[index]!.pendingTodos[0]!.text
-          : item.error;
+        const itemConditions = conditions.get(item.key) ?? [];
+        const ready = itemConditions.find((condition) => condition.type === "Ready") ?? null;
+        const nextAction = item.state === "running" && live[index]?.pendingTodos[0] !== undefined
+          ? live[index]!.pendingTodos[0]!.text
+          : ready?.status === false ? ready.message ?? item.error : item.error;
         return {
           key: item.key, title: item.title, projectId: item.projectId, parentKey: item.parentKey, depth: item.depth,
           accessMode: item.accessMode, profile: item.profile, providerId: item.providerId, model: item.model,
           state: item.state, threadId: item.threadId, attemptCount: item.attemptCount, totalTokens: item.totalTokens,
           createdAt: item.createdAt, updatedAt: item.updatedAt, startedAt: item.startedAt, completedAt: item.completedAt,
           error: item.error, result: item.result, evidence: parsedEvidence?.success ? parsedEvidence.data : null,
-          live: live[index] ?? null, dependencies: itemDependencies, nextAction,
+          live: live[index] ?? null, dependencies: itemDependencies, nextAction, conditions: itemConditions,
         };
       });
       return {
@@ -993,6 +1043,12 @@ export default async function plugin(bb: BbPluginApi) {
         workstreams,
         artifacts: store.listArtifacts(coordinatorThreadId).map(({ id, workstreamKey, kind, name, version, summary, path, createdAt }) => ({ id, workstreamKey, kind, name, version, summary, path, createdAt })),
       };
+    },
+    run_control: async ({ threadId, action, workstreamKey }) => {
+      const value = await metadata(threadId);
+      const coordinatorThreadId = value?.role === "worker" ? value.coordinatorThreadId : value?.role === "coordinator" ? threadId : null;
+      if (coordinatorThreadId === null) throw new Error("This thread is not part of a managed Orchestrator run.");
+      return setSuspension(coordinatorThreadId, action, workstreamKey);
     },
     thread_orchestration_disable: async ({ threadId }) => {
       const state = await threadOrchestrationStateFor(threadId);
@@ -1225,6 +1281,7 @@ export default async function plugin(bb: BbPluginApi) {
         allowedProjectIds: coordinatorMetadata.allowedProjectIds, policy: await readPolicy(),
       });
       if (isTerminalRun(run.state)) throw new Error(`This Orchestrator run is ${run.state}. Start the next request with orchestrator_plan so it can reset the run and its timeout clock.`);
+      if (run.state === "suspended") throw new Error("This Orchestrator run is suspended. Resume it from the run panel before dispatching workstreams.");
       const referencedPlan = input.planVersion === undefined ? null : store.getPlan(threadId);
       if (input.planVersion !== undefined && referencedPlan === null) throw new Error("No durable plan is available for planVersion dispatch.");
       if (input.planVersion !== undefined && referencedPlan!.version !== input.planVersion) {
@@ -1496,10 +1553,19 @@ export default async function plugin(bb: BbPluginApi) {
       const [routingPolicyValue, configuredRoutes] = await Promise.all([readRoutingPolicy(), readRoutes()]);
       const environments = store.listProjectEnvironments(coordinatorThreadId);
       const environmentByProject = new Map(environments.map((item) => [item.projectId, item.environmentId]));
-      const workstreams = store.listWorkstreams(coordinatorThreadId).map((item) => ({
+      const durable = store.listWorkstreams(coordinatorThreadId);
+      const planDependencies = new Map((store.getPlan(coordinatorThreadId)?.steps ?? []).map((step) => [step.key, step.dependsOn]));
+      const conditions = runConditions({
+        workstreams: durable,
+        dependencies: (key) => planDependencies.get(key) ?? [],
+        environmentAttached: (projectId) => environmentByProject.has(projectId),
+        maxParallelWorkers: (store.getRun(coordinatorThreadId)?.policy ?? DEFAULT_POLICY).maxParallelWorkers,
+      });
+      const workstreams = durable.map((item) => ({
         ...item,
         effectiveReasoningLevel: item.reasoningLevel,
         environmentId: environmentByProject.get(item.projectId) ?? null,
+        conditions: conditions.get(item.key) ?? [],
       }));
       const full = {
         run: store.getRun(coordinatorThreadId),

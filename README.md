@@ -95,6 +95,21 @@ while children run, and `orchestrator_worker_done` rejects parent completion
 until every descendant is terminal. Replacement, failure, timeout, finish,
 disable, expiry, and reload reconciliation clean descendants recursively.
 
+Every workstream reports derived conditions beside its state: `DependenciesSatisfied`,
+`LaneAvailable`, `WorkspaceReady`, and the summarizing `Ready`. Each carries a
+reason such as `WaitingForDependencies`, `ProjectLaneBusy`, `WorkerSlotsExhausted`,
+`Provisioning`, or `Suspended`, plus a human message. Conditions are computed from
+durable state rather than stored, so they cannot go stale, and the run panel and
+`orchestrator_status` show the same reasons the launcher acts on.
+
+The run panel can suspend and resume a whole run or a single workstream. Suspending
+stops the worker's agent session but keeps its thread, its worktree, and its
+project's single mutating lane, so no other writer can enter that project while the
+work is paused. A suspended run does not launch queued work, is skipped by run
+inactivity expiry, and rejects dispatch until it resumes. Resuming re-sends the
+worker a continuation prompt on its existing thread, and the time spent suspended is
+added back to the worker timeout instead of counting against it.
+
 Coordinators created by the older Sidebar group orchestrator are outside this
 plugin's lifecycle ownership. Their direct children must be finished or
 archived through that coordinator, or the work should be restarted as a

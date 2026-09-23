@@ -1459,3 +1459,87 @@ test("disable, worker timeout, and run expiry recursively clean nested threads",
     Date.now = originalNow;
   }
 });
+
+test("workstream conditions name the reason each workstream is not ready", async () => {
+  const state = await load();
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "first", projectId: "api", prompt: "First." }, { key: "second", projectId: "api", prompt: "Second." }],
+  }, { threadId: "coord", projectId: "personal" }) as string);
+  assert.deepEqual(dispatched.workers.map((worker: { state: string }) => worker.state), ["running", "queued"]);
+  type Condition = { type: string; status: boolean; reason: string; message: string | null };
+  const dashboard = await state.harness.behavior.callRpc("run_dashboard_get", { threadId: "coord" }) as {
+    workstreams: Array<{ key: string; nextAction: string | null; conditions: Condition[] }>;
+  };
+  const first = dashboard.workstreams.find((item) => item.key === "first")!;
+  assert.deepEqual(first.conditions.map((condition) => [condition.type, condition.status, condition.reason]), [
+    ["DependenciesSatisfied", true, "Satisfied"], ["WorkspaceReady", true, "Attached"], ["Ready", true, "Running"],
+  ]);
+  const second = dashboard.workstreams.find((item) => item.key === "second")!;
+  assert.deepEqual(second.conditions.find((condition) => condition.type === "LaneAvailable"), {
+    type: "LaneAvailable", status: false, reason: "ProjectLaneBusy", message: "Another api workstream holds the single mutating lane",
+  });
+  assert.equal(second.nextAction, "Another api workstream holds the single mutating lane");
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.workstreams.find((item: { key: string }) => item.key === "second").conditions.at(-1).reason, "ProjectLaneBusy");
+
+  const planned = await load();
+  await planned.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  const steps = [
+    { key: "inspect", projectId: "api", prompt: "Inspect.", accessMode: "read-only" },
+    { key: "implement", projectId: "api", prompt: "Implement.", dependsOn: ["inspect"] },
+  ];
+  await planned.harness.behavior.callAgentTool("orchestrator_plan", {
+    scale: "large", rationale: "Implementation depends on investigation.", steps,
+  }, { threadId: "coord", projectId: "personal" });
+  await planned.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: steps }, { threadId: "coord", projectId: "personal" });
+  const blocked = await planned.harness.behavior.callRpc("run_dashboard_get", { threadId: "coord" }) as {
+    workstreams: Array<{ key: string; nextAction: string | null; conditions: Condition[] }>;
+  };
+  const implement = blocked.workstreams.find((item) => item.key === "implement")!;
+  assert.deepEqual(implement.conditions[0], {
+    type: "DependenciesSatisfied", status: false, reason: "WaitingForDependencies", message: "Waiting for inspect",
+  });
+  assert.equal(implement.nextAction, "Waiting for inspect");
+});
+
+test("suspending holds the project lane and pauses the run's clocks until it is resumed", async () => {
+  const originalNow = Date.now;
+  try {
+    const state = await load();
+    await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off", workerTimeoutMinutes: 5, inactiveCleanupMinutes: 10 });
+    const dispatched = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+      assignments: [{ key: "first", projectId: "api", prompt: "First." }, { key: "second", projectId: "api", prompt: "Second." }],
+    }, { threadId: "coord", projectId: "personal" }) as string);
+    const workerThreadId = dispatched.workers[0].threadId as string;
+    state.threads.get(workerThreadId)!.status = "active";
+
+    assert.deepEqual(await state.harness.behavior.callRpc("run_control", { threadId: "coord", action: "suspend", workstreamKey: null }), {
+      runState: "suspended", affected: ["first", "second"],
+    });
+    assert.ok(state.stopped.includes(workerThreadId));
+    await state.harness.behavior.emitThreadEvent("thread.idle", { thread: state.threads.get(workerThreadId)!, lastAssistantText: "Paused." });
+
+    const base = originalNow();
+    Date.now = () => base + 11 * 60_000;
+    await state.harness.behavior.runSchedule("cleanup-expired-runs");
+    const suspended = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+    assert.equal(suspended.run.state, "suspended");
+    assert.deepEqual(suspended.workstreams.map((item: { state: string }) => item.state), ["suspended", "suspended"]);
+    assert.deepEqual(suspended.workstreams[0].conditions, [{ type: "Ready", status: false, reason: "Suspended", message: "Resume this workstream to continue it." }]);
+    await assert.rejects(state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+      assignments: [{ key: "first", projectId: "api", prompt: "First." }],
+    }, { threadId: "coord", projectId: "personal" }), /run is suspended/);
+
+    assert.deepEqual(await state.harness.behavior.callRpc("run_control", { threadId: "coord", action: "resume", workstreamKey: null }), {
+      runState: "running", affected: ["first", "second"],
+    });
+    assert.equal(state.spawned.length, 1, "the resumed writer keeps its thread and its project lane");
+    assert.match(state.sent.at(-1)!.text, /resumed/i);
+
+    await state.harness.behavior.runSchedule("cleanup-expired-runs");
+    const resumed = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+    assert.deepEqual(resumed.workstreams.map((item: { state: string }) => item.state), ["running", "queued"], "suspended minutes do not count against the worker timeout");
+  } finally {
+    Date.now = originalNow;
+  }
+});
