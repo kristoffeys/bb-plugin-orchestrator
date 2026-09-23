@@ -1019,12 +1019,15 @@ test("provisioning helper handles timeout, terminal error, and cancellation", as
 
 test("definitive provisioning failure cleans up the spawned thread", async () => {
   const state = await load("codex", { provisioningStatus: "error" });
+  state.eventRows.set("spawned-1", [{ id: "err-1", threadId: "spawned-1", seq: 1, createdAt: Date.now(), scope: { kind: "thread" }, type: "system/error", data: { code: "thread_provisioning_failed", message: "Provisioning thread failed", detail: "This project checkout has no commits." } }]);
   const dispatched = JSON.parse(await state.harness.behavior.callAgentTool(
     "orchestrator_dispatch",
     { assignments: [{ key: "broken", projectId: "api", prompt: "Provision." }] },
     { threadId: "coord", projectId: "personal" },
   ) as string);
   assert.equal(dispatched.workers[0].state, "failed");
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.match(status.workstreams[0].error, /has no commits/);
   assert.deepEqual(state.stopped, ["spawned-1"]);
   assert.deepEqual(state.archived, ["spawned-1"]);
 });
@@ -1619,4 +1622,67 @@ test("coordinator turns after finish count toward neither the finished nor the n
   await state.harness.behavior.callAgentTool("orchestrator_plan", { scale: "small", rationale: "Follow-up." }, { threadId: "coord", projectId: "personal" });
   await usage(3, 950);
   assert.equal((await status()).run.coordinatorTotalTokens, 50);
+});
+
+test("a dependent worker's prompt carries upstream results and its artifacts", async () => {
+  const state = await load();
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  const steps = [
+    { key: "inspect", projectId: "api", prompt: "Inspect.", accessMode: "read-only" },
+    { key: "implement", projectId: "api", prompt: "Implement.", dependsOn: ["inspect"] },
+  ];
+  await state.harness.behavior.callAgentTool("orchestrator_plan", { scale: "large", rationale: "Handoff.", steps }, { threadId: "coord", projectId: "personal" });
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: steps }, { threadId: "coord", projectId: "personal" }) as string);
+  const inspector = dispatched.workers[0].threadId;
+  await state.harness.behavior.callAgentTool("orchestrator_publish_artifact", {
+    kind: "api-contract", name: "Items API", version: "v1", summary: "List items.", content: "GET /items -> Item[]", consumers: ["implement"],
+  }, { threadId: inspector, projectId: "api" });
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "The bug is in parseItems.", changedFiles: [], validation: [], blockers: [], limitations: ["Production logs were not available."],
+  }, { threadId: inspector, projectId: "api" });
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread: state.threads.get(inspector)!, lastAssistantText: "Done." });
+  const prompt = String((state.spawned.at(-1) as { prompt?: string }).prompt);
+  assert.match(prompt, /Upstream results:\n- inspect \(completed\): The bug is in parseItems\./);
+  assert.match(prompt, /Limitations: Production logs were not available\./);
+  assert.match(prompt, /#\d+ Items API v1 \(api-contract, from inspect\)/);
+  assert.match(prompt, /GET \/items -> Item\[\]/);
+});
+
+test("a worker waiting on the coordinator's answer is not failed for going idle", async () => {
+  const state = await load();
+  const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "ask", projectId: "api", prompt: "Ask first." }],
+  }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  await state.harness.behavior.callAgentTool("orchestrator_message", { targetThreadId: "coord", message: "Which API version?", expectsReply: true }, { threadId: worker.threadId, projectId: "api" });
+  state.sent.length = 0;
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread: state.threads.get(worker.threadId)!, lastAssistantText: "Waiting." });
+  const status = async () => JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string).workstreams[0];
+  assert.equal((await status()).state, "running");
+  assert.ok(!state.sent.some((message) => message.threadId === worker.threadId), "no completion reminder while waiting");
+  await state.harness.behavior.callAgentTool("orchestrator_message", { targetThreadId: worker.threadId, message: "Use v2." }, { threadId: "coord", projectId: "personal" });
+  assert.equal((await status()).error, null);
+});
+
+test("a suspended workstream that never launched does not hold its project lane", async () => {
+  const state = await load();
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [
+    { key: "a", projectId: "api", prompt: "A." }, { key: "b", projectId: "api", prompt: "B." }, { key: "c", projectId: "api", prompt: "C." },
+  ] }, { threadId: "coord", projectId: "personal" }) as string);
+  await state.harness.behavior.callRpc("run_control", { threadId: "coord", action: "suspend", workstreamKey: "b" });
+  const first = dispatched.workers[0].threadId;
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", { status: "success", summary: "A done.", changedFiles: [], validation: [], blockers: [] }, { threadId: first, projectId: "api" });
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread: state.threads.get(first)!, lastAssistantText: "Done." });
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.deepEqual(status.workstreams.map((item: { key: string; state: string }) => [item.key, item.state]), [["a", "completed"], ["b", "suspended"], ["c", "running"]]);
+});
+
+test("archiving a coordinator whose work all finished records the run as completed", async () => {
+  const state = await load();
+  const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", {
+    assignments: [{ key: "only", projectId: "api", prompt: "Do it." }],
+  }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", { status: "success", summary: "Done.", changedFiles: [], validation: [], blockers: [] }, { threadId: worker.threadId, projectId: "api" });
+  await state.harness.behavior.emitThreadEvent("thread.archived", { thread: state.threads.get("coord")! });
+  const analytics = await state.harness.behavior.callRpc("analytics_get", null) as { totals: Record<string, number> };
+  assert.equal(analytics.totals.completed, 1);
 });

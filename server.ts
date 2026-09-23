@@ -259,6 +259,7 @@ const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled"]);
 const TERMINAL_WORKSTREAM_STATES = new Set(["completed", "failed", "cancelled"]);
 const WORKER_IDLE_SETTLE_MS = 250;
 const COMPLETION_REMINDER = "Worker became idle without orchestrator_worker_done and was asked once to submit its structured completion record.";
+const AWAITING_REPLY = "Worker asked the coordinator a question and is waiting for the reply.";
 const ROUTE_RECOMMENDATION_MIN_SAMPLES = 5;
 const WORKSTREAM_ACTION_BUDGET: Record<WorkerProfile, number> = { quick: 20, standard: 40, complex: 60, critical: 80 };
 type TokenUsage = { totalTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number };
@@ -720,7 +721,27 @@ export default async function plugin(bb: BbPluginApi) {
       ? "This delegated workstream is read-only. Do not edit files, create commits, or push. Report findings through messages/artifacts and worker_done."
       : "This is the sole mutating workstream in its project lane. Nested delegation is read-only only, so descendants cannot race this writer.";
     const planning = plannedStep === undefined ? "" : `\nPlan context:\n- Phase: ${plannedStep.phase ?? "unspecified"}.\n- Dependencies: ${plannedStep.dependsOn.length === 0 ? "none" : plannedStep.dependsOn.join(", ")}.\n- Success criteria: ${plannedStep.successCriteria?.length ? plannedStep.successCriteria.join("; ") : "use the assignment and completion contract"}.`;
-    return `${item.assignment}${planning}\n\nManaged workstream contract:\n- Work on the Orchestrator-owned feature branch ${JSON.stringify(run.featureBranch)}. This workstream shares one durable project worktree with this run's other ${item.projectId} workstreams. Preserve unrelated changes and do not create, check out, or switch to another branch or environment.\n- ${access}\n- Keep the execution bounded to roughly ${WORKSTREAM_ACTION_BUDGET[item.profile]} tool actions. Read the smallest relevant surface, implement, and validate targeted behavior. If the scope cannot be completed within that budget, report a blocker or delegate a bounded read-only investigation instead of exhaustively exploring.\n- You may delegate bounded read-only subtasks only with orchestrator_delegate; never spawn threads directly.\n- Commit mode is ${run.policy.commitMode}; push mode is ${run.policy.pushMode}; protected branches are ${JSON.stringify(protectedBranches)}. Protected branches cannot be committed to or pushed. Existing branches require separate explicit user approval for commits and pushes. Orchestrator-owned branches need no commit approval. Never push without explicit user approval.\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers.\n- Before ending, call orchestrator_worker_done exactly once with ordered commit SHAs, changed files, validation, and blockers. Status says whether you finished your assignment, not whether the news is good: a verification that refutes a claim, or an investigation that answers the question, is success. Put caveats that did not stop the assignment (an untested path, missing access for an optional check) in limitations. Use blocked only when the assignment itself could not be finished. Parent completion is rejected while descendants are live. An idle turn without that record is treated as a failed workstream.`;
+    // Hand over what upstream work produced; before, a worker saw only its dependency keys unless the coordinator rewrote its prompt.
+    const dependencyKeys = plannedStep?.dependsOn ?? [];
+    const upstream = dependencyKeys.flatMap((key) => {
+      const dependency = store.getWorkstream(item.coordinatorThreadId, key);
+      if (dependency === null) return [];
+      const result = (typeof dependency.result === "object" && dependency.result !== null ? dependency.result : {}) as { summary?: unknown; limitations?: unknown; changedFiles?: unknown };
+      const list = (value: unknown) => Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+      const limitations = list(result.limitations);
+      const changedFiles = list(result.changedFiles);
+      return [`- ${key} (${dependency.state}): ${clip(typeof result.summary === "string" ? result.summary : dependency.error ?? "No summary recorded.", 1_500)}`
+        + (limitations.length === 0 ? "" : `\n  Limitations: ${limitations.map((entry) => clip(entry, 300)).join("; ")}`)
+        + (changedFiles.length === 0 ? "" : `\n  Changed files: ${changedFiles.slice(0, 15).join(", ")}${changedFiles.length > 15 ? ` (+${changedFiles.length - 15} more)` : ""}`)];
+    });
+    const artifacts = store.listArtifacts(item.coordinatorThreadId)
+      .filter((artifact) => artifact.consumers.includes(item.key) || dependencyKeys.includes(artifact.workstreamKey))
+      .map((artifact) => `- #${artifact.id} ${artifact.name}${artifact.version === null ? "" : ` ${artifact.version}`} (${artifact.kind}, from ${artifact.workstreamKey}): ${clip(artifact.summary, 500)}`
+        + (artifact.path === null ? "" : `\n  Path: ${artifact.path}`)
+        + (artifact.content === null || !artifact.consumers.includes(item.key) ? "" : `\n  Content:\n${clip(artifact.content, 4_000)}`));
+    const handoff = (upstream.length === 0 ? "" : `\n\nUpstream results:\n${upstream.join("\n")}`)
+      + (artifacts.length === 0 ? "" : `\n\nArtifacts for this workstream:\n${artifacts.join("\n")}`);
+    return `${item.assignment}${planning}${handoff}\n\nManaged workstream contract:\n- Work on the Orchestrator-owned feature branch ${JSON.stringify(run.featureBranch)}. This workstream shares one durable project worktree with this run's other ${item.projectId} workstreams. Preserve unrelated changes and do not create, check out, or switch to another branch or environment.\n- ${access}\n- Keep the execution bounded to roughly ${WORKSTREAM_ACTION_BUDGET[item.profile]} tool actions. Read the smallest relevant surface, implement, and validate targeted behavior. If the scope cannot be completed within that budget, report a blocker or delegate a bounded read-only investigation instead of exhaustively exploring.\n- You may delegate bounded read-only subtasks only with orchestrator_delegate; never spawn threads directly.\n- Commit mode is ${run.policy.commitMode}; push mode is ${run.policy.pushMode}; protected branches are ${JSON.stringify(protectedBranches)}. Protected branches cannot be committed to or pushed. Existing branches require separate explicit user approval for commits and pushes. Orchestrator-owned branches need no commit approval. Never push without explicit user approval.\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers. If you must wait for the coordinator's answer before continuing, set expectsReply and end your turn; the answer arrives as a new message.\n- Before ending, call orchestrator_worker_done exactly once with ordered commit SHAs, changed files, validation, and blockers. Status says whether you finished your assignment, not whether the news is good: a verification that refutes a claim, or an investigation that answers the question, is success. Put caveats that did not stop the assignment (an untested path, missing access for an optional check) in limitations. Use blocked only when the assignment itself could not be finished. Parent completion is rejected while descendants are live. An idle turn without that record is treated as a failed workstream.`;
   };
 
   const launchQueuedUnlocked = async (coordinatorThreadId: string, signal?: AbortSignal) => {
@@ -788,7 +809,15 @@ export default async function plugin(bb: BbPluginApi) {
           if (attached.environmentId === null) throw new Error(`Worker ${attached.id} environment attachment was lost.`);
           return attached as typeof attached & { environmentId: string };
         } catch (error) {
+          // BB records the real cause (e.g. "checkout has no commits") as a system/error event; without it the failure only said "status error".
+          const cause = await bb.sdk.threads.events.list({ threadId: provisional.id, order: "desc", limit: "1", types: ["system/error"] })
+            .then(([row]) => {
+              const data = (row?.data ?? {}) as { detail?: unknown; message?: unknown };
+              return typeof data.detail === "string" ? data.detail : typeof data.message === "string" ? data.message : null;
+            })
+            .catch(() => null);
           await retireWorker(provisional.id);
+          if (cause !== null && error instanceof Error && error.name !== "AbortError") throw new Error(`${error.message} ${cause}`);
           throw error;
         }
       };
@@ -1643,10 +1672,10 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "orchestrator_message",
     description: "Send a message between a coordinator and managed workers in one run.",
-    instructions: "Use for questions, blockers, and integration feedback. Publish reusable contracts with orchestrator_publish_artifact.",
+    instructions: "Use for questions, blockers, and integration feedback. Publish reusable contracts with orchestrator_publish_artifact. A worker that stops to wait for the coordinator's answer sets expectsReply so going idle is not treated as a missing completion.",
     presentation: { label: { pending: "Sending orchestration update", completed: "Sent orchestration update" } },
-    parameters: z.object({ targetThreadId: z.string().min(1), message: z.string().trim().min(1).max(50_000) }),
-    async execute({ targetThreadId, message }, { threadId }) {
+    parameters: z.object({ targetThreadId: z.string().min(1), message: z.string().trim().min(1).max(50_000), expectsReply: z.boolean().default(false) }),
+    async execute({ targetThreadId, message, expectsReply }, { threadId }) {
       const senderMetadata = await metadata(threadId);
       if (senderMetadata === null) throw new Error("This thread is not in a managed run.");
       const coordinatorThreadId = senderMetadata.role === "coordinator" ? threadId : senderMetadata.coordinatorThreadId;
@@ -1656,6 +1685,13 @@ export default async function plugin(bb: BbPluginApi) {
         : targetMetadata?.role === "worker" && targetMetadata.coordinatorThreadId === coordinatorThreadId;
       if (!valid) throw new Error("The target is not in this coordinator's managed worker set.");
       await bb.sdk.threads.send({ threadId: targetThreadId, senderThreadId: threadId, mode: "auto", input: [{ type: "text", text: message, mentions: [] }] });
+      // The durable marker survives reloads; the idle and cron checks skip a worker until the coordinator answers.
+      const waiting = senderMetadata.role === "worker" ? store.getWorkstream(coordinatorThreadId, senderMetadata.key) : null;
+      if (waiting?.state === "running" && expectsReply && targetThreadId === coordinatorThreadId) {
+        store.setWorkstreamState(coordinatorThreadId, waiting.key, "running", { error: AWAITING_REPLY, reasonCode: "awaiting_coordinator" });
+      }
+      const answered = targetMetadata?.role === "worker" ? store.getWorkstream(coordinatorThreadId, targetMetadata.key) : null;
+      if (answered?.state === "running" && answered.error === AWAITING_REPLY) store.setWorkstreamState(coordinatorThreadId, answered.key, "running", { error: null });
       store.touchRun(coordinatorThreadId);
       return JSON.stringify({ deliveredTo: targetThreadId });
     },
@@ -1848,6 +1884,7 @@ export default async function plugin(bb: BbPluginApi) {
     const settledLiveDescendants = store.listDescendants(item.coordinatorThreadId, item.key)
       .filter((child) => !isTerminalWorkstream(child.state));
     if (settledLiveDescendants.length > 0) return;
+    if (item.error === AWAITING_REPLY) return;
     if (item.error !== COMPLETION_REMINDER) {
       store.setWorkstreamState(item.coordinatorThreadId, item.key, "running", { error: COMPLETION_REMINDER, reasonCode: "completion_contract_reminder" });
       store.recordEvent({ coordinatorThreadId: item.coordinatorThreadId, type: "worker.completion_reminder", workstreamKey: item.key, workerThreadId: thread.id, outcome: "sent", reasonCode: "completion_contract_missing", details: { hadAssistantOutput: lastAssistantText !== null && lastAssistantText.trim().length > 0 } });
@@ -1908,7 +1945,12 @@ export default async function plugin(bb: BbPluginApi) {
     bb.events.on(eventName, async ({ thread }) => {
       const coordinatorRun = store.getRun(thread.id);
       if (coordinatorRun !== null) {
-        if (!isTerminalRun(coordinatorRun.state)) await cleanupRun(thread.id, "cancelled", `Coordinator was ${eventName === "thread.archived" ? "archived" : "deleted"}.`);
+        if (!isTerminalRun(coordinatorRun.state)) {
+          // Archiving after all work finished is how many runs end; count those as completed, not cancelled.
+          const workstreams = store.listWorkstreams(thread.id);
+          const finished = workstreams.length > 0 && workstreams.every((item) => item.state === "completed");
+          await cleanupRun(thread.id, finished ? "completed" : "cancelled", `Coordinator was ${eventName === "thread.archived" ? "archived" : "deleted"}.`);
+        }
         return;
       }
       const item = store.getWorkstreamByThread(thread.id);
@@ -1945,6 +1987,7 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         const thread = await bb.sdk.threads.get({ threadId: item.threadId });
         if (thread.status !== "idle" && thread.status !== "error") continue;
+        if (thread.status === "idle" && item.error === AWAITING_REPLY) continue;
         const descendants = store.listDescendants(item.coordinatorThreadId, item.key);
         const liveDescendants = descendants
           .filter((child) => !["completed", "failed", "cancelled"].includes(child.state));

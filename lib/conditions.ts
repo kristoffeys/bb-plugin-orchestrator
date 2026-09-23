@@ -19,7 +19,7 @@ export const mutatingLaneHolders = (workstreams: readonly WorkstreamRecord[]) =>
   .filter((item) => item.accessMode === "mutating" && (
     item.state === "running"
     || item.state === "reviewing"
-    || item.state === "suspended"
+    || (item.state === "suspended" && item.threadId !== null)
     || (item.threadId !== null && item.laneReleasedAt === null && ["completed", "failed", "cancelled"].includes(item.state))))
   .map((item) => item.projectId));
 
