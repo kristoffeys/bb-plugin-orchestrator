@@ -1373,13 +1373,13 @@ test("reasoning policy survives reload and descendants inherit or override their
   ]);
 });
 
-test("only terminal coordinators regain orchestrator_enable discoverability", async () => {
+test("coordinator tool set stays complete across run states", async () => {
   const state = await load();
   const active = await state.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({
     thread: state.threads.get("coord")!, pluginMetadata: state.metadata.get("coord")! as never,
   }));
-  assert.equal(active.tools.some((tool) => tool.name === "orchestrator_enable"), false);
-  assert.equal(active.tools.some((tool) => tool.name === "orchestrator_plan_update"), true);
+  assert.ok(active.tools.some((tool) => tool.name === "orchestrator_enable"));
+  assert.ok(active.tools.some((tool) => tool.name === "orchestrator_plan_update"));
   const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "done", projectId: "api", prompt: "Finish." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
   const workerConfig = await state.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({
     thread: state.threads.get(worker.threadId)!, pluginMetadata: state.metadata.get(worker.threadId)! as never,
@@ -1391,7 +1391,7 @@ test("only terminal coordinators regain orchestrator_enable discoverability", as
     thread: state.threads.get("coord")!, pluginMetadata: state.metadata.get("coord")! as never,
   }));
   assert.ok(terminal.tools.some((tool) => tool.name === "orchestrator_enable"));
-  assert.ok(terminal.tools.some((tool) => tool.name === "orchestrator_plan"));
+  assert.deepEqual(terminal.tools.map((tool) => tool.name).sort(), active.tools.map((tool) => tool.name).sort());
   await state.harness.behavior.emitThreadEvent("thread.archived", { thread: state.threads.get("coord")! });
   const afterArchive = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
   assert.equal(afterArchive.run.state, "completed");

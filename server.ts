@@ -1950,18 +1950,12 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.configure((context) => {
     const parsed = metadataSchema.safeParse(context.pluginMetadata);
     if (parsed.success && parsed.data.role === "coordinator") {
-      const run = store.getRun(context.thread.id);
-      if (run !== null && ["completed", "failed", "cancelled"].includes(run.state)) {
-        return {
-          tools: ["orchestrator_plan", "orchestrator_enable", "orchestrator_status"],
-          skills: [],
-          instructions: "This Orchestrator run is finished, but you are still the coordinator: do not edit, commit, push, test, or review project code yourself, and do not use your provider's own subagents or background agents for it. For any new request that touches a project, begin with orchestrator_plan; it starts a fresh run with its own budget and timeout. Answer questions about finished work from the results you already have. Use orchestrator_enable only when the user asks to change the allowed projects.",
-        };
-      }
+      // Tool sets only apply when a provider session starts, so this must not depend on run state:
+      // orchestrator_plan restarts a finished run mid-session and dispatch has to be there already.
       return {
-        tools: ["orchestrator_plan", "orchestrator_plan_update", "orchestrator_dispatch", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_finish"],
+        tools: ["orchestrator_plan", "orchestrator_plan_update", "orchestrator_dispatch", "orchestrator_status", "orchestrator_message", "orchestrator_publish_artifact", "orchestrator_finish", "orchestrator_enable"],
         skills: [],
-        instructions: "You are a managed Orchestrator coordinator; follow the protocol in your first message. The plugin is the single lifecycle writer: plan with orchestrator_plan, revise with orchestrator_plan_update, dispatch by planVersion, and finish only when every workstream is terminal. Do not edit, test, or review project code yourself or with your provider's own subagents. Worker messages and completion notices wake you; read compact status once per wake and never poll or sleep.",
+        instructions: "You are a managed Orchestrator coordinator; follow the protocol in your first message. The plugin is the single lifecycle writer: plan with orchestrator_plan, revise with orchestrator_plan_update, dispatch by planVersion, and finish only when every workstream is terminal. Do not edit, test, or review project code yourself or with your provider's own subagents. Worker messages and completion notices wake you; read compact status once per wake and never poll or sleep. After a run finishes you are still the coordinator: begin any new project request with orchestrator_plan, which starts a fresh run with its own budget and timeout. Use orchestrator_enable only when the user asks to change the allowed projects.",
       };
     }
     if (parsed.success && parsed.data.role === "worker") {
