@@ -5,6 +5,7 @@ import { createFakePluginHost, makeMessageDispatchHookContext, makePluginAgentCo
 import plugin, { deriveCoordinatorTitle, ORCHESTRATOR_MIGRATIONS, waitForEnvironmentAttachment } from "../server.ts";
 import { DEFAULT_POLICY, effectiveProtectedBranches, parseOrchestrationPolicy } from "../lib/policy.ts";
 import { encodeNewThreadOrchestrationMarker } from "../lib/new-thread-marker.ts";
+import { OrchestratorStore } from "../lib/state.ts";
 
 const projects = [
   { id: "personal", name: "Personal", kind: "personal", sources: [] },
@@ -47,14 +48,15 @@ test("upgrades the prior released migration ledger without changing its statemen
 
 test("repairs terminal sessions that coordinator archival incorrectly cancelled", () => {
   const db = new Database(":memory:");
-  for (const statement of ORCHESTRATOR_MIGRATIONS.slice(0, -2)) db.exec(statement);
+  const repairStart = ORCHESTRATOR_MIGRATIONS.findIndex((statement) => statement.startsWith("UPDATE orchestration_sessions AS session SET state"));
+  for (const statement of ORCHESTRATOR_MIGRATIONS.slice(0, repairStart)) db.exec(statement);
   db.prepare("INSERT INTO runs (coordinator_thread_id, session_id, feature_branch, label, allowed_project_ids_json, state, policy_json, created_at, updated_at, last_activity_at, total_tokens, first_dispatch_approved, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
     .run("coord", "session-1", "orchestrator/test", "Test", "[]", "cancelled", "{}", 10, 300, 300, 100, 0, "Coordinator was archived.");
   db.prepare("INSERT INTO orchestration_sessions (session_id, coordinator_thread_id, label, feature_branch, allowed_project_ids_json, state, policy_json, total_tokens, started_at, updated_at, completed_at, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
     .run("session-1", "coord", "Test", "orchestrator/test", "[]", "cancelled", "{}", 100, 10, 300, 300, "Coordinator was archived.");
   db.prepare("INSERT INTO orchestration_events (session_id, coordinator_thread_id, event_type, outcome, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?)")
     .run("session-1", "coord", "run.state", "completed", "{}", 200);
-  for (const statement of ORCHESTRATOR_MIGRATIONS.slice(-2)) db.exec(statement);
+  for (const statement of ORCHESTRATOR_MIGRATIONS.slice(repairStart)) db.exec(statement);
   assert.deepEqual(db.prepare("SELECT state, error, updated_at AS updatedAt, completed_at AS completedAt FROM orchestration_sessions").get(), { state: "completed", error: null, updatedAt: 200, completedAt: 200 });
   assert.deepEqual(db.prepare("SELECT state, error, updated_at AS updatedAt, last_activity_at AS lastActivityAt FROM runs").get(), { state: "completed", error: null, updatedAt: 200, lastActivityAt: 200 });
   db.close();
@@ -69,6 +71,7 @@ async function load(providerId = "codex", options: { delayedAttachmentGets?: num
   const stopped: string[] = [];
   const retries: Array<Record<string, unknown>> = [];
   const eventRows = new Map<string, unknown[]>();
+  const outputs = new Map<string, string>();
   const environmentDiffInputs: Array<Record<string, unknown>> = [];
   const attachmentTargets = new Map<string, string>();
   const attachmentGets = new Map<string, number>();
@@ -106,7 +109,7 @@ async function load(providerId = "codex", options: { delayedAttachmentGets?: num
           }
           return thread;
         },
-        output: async () => ({ output: "Worker output." }) as never,
+        output: async ({ threadId }: { threadId: string }) => ({ output: outputs.get(threadId) ?? "Worker output." }) as never,
         conversationOutline: async () => ({ items: [] }) as never,
         context: async () => ({ usage: null }) as never,
         timeline: async () => ({ maxSeq: 0, rows: [], pendingTodos: null }) as never,
@@ -190,7 +193,7 @@ async function load(providerId = "codex", options: { delayedAttachmentGets?: num
   });
   await plugin(bb);
   await harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, planningMode: "off" });
-  return { bb, harness, metadata, threads, spawned, sent, archived, stopped, retries, eventRows, environmentDiffInputs };
+  return { bb, harness, metadata, threads, spawned, sent, archived, stopped, retries, eventRows, outputs, environmentDiffInputs };
 }
 
 test("start creates a personal coordinator titled from its task", async () => {
@@ -1688,4 +1691,84 @@ test("archiving a coordinator whose work all finished records the run as complet
   await state.harness.behavior.emitThreadEvent("thread.archived", { thread: state.threads.get("coord")! });
   const analytics = await state.harness.behavior.callRpc("analytics_get", null) as { totals: Record<string, number> };
   assert.equal(analytics.totals.completed, 1);
+});
+
+test("worker prompts carry the run goal and delegation ancestry, and events name their actor", async () => {
+  const state = await load();
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  const coord = { threadId: "coord", projectId: "personal" };
+  const steps = [{ key: "root", projectId: "api", prompt: "Build the login API.", title: "Build login API" }];
+  await state.harness.behavior.callAgentTool("orchestrator_plan", { scale: "small", rationale: "One project.", goal: "Ship magic-link login.", steps }, coord);
+  const root = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: steps }, coord) as string).workers[0];
+  assert.match(String(state.spawned.at(-1)?.prompt), /Why this exists:\n- Run goal: Ship magic-link login\./);
+  assert.doesNotMatch(String(state.spawned.at(-1)?.prompt), /Delegated from/);
+  await state.harness.behavior.callAgentTool("orchestrator_delegate", { assignments: [{ key: "child", projectId: "api", prompt: "Inspect the token table." }] }, { threadId: root.threadId, projectId: "api" });
+  assert.match(String(state.spawned.at(-1)?.prompt), /- Run goal: Ship magic-link login\.\n- Delegated from:\n  - root: Build login API/);
+  await state.harness.behavior.callRpc("run_control", { threadId: "coord", action: "suspend", workstreamKey: null });
+
+  const actors = state.bb.storage.database().prepare("SELECT event_type AS type, workstream_key AS key, actor FROM orchestration_events ORDER BY id").all() as Array<{ type: string; key: string | null; actor: string }>;
+  assert.equal(actors.find((event) => event.type === "plan.recorded")?.actor, "coordinator");
+  assert.equal(actors.find((event) => event.type === "workstream.state" && event.key === "root/child")?.actor, "worker:root");
+  assert.equal(actors.find((event) => event.type === "run.suspend")?.actor, "user");
+});
+
+test("an idle worker that says it is blocked settles as blocked so dependents wait", async () => {
+  const state = await load();
+  await state.harness.behavior.callRpc("policy_set", { ...DEFAULT_POLICY, approval: "never", evaluator: "never" });
+  const coord = { threadId: "coord", projectId: "personal" };
+  const steps = [
+    { key: "inspect", projectId: "api", prompt: "Inspect.", accessMode: "read-only" },
+    { key: "implement", projectId: "api", prompt: "Implement.", dependsOn: ["inspect"] },
+  ];
+  await state.harness.behavior.callAgentTool("orchestrator_plan", { scale: "large", rationale: "Implementation depends on investigation.", steps }, coord);
+  const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: steps }, coord) as string).workers[0];
+  const thread = state.threads.get(worker.threadId)!;
+  thread.status = "idle";
+  const blockedText = "I cannot proceed: I need staging API credentials to read the schema.";
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread, lastAssistantText: blockedText });
+  assert.ok(state.sent.some((message) => message.threadId === worker.threadId && message.text.includes('status "blocked"')));
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread, lastAssistantText: blockedText });
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, coord) as string);
+  const inspect = status.workstreams.find((item: { key: string }) => item.key === "inspect");
+  assert.equal(inspect.state, "failed");
+  assert.equal(inspect.result.status, "blocked");
+  assert.equal(status.workstreams.find((item: { key: string }) => item.key === "implement").state, "queued");
+  const reason = state.bb.storage.database().prepare("SELECT reason_code AS reasonCode FROM orchestration_events WHERE workstream_key = 'inspect' AND outcome = 'failed'").get() as { reasonCode: string };
+  assert.equal(reason.reasonCode, "worker_blocked_unreported");
+});
+
+test("reload reconciliation reminds an unreported idle worker before failing it", async () => {
+  const state = await load();
+  const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "plan-only", projectId: "api", prompt: "Fix it." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  state.threads.get(worker.threadId)!.status = "idle";
+  state.outputs.set(worker.threadId, "I looked at the handler. Next, I will update the validation and add a test.");
+  const reloaded = await state.harness.lifecycle.reload(plugin);
+  await reloaded.harness.behavior.runSchedule("cleanup-expired-runs");
+  let status = JSON.parse(await reloaded.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.workstreams[0].state, "running");
+  assert.ok(state.sent.some((message) => message.threadId === worker.threadId && message.text.includes("stopped before carrying them out")));
+  await reloaded.harness.behavior.runSchedule("cleanup-expired-runs");
+  status = JSON.parse(await reloaded.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.workstreams[0].state, "failed");
+});
+
+test("launch claims and expected-state transitions are compare-and-set", () => {
+  const db = new Database(":memory:");
+  for (const statement of ORCHESTRATOR_MIGRATIONS) db.exec(statement);
+  const store = new OrchestratorStore(db);
+  store.upsertRun({ coordinatorThreadId: "coord", label: "Test", allowedProjectIds: ["api"], policy: DEFAULT_POLICY });
+  store.upsertWorkstream({
+    coordinatorThreadId: "coord", key: "a", parentKey: null, depth: 0, accessMode: "mutating", projectId: "api", title: null, assignment: "Do it.",
+    profile: "quick", complexityReason: null, providerId: "codex", model: "m", configuredReasoningLevel: "model-default", requestedReasoningLevel: "model-default",
+    reasoningLevel: "low", state: "queued", threadId: null, attemptCount: 0,
+  });
+  assert.equal(store.claimLaunch("coord", "a"), true);
+  assert.equal(store.claimLaunch("coord", "a"), false, "a second launcher cannot claim the same queued workstream");
+  assert.equal(store.setWorkstreamState("coord", "a", "completed", { from: "running" }), null);
+  assert.equal(store.setWorkstreamState("coord", "a", "running", { from: "queued" })?.state, "running");
+  assert.equal(store.claimLaunch("coord", "a"), false, "only queued work can be claimed");
+  store.setWorkstreamState("coord", "a", "cancelled");
+  assert.equal(store.setWorkstreamState("coord", "a", "running", { threadId: "late-spawn", from: "queued" }), null, "a launch that finishes after cancellation cannot resurrect the workstream");
+  assert.equal(store.getWorkstream("coord", "a")?.state, "cancelled");
+  db.close();
 });

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type Database from "better-sqlite3";
 import { parseOrchestrationPolicy, type OrchestrationPolicy, type WorkerProfile } from "./policy.ts";
 
@@ -104,6 +105,8 @@ export interface PlanStepRecord {
 export interface PlanRecord {
   coordinatorThreadId: string;
   version: number;
+  /** One-sentence run goal shown to every worker so it knows why its assignment exists. */
+  goal: string | null;
   scale: "small" | "large";
   rationale: string;
   steps: PlanStepRecord[];
@@ -118,6 +121,11 @@ type RunRow = Omit<RunRecord, "allowedProjectIds" | "policy" | "firstDispatchApp
 };
 type WorkstreamRow = Omit<WorkstreamRecord, "result"> & { resultJson: string | null };
 type ArtifactRow = Omit<ArtifactRecord, "consumers"> & { consumersJson: string };
+
+/** Who caused the events recorded inside a call: `user`, `coordinator`, `worker:<key>`, or `system` when unset. */
+export const eventActor = new AsyncLocalStorage<string>();
+/** A launch claim older than this is treated as abandoned, e.g. by a plugin process that died mid-spawn. */
+const LAUNCH_CLAIM_LEASE_MS = 5 * 60_000;
 
 const parseJson = <T>(value: string): T => JSON.parse(value) as T;
 const branchSlug = (label: string) => label.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 36) || "feature";
@@ -244,28 +252,29 @@ export class OrchestratorStore {
       .run(Date.now(), coordinatorThreadId);
   }
 
-  setPlan(input: Omit<PlanRecord, "version" | "createdAt" | "updatedAt">) {
+  setPlan(input: Omit<PlanRecord, "version" | "createdAt" | "updatedAt" | "goal"> & { goal?: string | null }) {
     const now = Date.now();
     this.db.prepare(`
-      INSERT INTO plans (coordinator_thread_id, version, scale, rationale, steps_json, created_at, updated_at)
-      VALUES (?, 1, ?, ?, ?, ?, ?)
+      INSERT INTO plans (coordinator_thread_id, version, scale, rationale, steps_json, goal, created_at, updated_at)
+      VALUES (?, 1, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(coordinator_thread_id) DO UPDATE SET
         version = plans.version + 1,
         scale = excluded.scale,
         rationale = excluded.rationale,
         steps_json = excluded.steps_json,
+        goal = excluded.goal,
         updated_at = excluded.updated_at
-    `).run(input.coordinatorThreadId, input.scale, input.rationale, JSON.stringify(input.steps), now, now);
+    `).run(input.coordinatorThreadId, input.scale, input.rationale, JSON.stringify(input.steps), input.goal ?? null, now, now);
     this.touchRun(input.coordinatorThreadId);
     return this.getPlan(input.coordinatorThreadId)!;
   }
 
-  updatePlan(input: Omit<PlanRecord, "version" | "createdAt" | "updatedAt"> & { expectedVersion: number }) {
+  updatePlan(input: Omit<PlanRecord, "version" | "createdAt" | "updatedAt" | "goal"> & { goal?: string | null; expectedVersion: number }) {
     const now = Date.now();
     const result = this.db.prepare(`
-      UPDATE plans SET version = version + 1, scale = ?, rationale = ?, steps_json = ?, updated_at = ?
+      UPDATE plans SET version = version + 1, scale = ?, rationale = ?, steps_json = ?, goal = COALESCE(?, goal), updated_at = ?
       WHERE coordinator_thread_id = ? AND version = ?
-    `).run(input.scale, input.rationale, JSON.stringify(input.steps), now, input.coordinatorThreadId, input.expectedVersion);
+    `).run(input.scale, input.rationale, JSON.stringify(input.steps), input.goal ?? null, now, input.coordinatorThreadId, input.expectedVersion);
     if (result.changes === 0) return null;
     this.touchRun(input.coordinatorThreadId);
     return this.getPlan(input.coordinatorThreadId)!;
@@ -273,7 +282,7 @@ export class OrchestratorStore {
 
   getPlan(coordinatorThreadId: string): PlanRecord | null {
     const row = this.db.prepare(`
-      SELECT coordinator_thread_id AS coordinatorThreadId, version, scale, rationale,
+      SELECT coordinator_thread_id AS coordinatorThreadId, version, scale, rationale, goal,
         steps_json AS stepsJson, created_at AS createdAt, updated_at AS updatedAt
       FROM plans WHERE coordinator_thread_id = ?
     `).get(coordinatorThreadId) as (Omit<PlanRecord, "steps"> & { stepsJson: string }) | undefined;
@@ -314,7 +323,7 @@ export class OrchestratorStore {
         updated_at = excluded.updated_at, started_at = NULL, completed_at = NULL,
         lane_released_at = NULL, last_event_seq = 0, total_tokens = 0,
         input_tokens = 0, cached_input_tokens = 0, output_tokens = 0, reasoning_output_tokens = 0,
-        result_json = NULL, error = NULL
+        result_json = NULL, error = NULL, launch_claimed_at = NULL
     `).run(
       input.coordinatorThreadId, input.key, input.parentKey, input.depth, input.accessMode, input.projectId, input.title, input.assignment,
       input.profile, input.complexityReason, input.providerId, input.model, input.configuredReasoningLevel, input.requestedReasoningLevel, input.reasoningLevel,
@@ -395,15 +404,17 @@ export class OrchestratorStore {
     });
   }
 
-  setWorkstreamState(coordinatorThreadId: string, key: string, state: WorkstreamState, options: { threadId?: string | null; result?: unknown; error?: string | null; reasonCode?: string | null; incrementAttempt?: boolean } = {}) {
+  setWorkstreamState(coordinatorThreadId: string, key: string, state: WorkstreamState, options: { threadId?: string | null; result?: unknown; error?: string | null; reasonCode?: string | null; incrementAttempt?: boolean; from?: WorkstreamState } = {}) {
     const current = this.getWorkstream(coordinatorThreadId, key);
-    if (current === null) return null;
+    if (current === null || (options.from !== undefined && current.state !== options.from)) return null;
     const now = Date.now();
     const terminal = state === "completed" || state === "failed" || state === "cancelled";
-    this.db.prepare(`
+    // Pass `from` when the caller awaited since it last looked: the write then fails (null) if the row moved meanwhile.
+    // Without it, the guard only catches another process writing between this read and this update.
+    const changed = this.db.prepare(`
       UPDATE workstreams SET state = ?, thread_id = ?, result_json = ?, error = ?,
-        attempt_count = ?, updated_at = ?, started_at = ?, completed_at = ?
-      WHERE coordinator_thread_id = ? AND key = ?
+        attempt_count = ?, updated_at = ?, started_at = ?, completed_at = ?, launch_claimed_at = NULL
+      WHERE coordinator_thread_id = ? AND key = ? AND state = ?
     `).run(
       state,
       options.threadId === undefined ? current.threadId : options.threadId,
@@ -415,7 +426,9 @@ export class OrchestratorStore {
       terminal ? now : null,
       coordinatorThreadId,
       key,
+      current.state,
     );
+    if (changed.changes === 0) return null;
     this.touchRun(coordinatorThreadId);
     const updated = this.getWorkstream(coordinatorThreadId, key);
     if (updated !== null) this.recordEvent({
@@ -425,6 +438,15 @@ export class OrchestratorStore {
       details: { from: current.state, attempt: updated.attemptCount, queueMs: state === "running" ? Math.max(0, now - current.createdAt) : null, providerId: updated.providerId, model: updated.model, profile: updated.profile, configuredReasoningLevel: updated.configuredReasoningLevel, requestedReasoningLevel: updated.requestedReasoningLevel, reasoningLevel: updated.reasoningLevel, accessMode: updated.accessMode, error: options.error ?? null, result: telemetryResult(options.result) },
     });
     return updated;
+  }
+
+  /** Atomically reserve a queued workstream for one launcher, so a reloaded or second plugin process cannot spawn it twice. */
+  claimLaunch(coordinatorThreadId: string, key: string) {
+    const now = Date.now();
+    return this.db.prepare(`
+      UPDATE workstreams SET launch_claimed_at = ?
+      WHERE coordinator_thread_id = ? AND key = ? AND state = 'queued' AND (launch_claimed_at IS NULL OR launch_claimed_at < ?)
+    `).run(now, coordinatorThreadId, key, now - LAUNCH_CLAIM_LEASE_MS).changes === 1;
   }
 
   /** Move a suspended workstream's start forward by the time it spent suspended, so its worker timeout excludes that pause. */
@@ -531,12 +553,12 @@ export class OrchestratorStore {
     return aggregate.total;
   }
 
-  recordEvent(input: { coordinatorThreadId: string; type: string; workstreamKey?: string | null; workerThreadId?: string | null; outcome?: string | null; reasonCode?: string | null; durationMs?: number | null; tokens?: number | null; details?: unknown }) {
+  recordEvent(input: { coordinatorThreadId: string; type: string; workstreamKey?: string | null; workerThreadId?: string | null; outcome?: string | null; reasonCode?: string | null; durationMs?: number | null; tokens?: number | null; details?: unknown; actor?: string }) {
     const run = this.getRun(input.coordinatorThreadId);
     if (run === null) return;
     const details = JSON.stringify(input.details ?? {});
-    this.db.prepare(`INSERT INTO orchestration_events (session_id, coordinator_thread_id, workstream_key, worker_thread_id, event_type, outcome, reason_code, duration_ms, tokens, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(run.sessionId, input.coordinatorThreadId, input.workstreamKey ?? null, input.workerThreadId ?? null, input.type, input.outcome ?? null, input.reasonCode ?? null, input.durationMs ?? null, input.tokens ?? null, details.length > 100_000 ? JSON.stringify({ truncated: true }) : details, Date.now());
+    this.db.prepare(`INSERT INTO orchestration_events (session_id, coordinator_thread_id, workstream_key, worker_thread_id, event_type, outcome, reason_code, duration_ms, tokens, details_json, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(run.sessionId, input.coordinatorThreadId, input.workstreamKey ?? null, input.workerThreadId ?? null, input.type, input.outcome ?? null, input.reasonCode ?? null, input.durationMs ?? null, input.tokens ?? null, details.length > 100_000 ? JSON.stringify({ truncated: true }) : details, input.actor ?? eventActor.getStore() ?? "system", Date.now());
   }
 
   analytics() {
