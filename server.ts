@@ -129,9 +129,10 @@ export const rpcContract = defineRpcContract({
   policy_get: { input: z.null(), output: orchestrationPolicy },
   policy_set: { input: orchestrationPolicy, output: orchestrationPolicy },
   analytics_get: { input: z.null(), output: z.object({
+    withoutWorkers: z.object({ sessions: z.number(), totalTokens: z.number() }),
     totals: z.object({ sessions: z.number(), completed: z.number(), failed: z.number(), totalTokens: z.number(), coordinatorTokens: z.number(), inputTokens: z.number(), cachedInputTokens: z.number(), outputTokens: z.number(), reasoningOutputTokens: z.number() }),
     failures: z.array(z.object({ reasonCode: z.string(), count: z.number() })),
-    sessions: z.array(z.object({ sessionId: z.string(), coordinatorThreadId: z.string(), label: z.string(), featureBranch: z.string(), state: z.string(), totalTokens: z.number(), coordinatorTokens: z.number(), inputTokens: z.number(), cachedInputTokens: z.number(), outputTokens: z.number(), reasoningOutputTokens: z.number(), startedAt: z.number(), updatedAt: z.number(), completedAt: z.number().nullable(), error: z.string().nullable() })),
+    sessions: z.array(z.object({ sessionId: z.string(), coordinatorThreadId: z.string(), label: z.string(), featureBranch: z.string(), state: z.string(), totalTokens: z.number(), coordinatorTokens: z.number(), inputTokens: z.number(), cachedInputTokens: z.number(), outputTokens: z.number(), reasoningOutputTokens: z.number(), startedAt: z.number(), updatedAt: z.number(), completedAt: z.number().nullable(), error: z.string().nullable(), hasWorkers: z.boolean() })),
   }) },
 });
 
@@ -351,6 +352,9 @@ const completionResult = z.object({
   if (result.status === "success" && result.blockers.length > 0) {
     ctx.addIssue({ code: "custom", path: ["blockers"], message: "Successful work cannot have blockers. Move caveats that did not stop the assignment into limitations." });
   }
+  if (result.status === "success" && result.limitations.length === 0 && result.validation.some((entry) => entry.status === "failed")) {
+    ctx.addIssue({ code: "custom", path: ["validation"], message: "A check failed. Fix it and validate again, report status failed, or, if the failure does not affect this assignment (for example it already failed before your change), say why in limitations." });
+  }
 });
 const artifactInput = z.object({
   kind: z.enum(["api-contract", "schema", "decision", "migration", "interface", "note"]),
@@ -385,6 +389,8 @@ export async function waitForEnvironmentAttachment<T extends ProvisioningThread>
   pollIntervalMs?: number;
   now?: () => number;
   sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+  /** The reason BB recorded for a failed provisioning; the thread status alone only says "error". */
+  lastError?: () => Promise<string | null>;
 }): Promise<T> {
   const timeoutMs = input.timeoutMs ?? 60_000;
   const pollIntervalMs = input.pollIntervalMs ?? 250;
@@ -402,7 +408,8 @@ export async function waitForEnvironmentAttachment<T extends ProvisioningThread>
     if (input.signal?.aborted) throw abortError();
     if (thread.environmentId !== null) return thread;
     if (thread.status === "error" || thread.archivedAt != null) {
-      throw new Error(`Worker ${thread.id} provisioning ended with status ${thread.status}.`);
+      const reason = await input.lastError?.().catch(() => null) ?? null;
+      throw new Error(`Worker ${thread.id} provisioning ended with status ${thread.status}.${reason === null ? "" : ` ${reason}`}`);
     }
     if (now() - started >= timeoutMs) {
       const suffix = lastGetError === undefined ? "" : ` Last lookup failed: ${lastGetError instanceof Error ? lastGetError.message : String(lastGetError)}.`;
@@ -806,6 +813,10 @@ export default async function plugin(bb: BbPluginApi) {
             initial: provisional,
             getThread: () => bb.sdk.threads.get({ threadId: provisional.id }),
             signal,
+            lastError: async () => {
+              const [row] = await bb.sdk.threads.events.list({ threadId: provisional.id, order: "desc", limit: "1", types: ["system/error"] });
+              return row?.type === "system/error" ? row.data.message : null;
+            },
           });
           if (attached.environmentId === null) throw new Error(`Worker ${attached.id} environment attachment was lost.`);
           return attached as typeof attached & { environmentId: string };
@@ -895,6 +906,18 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(`Could not refresh token usage for ${item.threadId}: ${error instanceof Error ? error.message : String(error)}`);
       return item;
     }
+  };
+  /**
+   * worker_done runs mid-turn, before the provider reports that turn's tokens, so the terminal state event often records 0.
+   * Once the worker is idle its usage is final; log it so per-workstream cost survives a run reset.
+   */
+  const recordFinalUsage = async (item: WorkstreamRecord) => {
+    const refreshed = await refreshWorkstreamUsage(item);
+    if (refreshed.lastEventSeq === item.lastEventSeq) return;
+    store.recordEvent({
+      coordinatorThreadId: item.coordinatorThreadId, type: "workstream.usage", workstreamKey: item.key, workerThreadId: item.threadId, outcome: refreshed.state, tokens: refreshed.totalTokens,
+      details: { inputTokens: refreshed.inputTokens, cachedInputTokens: refreshed.cachedInputTokens, outputTokens: refreshed.outputTokens, reasoningOutputTokens: refreshed.reasoningOutputTokens, profile: refreshed.profile, providerId: refreshed.providerId, model: refreshed.model },
+    });
   };
   // A new session starts from the coordinator's real current usage, so work done between runs is charged to neither.
   const coordinatorUsageBaseline = async (threadId: string) => {
@@ -1635,6 +1658,7 @@ export default async function plugin(bb: BbPluginApi) {
           validationPassed: Array.isArray(result.validation) ? result.validation.filter((entry) => (entry as { status?: unknown }).status === "passed").length : 0,
           blockers: strings("blockers", 30), limitations: strings("limitations", 30), commits: strings("commits", 50), pushedCommits: strings("pushedCommits", 50),
           branch: result.branch ?? null,
+          warnings: strings("warnings", 10),
         };
       };
       // Compact is read after every wake and stays in the coordinator's context, so it carries only what the coordinator acts on.
@@ -1762,7 +1786,13 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const measuredItem = await refreshWorkstreamUsage(item);
       const evidence = await captureCompletionEvidence(measuredItem, threadId);
-      const resultWithEvidence = { ...result, ...(hasVcsAction ? { branch } : {}), evidence };
+      // A claimed change that the worktree diff cannot see usually means the work landed somewhere else.
+      const warnings = item.accessMode === "mutating" && result.status === "success" && result.changedFiles.length > 0
+        && evidence.environmentDiff?.outcome === "available" && evidence.environmentDiff.files.length === 0
+        ? [`Reported ${result.changedFiles.length} changed file(s), but the run worktree diff shows none. Check where the changes were made before relying on them.`]
+        : [];
+      if (warnings.length > 0) store.recordEvent({ coordinatorThreadId: meta.coordinatorThreadId, type: "worker.evidence_mismatch", workstreamKey: meta.key, workerThreadId: threadId, outcome: "warned", reasonCode: "changed_files_not_in_diff", details: { claimed: result.changedFiles.length } });
+      const resultWithEvidence = { ...result, ...(hasVcsAction ? { branch } : {}), evidence, warnings };
       const state = result.status === "success" ? "completed" : "failed";
       const next = store.setWorkstreamState(meta.coordinatorThreadId, meta.key, state, { result: resultWithEvidence, error: result.status === "success" ? null : result.summary, reasonCode: result.status === "success" ? null : result.status === "blocked" ? "worker_blocked" : "worker_reported_failure" })!;
       if (item.parentKey !== null) {
@@ -1845,6 +1875,7 @@ export default async function plugin(bb: BbPluginApi) {
     let item = store.getWorkstreamByThread(thread.id);
     if (item === null) return;
     if (isTerminalWorkstream(item.state)) {
+      await recordFinalUsage(item);
       store.releaseProjectLane(item.coordinatorThreadId, item.key);
       await launchQueued(item.coordinatorThreadId);
       await retireWorker(thread.id);
@@ -1940,7 +1971,7 @@ export default async function plugin(bb: BbPluginApi) {
     const terminal = store.listTerminalWorkstreams().filter((item) => item.threadId !== null && !retiredWorkerIds.has(item.threadId));
     for (const item of terminal) {
       try {
-        await refreshWorkstreamUsage(item);
+        await recordFinalUsage(item);
         const thread = await bb.sdk.threads.get({ threadId: item.threadId! });
         if (thread.status === "idle" || thread.status === "error") {
           store.releaseProjectLane(item.coordinatorThreadId, item.key);

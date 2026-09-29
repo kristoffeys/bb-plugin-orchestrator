@@ -1129,7 +1129,8 @@ function RoutingSettings() {
 type AnalyticsData = {
   totals: { sessions: number; completed: number; failed: number; totalTokens: number; coordinatorTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number };
   failures: Array<{ reasonCode: string; count: number }>;
-  sessions: Array<{ sessionId: string; coordinatorThreadId: string; label: string; featureBranch: string; state: string; totalTokens: number; coordinatorTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number; startedAt: number; updatedAt: number; completedAt: number | null; error: string | null }>;
+  withoutWorkers: { sessions: number; totalTokens: number };
+  sessions: Array<{ sessionId: string; coordinatorThreadId: string; label: string; featureBranch: string; state: string; totalTokens: number; coordinatorTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number; startedAt: number; updatedAt: number; completedAt: number | null; error: string | null; hasWorkers: boolean }>;
 };
 
 function LearningDataSettings() {
@@ -1155,6 +1156,7 @@ function LearningDataSettings() {
         {([['Sessions', data.totals.sessions], ['Completed', `${completionRate}%`], ['Failed', data.totals.failed], ['Tokens', formatCount(data.totals.totalTokens)]] as const).map(([label, value]) => <div key={label} className="rounded-md border border-border bg-card p-3"><p className="text-lg font-semibold text-foreground">{value}</p><p className="text-xs text-muted-foreground">{label}</p></div>)}
       </div>
       <div className="rounded-md border border-border bg-card p-3"><div className="flex items-center justify-between gap-3"><div><p className="text-sm font-semibold text-foreground">Token composition</p><p className="mt-0.5 text-xs text-muted-foreground">Provider-reported totals; cached input is cheaper than fresh input but still signals repeated context processing. Breakdown coverage: {breakdownCoverage}%.</p></div><div className="text-right text-sm font-semibold text-foreground"><div>{cachedPercent}% cached</div><div>{coordinatorPercent}% coordinator</div></div></div><div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4"><span>Fresh input <strong>{formatCount(data.totals.inputTokens)}</strong></span><span>Cached input <strong>{formatCount(data.totals.cachedInputTokens)}</strong></span><span>Output <strong>{formatCount(data.totals.outputTokens)}</strong></span><span>Reasoning <strong>{formatCount(data.totals.reasoningOutputTokens)}</strong></span></div></div>
+      {data.withoutWorkers.sessions === 0 ? null : <p className="text-xs text-muted-foreground">Excludes {data.withoutWorkers.sessions} session{data.withoutWorkers.sessions === 1 ? "" : "s"} that never started a worker ({formatCount(data.withoutWorkers.totalTokens)} coordinator tokens).</p>}
       <section>
         <h3 className="mb-2 text-sm font-semibold text-foreground">Failure categories</h3>
         {data.failures.length === 0 ? <p className="text-xs text-muted-foreground">No failures recorded.</p> : <div className="overflow-hidden rounded-md border border-border">{data.failures.map((item) => <div key={item.reasonCode} className="flex justify-between border-b border-border px-3 py-2 text-xs last:border-b-0"><span className="text-foreground">{item.reasonCode.replaceAll('_', ' ')}</span><span className="tabular-nums text-muted-foreground">{item.count}</span></div>)}</div>}

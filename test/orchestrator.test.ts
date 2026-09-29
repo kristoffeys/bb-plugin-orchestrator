@@ -1772,3 +1772,54 @@ test("launch claims and expected-state transitions are compare-and-set", () => {
   assert.equal(store.getWorkstream("coord", "a")?.state, "cancelled");
   db.close();
 });
+
+test("learning data separates real failures, repeated run states, and sessions without workers", async () => {
+  const state = await load();
+  const coord = { threadId: "coord", projectId: "personal" };
+  const dispatched = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "a", projectId: "api", prompt: "A." }, { key: "b", projectId: "web", prompt: "B." }] }, coord) as string);
+  await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "a", projectId: "api", prompt: "A." }] }, coord);
+  const db = state.bb.storage.database();
+  const cancelled = db.prepare("SELECT reason_code AS reasonCode FROM orchestration_events WHERE workstream_key = 'b' AND outcome = 'cancelled'").get() as { reasonCode: string };
+  assert.equal(cancelled.reasonCode, "workstream_cancelled");
+  const runStates = db.prepare("SELECT outcome FROM orchestration_events WHERE event_type = 'run.state'").all() as Array<{ outcome: string }>;
+  assert.equal(runStates.filter((row) => row.outcome === "running").length, 1, "re-asserting running is not a new transition");
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", { status: "failed", summary: "Broke.", changedFiles: [], validation: [], blockers: ["x"] }, { threadId: dispatched.workers[0].threadId, projectId: "api" });
+  db.prepare("INSERT INTO orchestration_sessions (session_id, coordinator_thread_id, label, feature_branch, allowed_project_ids_json, state, policy_json, total_tokens, started_at, updated_at) VALUES ('chat', 'chat', 'Chat', 'b', '[]', 'completed', '{}', 500, 1, 2)").run();
+  const analytics = await state.harness.behavior.callRpc("analytics_get", null) as { totals: { sessions: number }; withoutWorkers: { sessions: number; totalTokens: number }; failures: Array<{ reasonCode: string }>; sessions: Array<{ sessionId: string; hasWorkers: boolean }> };
+  assert.deepEqual(analytics.failures.map((item) => item.reasonCode), ["worker_reported_failure"]);
+  assert.equal(analytics.totals.sessions, 1);
+  assert.deepEqual(analytics.withoutWorkers, { sessions: 1, totalTokens: 500 });
+  assert.equal(analytics.sessions.find((item) => item.sessionId === "chat")?.hasWorkers, false);
+});
+
+test("worker_done needs a limitation for success with a failing check and flags changes the diff cannot see", async () => {
+  const state = await load();
+  const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "fix", projectId: "api", prompt: "Fix." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  const done = (extra: Record<string, unknown>) => state.harness.behavior.callAgentTool("orchestrator_worker_done", {
+    status: "success", summary: "Fixed.", changedFiles: ["src/a.ts"], validation: [{ command: "npm test", status: "failed", summary: "1 failing" }], blockers: [], ...extra,
+  }, { threadId: worker.threadId, projectId: "api" });
+  await assert.rejects(done({}), /A check failed/);
+  await done({ limitations: ["npm test already failed on main before this change."] });
+  const status = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_status", {}, { threadId: "coord", projectId: "personal" }) as string);
+  assert.equal(status.workstreams[0].state, "completed");
+  assert.match(status.workstreams[0].result.warnings[0], /worktree diff shows none/);
+});
+
+test("final worker usage is logged once the worker is idle", async () => {
+  const state = await load();
+  const worker = JSON.parse(await state.harness.behavior.callAgentTool("orchestrator_dispatch", { assignments: [{ key: "measure", projectId: "api", prompt: "Do it." }] }, { threadId: "coord", projectId: "personal" }) as string).workers[0];
+  await state.harness.behavior.callAgentTool("orchestrator_worker_done", { status: "success", summary: "Done.", changedFiles: [], validation: [], blockers: [] }, { threadId: worker.threadId, projectId: "api" });
+  const total = { cachedInputTokens: 700, inputTokens: 900, outputTokens: 100, reasoningOutputTokens: 0, totalTokens: 1000 };
+  state.eventRows.set(worker.threadId, [{ id: "worker-usage", threadId: worker.threadId, seq: 5, createdAt: Date.now(), scope: { kind: "thread" }, type: "thread/tokenUsage/updated", data: { providerThreadId: "provider-worker", tokenUsage: { last: total, total, modelContextWindow: 1000 } } }]);
+  await state.harness.behavior.emitThreadEvent("thread.idle", { thread: state.threads.get(worker.threadId)!, lastAssistantText: "Done." });
+  const usage = state.bb.storage.database().prepare("SELECT outcome, tokens FROM orchestration_events WHERE event_type = 'workstream.usage'").all();
+  assert.deepEqual(usage, [{ outcome: "completed", tokens: 1000 }]);
+});
+
+test("a failed provisioning names the reason BB recorded", async () => {
+  await assert.rejects(waitForEnvironmentAttachment({
+    initial: { id: "w1", status: "error", environmentId: null, archivedAt: null } as never,
+    getThread: async () => { throw new Error("unused"); },
+    lastError: async () => "Worktree path already exists.",
+  }), /provisioning ended with status error\. Worktree path already exists\./);
+});
