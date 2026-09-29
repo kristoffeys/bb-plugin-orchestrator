@@ -1,4 +1,4 @@
-import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { defineRpcContract, type BbPluginApi, type PluginAgentToolContext, type PluginAgentToolRegistrationBase, type PluginAgentToolResult } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { coordinatorPrompt, type OrchestratorProject } from "./lib/coordinator-prompt.ts";
 import {
@@ -14,9 +14,10 @@ import {
   workerProfile,
   type WorkerProfile,
 } from "./lib/policy.ts";
-import { OrchestratorStore, type RunRecord, type WorkstreamRecord } from "./lib/state.ts";
+import { eventActor, OrchestratorStore, type RunRecord, type WorkstreamRecord } from "./lib/state.ts";
 import { mutatingLaneHolders, reportedBlocked, runConditions } from "./lib/conditions.ts";
 import { parseNewThreadOrchestrationMarker } from "./lib/new-thread-marker.ts";
+import { classifyIdleWorker, idleFailureReason, idleReminder } from "./lib/liveness.ts";
 import { worktreeHostContract } from "./lib/host-contract.ts";
 
 const reasoningLevel = z.enum(["none", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"]);
@@ -182,6 +183,9 @@ export const ORCHESTRATOR_MIGRATIONS = [
   `UPDATE orchestration_sessions SET coordinator_tokens = COALESCE((SELECT coordinator_total_tokens FROM runs WHERE runs.session_id = orchestration_sessions.session_id), 0)`,
   `UPDATE orchestration_sessions AS session SET state = (SELECT event.outcome FROM orchestration_events AS event WHERE event.session_id = session.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed') ORDER BY event.created_at DESC, event.id DESC LIMIT 1), error = NULL, completed_at = (SELECT event.created_at FROM orchestration_events AS event WHERE event.session_id = session.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed') ORDER BY event.created_at DESC, event.id DESC LIMIT 1), updated_at = (SELECT event.created_at FROM orchestration_events AS event WHERE event.session_id = session.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed') ORDER BY event.created_at DESC, event.id DESC LIMIT 1) WHERE session.state = 'cancelled' AND session.error IN ('Coordinator was archived.', 'Coordinator was deleted.') AND EXISTS (SELECT 1 FROM orchestration_events AS event WHERE event.session_id = session.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed'))`,
   `UPDATE runs AS run SET state = (SELECT event.outcome FROM orchestration_events AS event WHERE event.session_id = run.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed') ORDER BY event.created_at DESC, event.id DESC LIMIT 1), error = NULL, updated_at = (SELECT event.created_at FROM orchestration_events AS event WHERE event.session_id = run.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed') ORDER BY event.created_at DESC, event.id DESC LIMIT 1), last_activity_at = (SELECT event.created_at FROM orchestration_events AS event WHERE event.session_id = run.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed') ORDER BY event.created_at DESC, event.id DESC LIMIT 1) WHERE run.state = 'cancelled' AND run.error IN ('Coordinator was archived.', 'Coordinator was deleted.') AND EXISTS (SELECT 1 FROM orchestration_events AS event WHERE event.session_id = run.session_id AND event.event_type = 'run.state' AND event.outcome IN ('completed', 'failed'))`,
+  `ALTER TABLE orchestration_events ADD COLUMN actor TEXT`,
+  `ALTER TABLE workstreams ADD COLUMN launch_claimed_at INTEGER`,
+  `ALTER TABLE plans ADD COLUMN goal TEXT`,
 ] as const;
 
 const workerAssignment = z.object({
@@ -210,6 +214,7 @@ const workerAssignment = z.object({
 const planInput = z.object({
   scale: z.enum(["small", "large"]),
   rationale: z.string().trim().min(1).max(2_000),
+  goal: z.string().trim().min(1).max(500).optional(),
   steps: z.array(workerAssignment).max(50).default([]),
 }).superRefine((plan, ctx) => {
   const keys = new Set(plan.steps.map((step) => step.key));
@@ -712,13 +717,20 @@ export default async function plugin(bb: BbPluginApi) {
 
   const workerPrompt = (item: WorkstreamRecord) => {
     const run = store.getRun(item.coordinatorThreadId)!;
-    const plannedStep = store.getPlan(item.coordinatorThreadId)?.steps.find((step) => step.key === item.key);
+    const plan = store.getPlan(item.coordinatorThreadId);
+    const plannedStep = plan?.steps.find((step) => step.key === item.key);
+    // Titles only, like Paperclip's heartbeat context: enough to know why this work exists without re-sending ancestor prompts.
+    const ancestors: string[] = [];
+    for (let parent = item.parentKey === null ? null : store.getWorkstream(item.coordinatorThreadId, item.parentKey); parent !== null; parent = parent.parentKey === null ? null : store.getWorkstream(item.coordinatorThreadId, parent.parentKey)) {
+      ancestors.unshift(`  - ${parent.key}: ${parent.title ?? parent.assignment.split("\n")[0]!.slice(0, 160)}`);
+    }
+    const why = plan?.goal == null && ancestors.length === 0 ? "" : `\n\nWhy this exists:${plan?.goal == null ? "" : `\n- Run goal: ${plan.goal}`}${ancestors.length === 0 ? "" : `\n- Delegated from:\n${ancestors.join("\n")}`}`;
     const protectedBranches = effectiveProtectedBranches(run.policy);
     const access = item.accessMode === "read-only"
       ? "This delegated workstream is read-only. Do not edit files, create commits, or push. Report findings through messages/artifacts and worker_done."
       : "This is the sole mutating workstream in its project lane. Nested delegation is read-only only, so descendants cannot race this writer.";
     const planning = plannedStep === undefined ? "" : `\nPlan context:\n- Phase: ${plannedStep.phase ?? "unspecified"}.\n- Dependencies: ${plannedStep.dependsOn.length === 0 ? "none" : plannedStep.dependsOn.join(", ")}.\n- Success criteria: ${plannedStep.successCriteria?.length ? plannedStep.successCriteria.join("; ") : "use the assignment and completion contract"}.`;
-    return `${item.assignment}${planning}\n\nManaged workstream contract:\n- Work on the Orchestrator-owned feature branch ${JSON.stringify(run.featureBranch)}. This workstream shares one durable project worktree with this run's other ${item.projectId} workstreams. Preserve unrelated changes and do not create, check out, or switch to another branch or environment.\n- ${access}\n- Keep the execution bounded to roughly ${WORKSTREAM_ACTION_BUDGET[item.profile]} tool actions. Read the smallest relevant surface, implement, and validate targeted behavior. If the scope cannot be completed within that budget, report a blocker or delegate a bounded read-only investigation instead of exhaustively exploring.\n- You may delegate bounded read-only subtasks only with orchestrator_delegate; never spawn threads directly.\n- Commit mode is ${run.policy.commitMode}; push mode is ${run.policy.pushMode}; protected branches are ${JSON.stringify(protectedBranches)}. Protected branches cannot be committed to or pushed. Existing branches require separate explicit user approval for commits and pushes. Orchestrator-owned branches need no commit approval. Never push without explicit user approval.\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers.\n- Before ending, call orchestrator_worker_done exactly once with ordered commit SHAs, changed files, validation, and blockers. Status says whether you finished your assignment, not whether the news is good: a verification that refutes a claim, or an investigation that answers the question, is success. Put caveats that did not stop the assignment (an untested path, missing access for an optional check) in limitations. Use blocked only when the assignment itself could not be finished. Parent completion is rejected while descendants are live. An idle turn without that record is treated as a failed workstream.`;
+    return `${item.assignment}${why}${planning}\n\nManaged workstream contract:\n- Work on the Orchestrator-owned feature branch ${JSON.stringify(run.featureBranch)}. This workstream shares one durable project worktree with this run's other ${item.projectId} workstreams. Preserve unrelated changes and do not create, check out, or switch to another branch or environment.\n- ${access}\n- Keep the execution bounded to roughly ${WORKSTREAM_ACTION_BUDGET[item.profile]} tool actions. Read the smallest relevant surface, implement, and validate targeted behavior. If the scope cannot be completed within that budget, report a blocker or delegate a bounded read-only investigation instead of exhaustively exploring.\n- You may delegate bounded read-only subtasks only with orchestrator_delegate; never spawn threads directly.\n- Commit mode is ${run.policy.commitMode}; push mode is ${run.policy.pushMode}; protected branches are ${JSON.stringify(protectedBranches)}. Protected branches cannot be committed to or pushed. Existing branches require separate explicit user approval for commits and pushes. Orchestrator-owned branches need no commit approval. Never push without explicit user approval.\n- Publish interface/API/schema decisions early with orchestrator_publish_artifact so consumers can proceed.\n- Use orchestrator_message for questions and blockers.\n- Before ending, call orchestrator_worker_done exactly once with ordered commit SHAs, changed files, validation, and blockers. Status says whether you finished your assignment, not whether the news is good: a verification that refutes a claim, or an investigation that answers the question, is success. Put caveats that did not stop the assignment (an untested path, missing access for an optional check) in limitations. Use blocked only when the assignment itself could not be finished. Parent completion is rejected while descendants are live. An idle turn without that record is treated as a failed workstream.`;
   };
 
   const launchQueuedUnlocked = async (coordinatorThreadId: string, signal?: AbortSignal) => {
@@ -747,6 +759,8 @@ export default async function plugin(bb: BbPluginApi) {
         store.setWorkstreamState(coordinatorThreadId, item.key, "cancelled", { error: "Delegating parent is no longer live." });
         continue;
       }
+      // ponytail: the claim stops double spawns across processes; capacity and lanes are still counted per process.
+      if (!store.claimLaunch(coordinatorThreadId, item.key)) continue;
       const project = (await bb.sdk.projects.list({ includePersonal: true })).find((candidate) => candidate.id === item.projectId);
       const source = project?.sources.find((candidate) => candidate.isDefault) ?? project?.sources[0];
       if (source === undefined) {
@@ -802,7 +816,13 @@ export default async function plugin(bb: BbPluginApi) {
           spawned = await spawnAttached(freshEnvironment);
         }
         store.setProjectEnvironment(coordinatorThreadId, item.projectId, spawned.environmentId);
-        launched.push(store.setWorkstreamState(coordinatorThreadId, item.key, "running", { threadId: spawned.id, incrementAttempt: true })!);
+        // Spawning awaits for a while; if the workstream was cancelled meanwhile, do not resurrect it — retire the new thread instead.
+        const started = store.setWorkstreamState(coordinatorThreadId, item.key, "running", { threadId: spawned.id, incrementAttempt: true, from: "queued" });
+        if (started === null) {
+          await retireWorker(spawned.id);
+          continue;
+        }
+        launched.push(started);
         if (item.accessMode === "mutating") activeProjects.add(item.projectId);
         available -= 1;
       } catch (error) {
@@ -810,6 +830,7 @@ export default async function plugin(bb: BbPluginApi) {
         store.setWorkstreamState(coordinatorThreadId, item.key, cancelled ? "cancelled" : "failed", {
           error: `Could not launch worker: ${error instanceof Error ? error.message : String(error)}`,
           reasonCode: cancelled ? "provisioning_cancelled" : "provisioning_failed",
+          from: "queued",
         });
         store.releaseProjectLane(coordinatorThreadId, item.key);
         if (cancelled) throw error;
@@ -968,6 +989,18 @@ export default async function plugin(bb: BbPluginApi) {
     };
   };
 
+  // Events recorded while a tool runs are attributed to the managed thread that called it.
+  const registerTool = <Schema extends z.ZodType>(tool: PluginAgentToolRegistrationBase & {
+    parameters: Schema;
+    execute(params: z.output<Schema>, ctx: PluginAgentToolContext): PluginAgentToolResult | Promise<PluginAgentToolResult>;
+  }) => bb.agents.registerTool({
+    ...tool,
+    execute: (params: z.output<Schema>, ctx: PluginAgentToolContext) => {
+      const worker = store.getWorkstreamByThread(ctx.threadId);
+      return eventActor.run(worker === null ? "coordinator" : `worker:${worker.key}`, () => tool.execute(params, ctx));
+    },
+  });
+
   bb.rpc.register(rpcContract, {
     start: async ({ label, task, projectIds: ids, attachments, ...execution }) => {
       const [{ all, selected }, policy] = await Promise.all([resolveProjects(ids), readPolicy()]);
@@ -981,10 +1014,10 @@ export default async function plugin(bb: BbPluginApi) {
         ...execution,
         input: [{ type: "text", text: coordinatorPrompt(label, selected, task, policy), mentions: [] }, ...(attachments ?? [])],
       });
-      store.upsertRun({ coordinatorThreadId: thread.id, label, allowedProjectIds: ids, policy });
+      eventActor.run("user", () => store.upsertRun({ coordinatorThreadId: thread.id, label, allowedProjectIds: ids, policy }));
       return { threadId: thread.id };
     },
-    enable,
+    enable: (input) => eventActor.run("user", () => enable(input)),
     orchestration_projects: async ({ currentProjectId }) => orchestrationProjectsFor(currentProjectId),
     thread_orchestration_get: async ({ threadId }) => threadOrchestrationStateFor(threadId),
     run_dashboard_get: async ({ threadId }) => {
@@ -1051,12 +1084,12 @@ export default async function plugin(bb: BbPluginApi) {
       const value = await metadata(threadId);
       const coordinatorThreadId = value?.role === "worker" ? value.coordinatorThreadId : value?.role === "coordinator" ? threadId : null;
       if (coordinatorThreadId === null) throw new Error("This thread is not part of a managed Orchestrator run.");
-      return setSuspension(coordinatorThreadId, action, workstreamKey);
+      return eventActor.run("user", () => setSuspension(coordinatorThreadId, action, workstreamKey));
     },
     thread_orchestration_disable: async ({ threadId }) => {
       const state = await threadOrchestrationStateFor(threadId);
       if (!state.eligible) throw new Error("Only an eligible root thread can change orchestration.");
-      await cleanupRun(threadId, "cancelled", "Orchestration was disabled.");
+      await eventActor.run("user", () => cleanupRun(threadId, "cancelled", "Orchestration was disabled."));
       await bb.sdk.threads.updatePluginMetadata({ threadId, remove: ["role", "label", "allowedProjectIds"] });
       bb.realtime.publish("thread-orchestration-changed", { threadId });
       return null;
@@ -1162,7 +1195,7 @@ export default async function plugin(bb: BbPluginApi) {
     return { action: "proceed" };
   });
 
-  bb.agents.registerTool({
+  registerTool({
     name: "orchestrator_enable",
     description: "Turn the current root project thread into a managed coordinator.",
     instructions: "Use when the user asks this ordinary thread to orchestrate workers. Managed tools attach on the next turn.",
@@ -1173,13 +1206,13 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  bb.agents.registerTool({
+  registerTool({
     name: "orchestrator_plan",
     description: "Classify the request as small or large and persist a versioned global execution plan before dispatch.",
-    instructions: "Call before orchestrator_dispatch when planning is enabled. Small requests may omit steps and take the fast path. Large requests need a complete dependency-aware step set; use read-only roots for parallel investigation and revise the plan after their findings when needed.",
+    instructions: "Call before orchestrator_dispatch when planning is enabled. Small requests may omit steps and take the fast path. Pass goal as one sentence stating the user's outcome; every worker sees it. Large requests need a complete dependency-aware step set; use read-only roots for parallel investigation and revise the plan after their findings when needed.",
     presentation: { label: { pending: "Assessing orchestration plan", completed: "Orchestration plan ready" } },
     parameters: planInput,
-    async execute({ scale, rationale, steps }, { threadId }) {
+    async execute({ scale, rationale, goal, steps }, { threadId }) {
       const coordinatorMetadata = await requireCoordinator(threadId);
       let run = store.getRun(threadId);
       const restart = run !== null && isTerminalRun(run.state);
@@ -1201,13 +1234,13 @@ export default async function plugin(bb: BbPluginApi) {
         coordinatorThreadId: threadId, label: coordinatorMetadata.label,
         allowedProjectIds: coordinatorMetadata.allowedProjectIds, policy,
       }, coordinatorBaseline) : run;
-      const plan = store.setPlan({ coordinatorThreadId: threadId, scale, rationale, steps });
+      const plan = store.setPlan({ coordinatorThreadId: threadId, scale, rationale, goal, steps });
       store.recordEvent({ coordinatorThreadId: threadId, type: "plan.recorded", outcome: scale, details: { version: plan.version, stepCount: plan.steps.length, dependencyCount: plan.steps.reduce((sum, step) => sum + step.dependsOn.length, 0), inputBytes: Buffer.byteLength(JSON.stringify({ scale, rationale, steps })), restart } });
       return JSON.stringify({ plan, restarted: restart, fastPath: scale === "small" && steps.length === 0, planningMode: run.policy.planningMode });
     },
   });
 
-  bb.agents.registerTool({
+  registerTool({
     name: "orchestrator_plan_update",
     description: "Incrementally revise the current durable plan without resending unchanged steps.",
     instructions: "Use after the initial orchestrator_plan call. Supply the current expectedVersion, complete definitions only for added or changed steps, and keys to remove. The merged plan is validated and versioned atomically.",
@@ -1271,7 +1304,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  bb.agents.registerTool({
+  registerTool({
     name: "orchestrator_dispatch",
     description: "Reconcile managed workstreams from a durable plan version or a complete desired assignment set.",
     instructions: "For an explicit large plan, send only planVersion so the server dispatches its durable steps without repeating prompts. Send complete assignments for a small fast-path plan without steps or when planning is disabled. Quick is the cheap default; stronger profiles require a concrete reason.",
@@ -1346,6 +1379,7 @@ export default async function plugin(bb: BbPluginApi) {
           timeoutMs: 60 * 60_000,
         }, { signal });
         const approved = answer.outcome === "submitted" && typeof answer.value === "object" && answer.value !== null && "approved" in answer.value && answer.value.approved === true;
+        store.recordEvent({ coordinatorThreadId: threadId, type: "dispatch.approval", outcome: approved ? "approved" : answer.outcome === "submitted" ? "rejected" : answer.outcome, actor: answer.outcome === "submitted" ? "user" : "system", details: { assignmentKeys: assignments.map((item) => item.key) } });
         if (!approved) {
           store.setRunState(threadId, "blocked", "Worker plan was not approved.");
           return JSON.stringify({ approved: false, workers: [], retired: [] });
@@ -1460,7 +1494,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  bb.agents.registerTool({
+  registerTool({
     name: "orchestrator_delegate",
     description: "Reconcile this managed worker's complete set of bounded read-only child workstreams.",
     instructions: "Use local stable keys. Children are always read-only, root-run-owned, and use quick routing by default. Do not spawn threads directly.",
@@ -1544,7 +1578,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  bb.agents.registerTool({
+  registerTool({
     name: "orchestrator_status",
     description: "Read bounded durable state, structured results, limits, and artifacts for this run. Compact detail is the normal coordination view; request full only for a specific debugging need.",
     presentation: { label: { pending: "Reading orchestration status", completed: "Read orchestration status" } },
@@ -1607,7 +1641,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  bb.agents.registerTool({
+  registerTool({
     name: "orchestrator_message",
     description: "Send a message between a coordinator and managed workers in one run.",
     instructions: "Use for questions, blockers, and integration feedback. Publish reusable contracts with orchestrator_publish_artifact.",
@@ -1628,7 +1662,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  bb.agents.registerTool({
+  registerTool({
     name: "orchestrator_publish_artifact",
     description: "Publish a versioned contract or decision and notify its consumer workstreams. The coordinator is not woken; it reads artifacts from status.",
     presentation: { label: { pending: "Publishing handoff artifact", completed: "Published handoff artifact" } },
@@ -1654,7 +1688,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  bb.agents.registerTool({
+  registerTool({
     name: "orchestrator_worker_done",
     description: "Persist a structured workstream completion or blocker report.",
     instructions: "Call exactly once before ending a managed worker turn.",
@@ -1714,7 +1748,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  bb.agents.registerTool({
+  registerTool({
     name: "orchestrator_review",
     description: "Accept or reject a structured workstream result at its evaluator gate.",
     presentation: { label: { pending: "Reviewing workstream", completed: "Reviewed workstream" } },
@@ -1728,8 +1762,9 @@ export default async function plugin(bb: BbPluginApi) {
       const run = store.getRun(threadId);
       const item = store.getWorkstream(threadId, key);
       if (run === null || item?.state !== "reviewing") throw new Error(`Workstream ${key} is not awaiting review.`);
+      const notReviewing = () => new Error(`Workstream ${key} is no longer awaiting review.`);
       if (decision === "accept") {
-        store.setWorkstreamState(threadId, key, "completed");
+        if (store.setWorkstreamState(threadId, key, "completed", { from: "reviewing" }) === null) throw notReviewing();
         store.releaseProjectLane(threadId, key);
         store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: true, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
         await launchQueued(threadId);
@@ -1737,14 +1772,14 @@ export default async function plugin(bb: BbPluginApi) {
         return JSON.stringify({ key, state: "completed" });
       }
       if (item.attemptCount >= run.policy.maxAttemptsPerWorkstream || item.threadId === null) {
-        store.setWorkstreamState(threadId, key, "failed", { error: feedback, reasonCode: "evaluation_rejected" });
+        if (store.setWorkstreamState(threadId, key, "failed", { error: feedback, reasonCode: "evaluation_rejected", from: "reviewing" }) === null) throw notReviewing();
         store.releaseProjectLane(threadId, key);
         store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
         await launchQueued(threadId);
         if (item.threadId !== null) await retireWorker(item.threadId);
         return JSON.stringify({ key, state: "failed", retry: false });
       }
-      store.setWorkstreamState(threadId, key, "running", { incrementAttempt: true, error: feedback });
+      if (store.setWorkstreamState(threadId, key, "running", { incrementAttempt: true, error: feedback, from: "reviewing" }) === null) throw notReviewing();
       await bb.sdk.threads.send({
         threadId: item.threadId, senderThreadId: threadId, mode: "auto", model: item.model,
         reasoningLevel: item.reasoningLevel as z.output<typeof reasoningLevel>,
@@ -1754,7 +1789,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  bb.agents.registerTool({
+  registerTool({
     name: "orchestrator_finish",
     description: "Complete a run and archive all managed workers without deleting history.",
     instructions: "Call after all structured results and evaluator gates are settled.",
@@ -1779,6 +1814,40 @@ export default async function plugin(bb: BbPluginApi) {
       return JSON.stringify({ retired: [...managed], state: store.getRun(threadId)?.state, ignoredHistoricalFailures: all.filter((item) => item.state === "failed" && !relevantKeys.has(item.key)).map((item) => item.key) });
     },
   });
+
+  /** A running worker with no live descendants went idle without orchestrator_worker_done: nudge it once for the likely reason, then settle it. */
+  const settleUnreportedWorker = async (observed: WorkstreamRecord, lastText: string | null) => {
+    // Re-read synchronously before writing: the idle handler and the reconcile loop can both reach here for one idle turn.
+    const item = store.getWorkstream(observed.coordinatorThreadId, observed.key);
+    if (item === null || item.state !== "running" || item.threadId === null) return;
+    const workerThreadId = item.threadId;
+    const idleClass = classifyIdleWorker(lastText);
+    if (item.error !== COMPLETION_REMINDER) {
+      if (store.setWorkstreamState(item.coordinatorThreadId, item.key, "running", { error: COMPLETION_REMINDER, reasonCode: "completion_contract_reminder", from: "running" }) === null) return;
+      store.recordEvent({ coordinatorThreadId: item.coordinatorThreadId, type: "worker.completion_reminder", workstreamKey: item.key, workerThreadId, outcome: "sent", reasonCode: idleFailureReason[idleClass], details: { hadAssistantOutput: lastText !== null && lastText.trim().length > 0, idleClass } });
+      await notify(workerThreadId, idleReminder[idleClass], item.coordinatorThreadId);
+      return;
+    }
+    // A worker that says it is blocked settles like a reported blocker, so dependents wait for a plan revision instead of being cancelled.
+    const blocked = idleClass === "blocked" && lastText !== null;
+    const settled = store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", {
+      from: "running",
+      error: blocked ? "Worker stopped blocked without a structured completion record." : "Worker became idle without a structured completion record.",
+      reasonCode: idleFailureReason[idleClass],
+      result: blocked
+        ? { status: "blocked", summary: lastText, changedFiles: [], validation: [], blockers: [lastText.trim().slice(-1_000)] }
+        : { status: "failed", summary: lastText ?? "No worker output was recorded.", changedFiles: [], validation: [], blockers: ["Missing orchestrator_worker_done call."] },
+    });
+    if (settled === null) return;
+    store.releaseProjectLane(item.coordinatorThreadId, item.key);
+    store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
+    await cancelDescendants(item.coordinatorThreadId, item.key, "Parent worker failed its completion contract.");
+    await notify(item.coordinatorThreadId, blocked
+      ? `Workstream ${item.key} stopped blocked without orchestrator_worker_done. Its dependents wait for a plan revision. Last output: ${lastText.trim().slice(-500)}`
+      : `Workstream ${item.key} failed its completion contract: the worker became idle without orchestrator_worker_done (${idleClass}).`, workerThreadId);
+    await launchQueued(item.coordinatorThreadId);
+    await retireWorker(workerThreadId);
+  };
 
   bb.events.on("thread.active", async ({ thread }) => {
     workerActivityEpochs.set(thread.id, (workerActivityEpochs.get(thread.id) ?? 0) + 1);
@@ -1815,23 +1884,7 @@ export default async function plugin(bb: BbPluginApi) {
     const settledLiveDescendants = store.listDescendants(item.coordinatorThreadId, item.key)
       .filter((child) => !isTerminalWorkstream(child.state));
     if (settledLiveDescendants.length > 0) return;
-    if (item.error !== COMPLETION_REMINDER) {
-      store.setWorkstreamState(item.coordinatorThreadId, item.key, "running", { error: COMPLETION_REMINDER, reasonCode: "completion_contract_reminder" });
-      store.recordEvent({ coordinatorThreadId: item.coordinatorThreadId, type: "worker.completion_reminder", workstreamKey: item.key, workerThreadId: thread.id, outcome: "sent", reasonCode: "completion_contract_missing", details: { hadAssistantOutput: lastAssistantText !== null && lastAssistantText.trim().length > 0 } });
-      await notify(thread.id, "Your workstream is still marked running because no structured completion was recorded. Review your work, then call orchestrator_worker_done exactly once with status, summary, changed files, validation, blockers, and commits. Do not make unrelated changes.", item.coordinatorThreadId);
-      return;
-    }
-    store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", {
-      error: "Worker became idle without a structured completion record.",
-      reasonCode: "completion_contract_missing",
-      result: { status: "failed", summary: lastAssistantText ?? "No worker output was recorded.", changedFiles: [], validation: [], blockers: ["Missing orchestrator_worker_done call."] },
-    });
-    store.releaseProjectLane(item.coordinatorThreadId, item.key);
-    store.recordMetric({ providerId: item.providerId, model: item.model, profile: item.profile, succeeded: false, durationMs: Math.max(0, Date.now() - (item.startedAt ?? item.createdAt)), totalTokens: item.totalTokens });
-    await cancelDescendants(item.coordinatorThreadId, item.key, "Parent worker failed its completion contract.");
-    await notify(item.coordinatorThreadId, `Workstream ${item.key} failed its completion contract: the worker became idle without orchestrator_worker_done.`, thread.id);
-    await launchQueued(item.coordinatorThreadId);
-    await retireWorker(thread.id);
+    await settleUnreportedWorker(item, lastAssistantText);
   });
   bb.events.on("turn.failed", async (event) => {
     const item = store.getWorkstreamByThread(event.threadId);
@@ -1920,15 +1973,8 @@ export default async function plugin(bb: BbPluginApi) {
           await notify(item.threadId, `All managed descendants of ${item.key} are terminal. Join their durable results and call orchestrator_worker_done.`, item.coordinatorThreadId);
           continue;
         }
-        store.setWorkstreamState(item.coordinatorThreadId, item.key, "failed", {
-          error: "Reload reconciliation found an idle worker without a structured completion record.",
-          reasonCode: "completion_contract_missing",
-          result: { status: "failed", summary: "No structured completion was recorded.", changedFiles: [], validation: [], blockers: ["Missing orchestrator_worker_done call."], commits: [], pushedCommits: [] },
-        });
-        await cancelDescendants(item.coordinatorThreadId, item.key, "Parent worker failed reload reconciliation.");
-        store.releaseProjectLane(item.coordinatorThreadId, item.key);
-        await notify(item.coordinatorThreadId, `Workstream ${item.key} failed reload reconciliation without orchestrator_worker_done.`);
-        await retireWorker(item.threadId);
+        const output = await bb.sdk.threads.output({ threadId: item.threadId }).then((value) => value.output, () => null);
+        await settleUnreportedWorker(item, output);
       } catch (error) {
         bb.log.warn(`Could not reconcile running worker ${item.threadId}: ${error instanceof Error ? error.message : String(error)}`);
       }
