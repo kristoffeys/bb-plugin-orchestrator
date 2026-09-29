@@ -127,6 +127,8 @@ export const eventActor = new AsyncLocalStorage<string>();
 /** A launch claim older than this is treated as abandoned, e.g. by a plugin process that died mid-spawn. */
 const LAUNCH_CLAIM_LEASE_MS = 5 * 60_000;
 
+const HAS_WORKERS = "EXISTS (SELECT 1 FROM orchestration_events AS event WHERE event.session_id = session.session_id AND event.event_type = 'workstream.state')";
+
 const parseJson = <T>(value: string): T => JSON.parse(value) as T;
 const branchSlug = (label: string) => label.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 36) || "feature";
 const telemetryResult = (value: unknown) => {
@@ -231,6 +233,8 @@ export class OrchestratorStore {
   setRunState(coordinatorThreadId: string, state: RunState, error: string | null = null) {
     const current = this.getRun(coordinatorThreadId);
     if (current === null || ["completed", "failed", "cancelled"].includes(current.state)) return;
+    // Re-asserting the current state is activity, not a transition; logging it buried real transitions in repeats.
+    if (current.state === state && current.error === error) return this.touchRun(coordinatorThreadId);
     const now = Date.now();
     this.db.prepare("UPDATE runs SET state = ?, error = ?, updated_at = ?, last_activity_at = ? WHERE coordinator_thread_id = ?")
       .run(state, error, now, now, coordinatorThreadId);
@@ -433,7 +437,7 @@ export class OrchestratorStore {
     const updated = this.getWorkstream(coordinatorThreadId, key);
     if (updated !== null) this.recordEvent({
       coordinatorThreadId, type: "workstream.state", workstreamKey: key, workerThreadId: updated.threadId,
-      outcome: state, reasonCode: options.reasonCode ?? (options.error === undefined || options.error === null ? null : state === "failed" ? "worker_failed" : "worker_feedback"),
+      outcome: state, reasonCode: options.reasonCode ?? (options.error === undefined || options.error === null ? null : state === "failed" ? "worker_failed" : state === "cancelled" ? "workstream_cancelled" : "worker_feedback"),
       durationMs: updated.startedAt === null ? null : Math.max(0, now - updated.startedAt), tokens: updated.totalTokens,
       details: { from: current.state, attempt: updated.attemptCount, queueMs: state === "running" ? Math.max(0, now - current.createdAt) : null, providerId: updated.providerId, model: updated.model, profile: updated.profile, configuredReasoningLevel: updated.configuredReasoningLevel, requestedReasoningLevel: updated.requestedReasoningLevel, reasoningLevel: updated.reasoningLevel, accessMode: updated.accessMode, error: options.error ?? null, result: telemetryResult(options.result) },
     });
@@ -562,10 +566,12 @@ export class OrchestratorStore {
   }
 
   analytics() {
-    const sessions = this.db.prepare(`SELECT session_id AS sessionId, coordinator_thread_id AS coordinatorThreadId, label, feature_branch AS featureBranch, state, total_tokens AS totalTokens, coordinator_tokens AS coordinatorTokens, input_tokens AS inputTokens, cached_input_tokens AS cachedInputTokens, output_tokens AS outputTokens, reasoning_output_tokens AS reasoningOutputTokens, started_at AS startedAt, updated_at AS updatedAt, completed_at AS completedAt, error FROM orchestration_sessions ORDER BY started_at DESC LIMIT 100`).all() as Array<{ sessionId: string; coordinatorThreadId: string; label: string; featureBranch: string; state: string; totalTokens: number; coordinatorTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number; startedAt: number; updatedAt: number; completedAt: number | null; error: string | null }>;
-    const failures = this.db.prepare(`SELECT COALESCE(reason_code, 'uncategorized') AS reasonCode, COUNT(*) AS count FROM orchestration_events WHERE outcome = 'failed' OR reason_code IS NOT NULL GROUP BY COALESCE(reason_code, 'uncategorized') ORDER BY count DESC`).all() as Array<{ reasonCode: string; count: number }>;
-    const row = this.db.prepare(`SELECT COUNT(*) AS sessions, SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) AS completed, SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) AS failed, COALESCE(SUM(total_tokens), 0) AS totalTokens, COALESCE(SUM(coordinator_tokens), 0) AS coordinatorTokens, COALESCE(SUM(input_tokens), 0) AS inputTokens, COALESCE(SUM(cached_input_tokens), 0) AS cachedInputTokens, COALESCE(SUM(output_tokens), 0) AS outputTokens, COALESCE(SUM(reasoning_output_tokens), 0) AS reasoningOutputTokens FROM orchestration_sessions`).get() as { sessions: number; completed: number | null; failed: number | null; totalTokens: number; coordinatorTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number };
-    return { totals: { sessions: row.sessions, completed: row.completed ?? 0, failed: row.failed ?? 0, totalTokens: row.totalTokens, coordinatorTokens: row.coordinatorTokens, inputTokens: row.inputTokens, cachedInputTokens: row.cachedInputTokens, outputTokens: row.outputTokens, reasoningOutputTokens: row.reasoningOutputTokens }, failures, sessions };
+    const sessions = this.db.prepare(`SELECT session_id AS sessionId, coordinator_thread_id AS coordinatorThreadId, label, feature_branch AS featureBranch, state, total_tokens AS totalTokens, coordinator_tokens AS coordinatorTokens, input_tokens AS inputTokens, cached_input_tokens AS cachedInputTokens, output_tokens AS outputTokens, reasoning_output_tokens AS reasoningOutputTokens, started_at AS startedAt, updated_at AS updatedAt, completed_at AS completedAt, error, ${HAS_WORKERS} AS hasWorkers FROM orchestration_sessions AS session ORDER BY started_at DESC LIMIT 100`).all() as Array<{ sessionId: string; coordinatorThreadId: string; label: string; featureBranch: string; state: string; totalTokens: number; coordinatorTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number; startedAt: number; updatedAt: number; completedAt: number | null; error: string | null; hasWorkers: number }>;
+    const failures = this.db.prepare(`SELECT COALESCE(reason_code, 'uncategorized') AS reasonCode, COUNT(*) AS count FROM orchestration_events WHERE outcome = 'failed' GROUP BY COALESCE(reason_code, 'uncategorized') ORDER BY count DESC`).all() as Array<{ reasonCode: string; count: number }>;
+    const row = this.db.prepare(`SELECT COUNT(*) AS sessions, SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) AS completed, SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) AS failed, COALESCE(SUM(total_tokens), 0) AS totalTokens, COALESCE(SUM(coordinator_tokens), 0) AS coordinatorTokens, COALESCE(SUM(input_tokens), 0) AS inputTokens, COALESCE(SUM(cached_input_tokens), 0) AS cachedInputTokens, COALESCE(SUM(output_tokens), 0) AS outputTokens, COALESCE(SUM(reasoning_output_tokens), 0) AS reasoningOutputTokens FROM orchestration_sessions AS session WHERE ${HAS_WORKERS}`).get() as { sessions: number; completed: number | null; failed: number | null; totalTokens: number; coordinatorTokens: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number };
+    // A coordinator that never dispatched was used as an ordinary chat thread; its tokens are real spend but not orchestration.
+    const withoutWorkers = this.db.prepare(`SELECT COUNT(*) AS sessions, COALESCE(SUM(total_tokens), 0) AS totalTokens FROM orchestration_sessions AS session WHERE NOT ${HAS_WORKERS}`).get() as { sessions: number; totalTokens: number };
+    return { withoutWorkers, totals: { sessions: row.sessions, completed: row.completed ?? 0, failed: row.failed ?? 0, totalTokens: row.totalTokens, coordinatorTokens: row.coordinatorTokens, inputTokens: row.inputTokens, cachedInputTokens: row.cachedInputTokens, outputTokens: row.outputTokens, reasoningOutputTokens: row.reasoningOutputTokens }, failures, sessions: sessions.map((session) => ({ ...session, hasWorkers: session.hasWorkers === 1 })) };
   }
 
   addArtifact(input: Omit<ArtifactRecord, "id" | "createdAt">) {
