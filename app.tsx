@@ -33,7 +33,6 @@ type OrchestrationPolicy = {
   tokenBudget: number;
   planningMode: "off" | "auto" | "always";
   approval: "never" | "first-dispatch" | "critical" | "every-dispatch";
-  evaluator: "never" | "critical" | "always";
   commitMode: "disabled" | "owned-only" | "owned-or-approved-existing";
   pushMode: "disabled" | "explicit-approval";
   protectedBranches: string[];
@@ -78,7 +77,7 @@ type DashboardWorkstream = {
 type DashboardData = {
   available: boolean; coordinatorThreadId: string | null;
   run: { label: string; sessionId: string; featureBranch: string; state: string; createdAt: number; updatedAt: number; lastActivityAt: number; totalTokens: number; tokenBudget: number; error: string | null } | null;
-  counts: { total: number; active: number; queued: number; completed: number; failed: number; reviewing: number };
+  counts: { total: number; active: number; queued: number; completed: number; failed: number };
   workstreams: DashboardWorkstream[];
   artifacts: Array<{ id: number; workstreamKey: string; kind: string; name: string; version: string | null; summary: string; path: string | null; createdAt: number }>;
 };
@@ -393,7 +392,6 @@ function OrchestrationOverlay() {
 
 const STATE_STYLE: Record<string, string> = {
   running: "bg-blue-500/15 text-blue-700 dark:text-blue-300",
-  reviewing: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
   completed: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300",
   failed: "bg-destructive/15 text-destructive",
   cancelled: "bg-muted text-muted-foreground",
@@ -613,7 +611,7 @@ function EvidenceBundle({ evidence }: { evidence: DashboardEvidence }) {
 
 type RunControl = (action: "suspend" | "resume", workstreamKey: string | null) => Promise<void>;
 const ATTENTION_STATES = new Set(["failed", "blocked", "awaiting_approval"]);
-const ACTIVE_STATES = new Set(["running", "reviewing"]);
+const ACTIVE_STATES = new Set(["running"]);
 
 function WorkstreamDetail({ item, result, evidence }: { item: DashboardWorkstream; result: DashboardResult | null; evidence: DashboardEvidence | null }) {
   const context = item.live?.context ?? evidence?.context ?? null;
@@ -895,7 +893,6 @@ function PolicySettings() {
       <div className="grid gap-4 border-t border-border pt-4 sm:grid-cols-2">
         <label><span className="block text-sm font-medium text-foreground">Planning mode</span><span className="mb-1.5 block text-xs text-muted-foreground">Auto keeps small requests fast and requires durable plans for larger work.</span><select value={draft.planningMode} onChange={(event) => setDraft({ ...draft, planningMode: event.target.value as OrchestrationPolicy["planningMode"] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option value="off">Off</option><option value="auto">Auto</option><option value="always">Always plan</option></select></label>
         <label><span className="block text-sm font-medium text-foreground">Dispatch approval</span><span className="mb-1.5 block text-xs text-muted-foreground">Pause before workers are created.</span><select value={draft.approval} onChange={(event) => setDraft({ ...draft, approval: event.target.value as OrchestrationPolicy["approval"] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option value="never">Never</option><option value="first-dispatch">First dispatch</option><option value="critical">Critical work only</option><option value="every-dispatch">Every dispatch</option></select></label>
-        <label><span className="block text-sm font-medium text-foreground">Evaluator gate</span><span className="mb-1.5 block text-xs text-muted-foreground">Require coordinator review before completion.</span><select value={draft.evaluator} onChange={(event) => setDraft({ ...draft, evaluator: event.target.value as OrchestrationPolicy["evaluator"] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option value="never">Never</option><option value="critical">Critical work only</option><option value="always">Every successful result</option></select></label>
         <label><span className="block text-sm font-medium text-foreground">Commit mode</span><span className="mb-1.5 block text-xs text-muted-foreground">Existing branches always need explicit user approval.</span><select value={draft.commitMode} onChange={(event) => setDraft({ ...draft, commitMode: event.target.value as OrchestrationPolicy["commitMode"] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option value="disabled">Disabled</option><option value="owned-only">Orchestrator-owned only</option><option value="owned-or-approved-existing">Owned or approved existing</option></select></label>
         <label><span className="block text-sm font-medium text-foreground">Push mode</span><span className="mb-1.5 block text-xs text-muted-foreground">Every permitted push still needs explicit user approval.</span><select value={draft.pushMode} onChange={(event) => setDraft({ ...draft, pushMode: event.target.value as OrchestrationPolicy["pushMode"] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"><option value="disabled">Disabled</option><option value="explicit-approval">Explicit approval</option></select></label>
         <label className="sm:col-span-2"><span className="block text-sm font-medium text-foreground">Protected branches</span><span className="mb-1.5 block text-xs text-muted-foreground">Comma-separated branch names that workers may never commit to or push.</span><input value={draft.protectedBranches.join(", ")} onChange={(event) => setDraft({ ...draft, protectedBranches: [...new Set(event.target.value.split(",").map((value) => value.trim()).filter(Boolean))] })} className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm" /></label>
@@ -914,8 +911,6 @@ function RoutingSettings() {
   const initialRoutingPolicy: RoutingPolicy = { strategy: "coordinator", profileRoutes: { quick: null, standard: null, complex: null, critical: null } };
   const [routePolicy, setRoutePolicy] = useState<RoutingPolicy>(initialRoutingPolicy);
   const [savedRoutePolicy, setSavedRoutePolicy] = useState<RoutingPolicy>(initialRoutingPolicy);
-  const [metrics, setMetrics] = useState<Array<{ providerId: string; model: string; profile: Profile; samples: number; successes: number; failures: number; averageDurationMs: number; averageTokens: number }>>([]);
-  const [recommendations, setRecommendations] = useState<Array<{ profile: Profile; providerId: string; model: string; samples: number; successRate: number; reason: string }>>([]);
   const [saving, setSaving] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -932,8 +927,6 @@ function RoutingSettings() {
       setStoredRoutes(routing.routes);
       setRoutePolicy(routing.policy);
       setSavedRoutePolicy(routing.policy);
-      setMetrics(routing.metrics);
-      setRecommendations(routing.recommendations);
       setDrafts((current) => {
         const next = { ...current };
         for (const provider of catalog.providers) {
@@ -1051,17 +1044,6 @@ function RoutingSettings() {
       </section>
 
 
-      {recommendations.length === 0 ? (
-        <p className="text-xs text-muted-foreground">Measured recommendations appear after three completed samples for a profile and model. Routes never change automatically.</p>
-      ) : (
-        <div className="rounded-md border border-border bg-muted/25 px-4 py-3">
-          <p className="text-sm font-medium text-foreground">Measured recommendations</p>
-          <div className="mt-2 space-y-1.5">
-            {recommendations.map((item) => <p key={item.profile} className="text-xs text-muted-foreground"><span className="font-medium text-foreground">{PROFILE_COPY[item.profile].label}:</span> {item.providerId} / {item.model} — {item.reason}</p>)}
-          </div>
-        </div>
-      )}
-
       {providers.length === 0 ? (
         <div className="rounded-md border border-dashed border-border px-4 py-5 text-sm text-muted-foreground">
           No agent providers are currently available. Enable a provider in BB, then return here.
@@ -1127,7 +1109,6 @@ function RoutingSettings() {
                             {selected === undefined ? null : (
                               <p className="mt-1 text-xs text-muted-foreground">
                                 Default reasoning: {selected.defaultReasoningLevel}
-                                {(() => { const evidence = metrics.find((item) => item.providerId === provider.id && item.model === selected.model && item.profile === profile); return evidence === undefined ? " · no measured runs yet" : ` · ${evidence.successes}/${evidence.samples} successful · ${Math.round(evidence.averageDurationMs / 1000)}s avg · ${evidence.averageTokens.toLocaleString()} tokens avg`; })()}
                               </p>
                             )}
                           </div>
@@ -1215,7 +1196,7 @@ export default definePluginApp((app) => {
   app.slots.settingsSection({
     id: "orchestration-policy",
     title: "Orchestration policy",
-    description: "Set lifecycle, delegation, commit, push, approval, and evaluator limits.",
+    description: "Set lifecycle, delegation, commit, push, and approval limits.",
     component: PolicySettings,
   });
   app.slots.settingsSection({

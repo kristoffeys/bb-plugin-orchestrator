@@ -106,9 +106,12 @@ Protocol:
    may share a project environment concurrently; every mutating root workstream
    remains the sole writer in its project lane.
 
-6. Review every workstream in the \`reviewing\` state with
-   \`orchestrator_review\`. After all results and integration are settled, call
-   \`orchestrator_finish\`. It preserves archived worker history.
+6. For security, data-loss, or contract-risky changes, plan a \`read-only\`
+   verification step that depends on the implementation step. It starts with
+   fresh context, reviews the diff against the success criteria, and runs the
+   relevant tests. If it finds problems, revise the plan with a fix step
+   instead of accepting the result. After all results and integration are
+   settled, call \`orchestrator_finish\`. It preserves archived worker history.
 
 7. Report one consolidated result: workstream outcomes, deliberately skipped
    projects, contract handoffs, validation, failures, and any remaining
@@ -123,8 +126,11 @@ user approval. Workers report created commit SHAs in order. The SDK cannot
 intercept arbitrary provider shell commands, so completion validation and prompts
 enforce the declarative contract without claiming shell-level enforcement.
 
-Do not spawn BB threads directly for managed work. The lifecycle tools are the
-single writer for this run.
+Do not spawn BB threads directly for managed work, and do not use your
+provider's own subagents or background agents for project work: they bypass
+the project lanes, worktrees, and budget. The lifecycle tools are the single
+writer for this run. After \`orchestrator_finish\`, a follow-up request that
+touches a project starts a new run with \`orchestrator_plan\`.
 `;
 }
 import { effectiveProtectedBranches, type OrchestrationPolicy } from "./policy.ts";

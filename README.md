@@ -10,7 +10,7 @@ bb plugin install git:https://github.com/kristoffeys/bb-plugin-orchestrator.git@
 
 The plugin owns durable run/workstream state, bounded hierarchical worker
 reconciliation, event-driven completion and retry handling, parent/worker
-messaging, cleanup, approval and evaluator gates, structured artifacts,
+messaging, cleanup, dispatch approval gates, structured artifacts,
 configurable commit policy, and cost-aware model and reasoning routing.
 Callers such as the Sidebar plugin provide a label, task, and allowed project
 ids through the `start` RPC; they do not manage worker threads themselves.
@@ -132,7 +132,7 @@ complexity reason. The default routing is:
 Open **Settings → Installed Plugins → Orchestrator → Orchestration policy** to
 configure parallelism, per-run workstream and attempt ceilings, worker/run/
 inactivity timeouts, an optional observed token budget, dispatch approvals,
-evaluator gates, delegation limits, and version-control policy. Each run
+delegation limits, and version-control policy. Each run
 snapshots this policy when orchestration is enabled, so changing global defaults
 never changes a run already in progress.
 
@@ -168,9 +168,7 @@ provider and model lists come from BB's live catalogs, so OpenCode and future
 providers appear without an Orchestrator release. Claude Code and Codex retain
 the defaults above until explicitly changed. Select **Route by workload
 profile** to send quick, standard, complex, and critical work to different
-providers. Completed work records success, duration, and observed tokens;
-measured recommendations appear after three samples and never change routing
-without an explicit save.
+providers. Per-route outcomes, duration, and tokens are in the learning data.
 
 Reasoning is configured beside every exact provider/model route, both in the
 provider-local table and cross-provider profile strategy. This means two

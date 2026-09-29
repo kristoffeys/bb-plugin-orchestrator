@@ -60,3 +60,15 @@ test("explains how to fix a checkout with no baseline commit", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("worktree removal succeeds through read-only directories", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "orchestrator-readonly-"));
+  const worktreePath = path.join(root, "run", "repo");
+  const locked = path.join(worktreePath, "public", "vendor-dist");
+  await exec("mkdir", ["-p", locked]);
+  await writeFile(path.join(locked, "bundle.js"), "x");
+  await exec("chmod", ["555", locked]);
+  await removeFeatureWorktree({ sourcePath: root, worktreePath });
+  await assert.rejects(readFile(path.join(locked, "bundle.js")), /ENOENT/);
+  await rm(root, { recursive: true, force: true });
+});
